@@ -14,10 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout doom-flow
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Checkout Flow
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: flooooooooooow/flow
           path: flow
@@ -26,7 +26,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang python3 python3-pip python3-venv
-          python3 -m pip install --user -r flow/requirements.txt pillow
+          python3 -m venv .venv
+          .venv/bin/pip install -r flow/requirements.txt pillow
+          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Record GIF via Flow gfx-record
         env:
@@ -39,7 +41,7 @@ jobs:
             --args "-timedemo demo1"
 
       - name: Upload gameplay GIF
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: doom-flow-gameplay-gif
           path: media/doom.gif

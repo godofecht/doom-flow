@@ -1,5 +1,7 @@
 # doom-flow
 
+[![Record gameplay GIF](https://github.com/godofecht/doom-flow/actions/workflows/record-gif.yml/badge.svg)](https://github.com/godofecht/doom-flow/actions/workflows/record-gif.yml)
+
 Doom, ported to the [Flow](https://github.com/flooooooooooow/flow) programming
 language. Started from the doomgeneric C core (same spirit as
 [doom-zig](https://github.com/3x3xX3N0N/doom-zig)); the engine is now Flow.
