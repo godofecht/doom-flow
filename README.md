@@ -53,8 +53,8 @@ Pages modes: **Play**, **Watch AI** (`DOOMFLOW_AI` pilot), **RL Arena**.
 **Known quirks (C → emcc path):**
 - IWAD is preloaded (`doom.data` → `/doom1.wad`); TITLEPIC/HUD load.
 - **Audio is silent** — `FEATURE_SOUND` is off in this port.
-- **3D walls/sky can look black** in the browser while flats/sprites work —
-  likely a wasm32 layout/render bug (tracked as a local follow-up).
+- Light tables must use native pointer width (wasm32 ≠ LP64); a hardcoded
+  `* 8` row stride used to blank walls/sprites in dim areas.
 
 ## MLIR WASM (upstream)
 

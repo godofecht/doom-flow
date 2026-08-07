@@ -194,13 +194,22 @@ let mut scalelight: ptr<ptr<void> > = null
 let mut scalelightfixed: ptr<ptr<void> > = null
 let mut zlight: ptr<ptr<void> > = null
 
+# Native pointer width — must not hardcode 8 (LP64). wasm32 is ILP32; using
+# * 8 for light-table row strides scrambled wall/sprite colormaps (black walls,
+# invisible guns/imps in dim sectors).
+function rmain_ptr_bytes() -> i64 {
+    let mut probe: array<ptr<void>, 2> = [null, null]
+    return (&probe[1] as i64) - (&probe[0] as i64)
+}
+
 function rmain_ensure_tables() -> void {
     if (viewangletox as i64) == 0 {
+        let psz: i64 = rmain_ptr_bytes()
         viewangletox = calloc(RMAIN_VIEWANGLETOX_LEN as i64, 4) as ptr<i32>
         xtoviewangle = calloc(RMAIN_XTOVIEWANGLE_LEN as i64, 4) as ptr<u32>
-        scalelight = calloc(RMAIN_SCALELIGHT_LEN as i64, 8) as ptr<ptr<void> >
-        scalelightfixed = calloc(RMAIN_MAXLIGHTSCALE as i64, 8) as ptr<ptr<void> >
-        zlight = calloc(RMAIN_ZLIGHT_LEN as i64, 8) as ptr<ptr<void> >
+        scalelight = calloc(RMAIN_SCALELIGHT_LEN as i64, psz) as ptr<ptr<void> >
+        scalelightfixed = calloc(RMAIN_MAXLIGHTSCALE as i64, psz) as ptr<ptr<void> >
+        zlight = calloc(RMAIN_ZLIGHT_LEN as i64, psz) as ptr<ptr<void> >
     }
 }
 
@@ -317,7 +326,8 @@ function RMAIN_zlight(light: i32, index: i32) -> ptr<void> {
 @flow_api
 function RMAIN_scalelight_row(lightnum: i32) -> ptr<ptr<void> > {
     rmain_ensure_tables()
-    return ((scalelight as i64) + (rmain_scalelight_idx(lightnum, 0) as i64) * 8) as ptr<ptr<void> >
+    let idx: i32 = rmain_scalelight_idx(lightnum, 0)
+    return ((scalelight as i64) + (idx as i64) * rmain_ptr_bytes()) as ptr<ptr<void> >
 }
 
 @flow_api

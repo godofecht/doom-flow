@@ -134,33 +134,42 @@
     window.focus();
 
     var cfg = MODES[mode];
+    function applyEnv(envObj) {
+      if (!envObj) return;
+      Object.keys(cfg.env).forEach(function (k) {
+        envObj[k] = cfg.env[k];
+      });
+      if (mode === "play") {
+        delete envObj.DOOMFLOW_AI;
+        delete envObj.DOOMFLOW_ARGS;
+        delete envObj.DOOMFLOW_KEYSCRIPT;
+      }
+    }
     loadScript(cfg.script)
       .then(function () {
         if (typeof createFlowModule !== "function") {
           throw new Error("createFlowModule missing from " + cfg.script);
         }
+        // Emscripten snapshots ENV into environ on first getenv(). Set it in
+        // preRun (before main) and again before callMain so Watch AI sees
+        // DOOMFLOW_AI even if something touched getenv during init.
         return createFlowModule({
           canvas: canvas,
           locateFile: function (path) {
             return assetUrl(cfg.assetDir, path);
           },
           print: function (t) { log(t, false); },
-          printErr: function (t) { log(t, true); }
+          printErr: function (t) { log(t, true); },
+          preRun: [
+            function (mod) {
+              applyEnv(mod && mod.ENV);
+            }
+          ]
         });
       })
       .then(function (mod) {
         activeModule = mod;
-        // getenv() reads Module.ENV on first use — set before callMain.
-        if (mod.ENV) {
-          Object.keys(cfg.env).forEach(function (k) {
-            mod.ENV[k] = cfg.env[k];
-          });
-          if (mode === "play") {
-            delete mod.ENV.DOOMFLOW_AI;
-            delete mod.ENV.DOOMFLOW_ARGS;
-            delete mod.ENV.DOOMFLOW_KEYSCRIPT;
-          }
-        }
+        applyEnv(mod.ENV);
         stopBtn.disabled = false;
         setStatus("running");
         window.flowGfxOnStart = function (title, w, h) {

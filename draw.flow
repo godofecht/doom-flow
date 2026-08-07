@@ -101,8 +101,10 @@ let mut ds_source: ptr<u8> = null
 
 function draw_ensure_buffers() -> void {
     if (columnofs as i64) == 0 {
+        let mut probe: array<ptr<u8>, 2> = [null, null]
+        let psz: i64 = (&probe[1] as i64) - (&probe[0] as i64)
         columnofs = calloc(DRAW_MAXWIDTH as i64, 4) as ptr<i32>
-        ylookup = calloc(DRAW_MAXHEIGHT as i64, 8) as ptr<ptr<u8> >
+        ylookup = calloc(DRAW_MAXHEIGHT as i64, psz) as ptr<ptr<u8> >
     }
 }
 
