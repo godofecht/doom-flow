@@ -7,8 +7,8 @@
 
 Doom, rewritten in [Flow](https://github.com/flooooooooooow/flow).
 Native build and the browser demo both use Flow’s **C backend** today
-(`flow.transpiler --c` → clang / emcc). Flow also has an **MLIR → LLVM**
-CPU path; this port does not use it yet.
+(`flow.transpiler --c` → clang / emcc). An **MLIR → LLVM → WASM** path is
+tracked upstream — not wired here yet (see below).
 
 ![Doom timedemo gameplay (CI GIF)](media/doom.gif)
 
@@ -49,6 +49,28 @@ python3 -m http.server 8000 --directory site
 ```
 
 Pages modes: **Play**, **Watch AI** (`DOOMFLOW_AI` pilot), **RL Arena**.
+
+**Known quirks (C → emcc path):**
+- IWAD is preloaded (`doom.data` → `/doom1.wad`); TITLEPIC/HUD load.
+- **Audio is silent** — `FEATURE_SOUND` is off in this port.
+- **3D walls/sky can look black** in the browser while flats/sprites work —
+  likely a wasm32 layout/render bug (tracked as a local follow-up).
+
+## MLIR WASM (upstream)
+
+Goal: same `*.flow` → `./flow wasm --backend=mlir` with gfx + WAD preload,
+instead of the custom C/`emcc` script. Flow epic and blockers:
+
+| | |
+| --- | --- |
+| Epic | [flow#221](https://github.com/flooooooooooow/flow/issues/221) |
+| `uN` → `iN` | [flow#222](https://github.com/flooooooooooow/flow/issues/222) |
+| null → `llvm.mlir.zero` | [flow#223](https://github.com/flooooooooooow/flow/issues/223) |
+| memref vs GEP | [flow#224](https://github.com/flooooooooooow/flow/issues/224) |
+| `--preload` / `--link` | [flow#225](https://github.com/flooooooooooow/flow/issues/225) |
+| Gallery roadmap | [discussion #226](https://github.com/flooooooooooow/flow/discussions/226) |
+
+Once snake-class gfx + preload pass on MLIR, dual-build here and A/B the Pages bundle.
 
 ## Record a GIF
 

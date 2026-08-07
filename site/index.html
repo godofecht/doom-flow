@@ -77,7 +77,7 @@
         <div class="scan" aria-hidden="true"></div>
         <div class="overlay" id="overlay">
           <p class="overlay-brand">DOOM</p>
-          <p class="overlay-copy" id="overlay-copy">Flow source, C backend, Emscripten. Click to boot the shareware episode.</p>
+          <p class="overlay-copy" id="overlay-copy">Flow → C → emcc. IWAD is preloaded; audio is silent in this build. Click to boot.</p>
           <button type="button" id="start">
             <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M8 5.14v14l11-7-11-7z"/></svg>
             Boot
@@ -128,9 +128,12 @@
       </li>
     </ol>
     <p class="pipeline-note">
-      Flow also ships an <strong>MLIR → LLVM</strong> CPU backend.
-      This Doom build uses the C path — same sources, different sink.
-      <a href="https://flooooooooooow.github.io/flow/" rel="noopener">Read the Flow wiki →</a>
+      Flow also ships an <strong>MLIR → LLVM</strong> path
+      (<code>./flow wasm --backend=mlir</code>). This Doom build still uses C → emcc
+      until gfx + preload land on MLIR —
+      <a href="https://github.com/flooooooooooow/flow/issues/221" rel="noopener">epic #221</a>,
+      <a href="https://github.com/flooooooooooow/flow/discussions/226" rel="noopener">roadmap discussion</a>.
+      <a href="https://flooooooooooow.github.io/flow/" rel="noopener">Flow wiki →</a>
     </p>
   </section>
 

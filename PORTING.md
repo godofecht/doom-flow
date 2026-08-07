@@ -44,7 +44,8 @@ ports; read them before writing a new one.
 
 - Transpiles to C via `PYTHONPATH=$HOME/flow/src python3 -m flow.transpiler
   file.flow --c --lenient -o out.c` (this port’s path). Flow also has an
-  MLIR → LLVM CPU backend; Doom does not use it yet. The generated C includes
+  MLIR → LLVM CPU / WASM backend; Doom still uses C → clang/emcc. Upstream
+  tracking: flooooooooooow/flow#221 and children #222–#225; discussion #226.
   stdint, stdbool, stdio, stdlib, string, math.
 - `extern { function name(args) -> ret }` emits a plain C prototype.
   Known libc names (malloc, calloc, free, memcpy, memset, strlen, strcmp,

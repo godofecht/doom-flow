@@ -23,8 +23,8 @@
       assetDir: "wasm/doom/",
       canvasW: 640,
       canvasH: 400,
-      copy: "Flow source → C backend → Emscripten. Click to boot the shareware episode.",
-      hint: "Arrows / WASD · X fire · E use · Esc menu",
+      copy: "Flow → C → emcc. IWAD is preloaded; audio is silent in this build. Click to boot.",
+      hint: "Arrows / WASD · X fire · E use · Esc menu · silent (no FEATURE_SOUND)",
       env: {}
     },
     ai: {
@@ -51,11 +51,16 @@
 
   // Pages lives at /doom-flow/; wasm bundles are under site/wasm/...
   // Dynamic <script> loads break emscripten's default scriptDirectory, so
-  // locateFile must point at the module folder for .wasm / .data.
+  // locateFile must return absolute URLs for .wasm / .data (relative to
+  // document.baseURI, not the page URL alone — subdirectory deploys).
   function assetUrl(dir, path) {
-    var base = dir || "";
     if (path.indexOf("://") >= 0 || path.charAt(0) === "/") return path;
-    return base + path;
+    var rel = (dir || "") + path;
+    try {
+      return new URL(rel, document.baseURI || window.location.href).href;
+    } catch (e) {
+      return rel;
+    }
   }
 
   function log(text, isErr) {
