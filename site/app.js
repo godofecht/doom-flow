@@ -20,6 +20,7 @@
     play: {
       label: "PLAY",
       script: "wasm/doom/doom.js",
+      assetDir: "wasm/doom/",
       canvasW: 640,
       canvasH: 400,
       copy: "Flow → C → WebAssembly. Click to load the shareware episode.",
@@ -29,6 +30,7 @@
     ai: {
       label: "WATCH AI",
       script: "wasm/doom/doom.js",
+      assetDir: "wasm/doom/",
       canvasW: 640,
       canvasH: 400,
       copy: "A Flow pilot opens a new game and takes the stick. Sit back.",
@@ -38,6 +40,7 @@
     arena: {
       label: "RL ARENA",
       script: "wasm/ai/ai.js",
+      assetDir: "wasm/ai/",
       canvasW: 368,
       canvasH: 400,
       copy: "Tabular Q-learning trains in-page, then the greedy policy clears the room.",
@@ -45,6 +48,15 @@
       env: {}
     }
   };
+
+  // Pages lives at /doom-flow/; wasm bundles are under site/wasm/...
+  // Dynamic <script> loads break emscripten's default scriptDirectory, so
+  // locateFile must point at the module folder for .wasm / .data.
+  function assetUrl(dir, path) {
+    var base = dir || "";
+    if (path.indexOf("://") >= 0 || path.charAt(0) === "/") return path;
+    return base + path;
+  }
 
   function log(text, isErr) {
     out.hidden = false;
@@ -124,6 +136,9 @@
         }
         return createFlowModule({
           canvas: canvas,
+          locateFile: function (path) {
+            return assetUrl(cfg.assetDir, path);
+          },
           print: function (t) { log(t, false); },
           printErr: function (t) { log(t, true); }
         });
