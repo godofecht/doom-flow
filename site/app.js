@@ -23,8 +23,8 @@
       assetDir: "wasm/doom/",
       canvasW: 640,
       canvasH: 400,
-      copy: "Flow → C → WebAssembly. Click to load the shareware episode.",
-      hint: "Arrows / WASD move · X fire · E use · Esc menu",
+      copy: "Flow source → C backend → Emscripten. Click to boot the shareware episode.",
+      hint: "Arrows / WASD · X fire · E use · Esc menu",
       env: {}
     },
     ai: {
@@ -34,7 +34,7 @@
       canvasW: 640,
       canvasH: 400,
       copy: "A Flow pilot opens a new game and takes the stick. Sit back.",
-      hint: "DOOMFLOW_AI pilot · menu boot keyscript · open-loop combat",
+      hint: "DOOMFLOW_AI pilot · menu boot · open-loop combat",
       env: { DOOMFLOW_AI: "1" }
     },
     arena: {
@@ -44,7 +44,7 @@
       canvasW: 368,
       canvasH: 400,
       copy: "Tabular Q-learning trains in-page, then the greedy policy clears the room.",
-      hint: "stdlib/ai.flow · amber marine · rust imp · green = your HP",
+      hint: "stdlib/ai.flow · amber marine · rust imp · green HP",
       env: {}
     }
   };

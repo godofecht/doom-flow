@@ -3,69 +3,180 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>DOOM.FLOW — play Doom in the browser, or watch an AI</title>
-  <meta name="description" content="Doom ported to the Flow language, compiled to WebAssembly. Play it yourself, or watch a Flow agent take the controls." />
+  <title>DOOM.FLOW — Doom in Flow, running as WebAssembly</title>
+  <meta name="description" content="Doom rewritten in the Flow language. Flow → C → WebAssembly. Play it, watch an AI pilot, or see Q-learning clear a room." />
+  <meta name="theme-color" content="#0a0908" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Teko:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <div class="noise" aria-hidden="true"></div>
+  <div class="grain" aria-hidden="true"></div>
+  <div class="heat" aria-hidden="true"></div>
 
-  <header class="top">
-    <a class="brand" href="./">DOOM<span>.FLOW</span></a>
-    <nav class="modes" role="tablist" aria-label="Play mode">
-      <button type="button" class="mode is-active" data-mode="play" role="tab" aria-selected="true">Play</button>
-      <button type="button" class="mode" data-mode="ai" role="tab" aria-selected="false">Watch AI</button>
-      <button type="button" class="mode" data-mode="arena" role="tab" aria-selected="false">RL Arena</button>
+  <header class="mast">
+    <a class="brand" href="./" aria-label="DOOM.FLOW home">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-text">DOOM<span>.FLOW</span></span>
+    </a>
+
+    <nav class="modes" role="tablist" aria-label="Session mode">
+      <button type="button" class="mode is-active" data-mode="play" role="tab" aria-selected="true">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M8 5.14v14l11-7-11-7z"/></svg>
+        Play
+      </button>
+      <button type="button" class="mode" data-mode="ai" role="tab" aria-selected="false">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a4 4 0 0 1 4 4v1h1a3 3 0 0 1 3 3v2h-2v-2a1 1 0 0 0-1-1h-1v1a1 1 0 1 1-2 0V9H10v1a1 1 0 1 1-2 0V9H7a1 1 0 0 0-1 1v2H4v-2a3 3 0 0 1 3-3h1V6a4 4 0 0 1 4-4zm-5 12h2v6H7v-6zm8 0h2v6h-2v-6zM9 14h6v2H9v-2z"/></svg>
+        Watch AI
+      </button>
+      <button type="button" class="mode" data-mode="arena" role="tab" aria-selected="false">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M3 3h8v8H3V3zm10 0h8v8h-8V3zM3 13h8v8H3v-8zm10 0h8v8h-8v-8z"/></svg>
+        RL Arena
+      </button>
     </nav>
-    <a class="gh" href="https://github.com/godofecht/doom-flow" rel="noopener">GitHub</a>
+
+    <nav class="ext" aria-label="Project links">
+      <a class="pill" href="https://flooooooooooow.github.io/flow/" rel="noopener" title="Flow wiki">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6 2h9l5 5v15a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm8 1.5V8h4.5L14 3.5zM8 12h8v1.5H8V12zm0 4h8v1.5H8V16z"/></svg>
+        <span>Wiki</span>
+      </a>
+      <a class="pill" href="https://flooooooooooow.github.io/flow/wasm/" rel="noopener" title="Flow WASM gallery">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 4h6v6H4V4zm10 0h6v6h-6V4zM4 14h6v6H4v-6zm10 2h2v2h-2v-2zm4 0h2v2h-2v-2zm-4 4h2v2h-2v-2zm4 0h2v2h-2v-2z"/></svg>
+        <span>WASM</span>
+      </a>
+      <a class="pill" href="https://github.com/flooooooooooow/flow" rel="noopener" title="Flow on GitHub">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.58 2 12.26c0 4.52 2.87 8.35 6.84 9.71.5.1.68-.22.68-.48 0-.24-.01-.87-.01-1.71-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.5-1.11-1.5-.91-.64.07-.63.07-.63 1 .07 1.53 1.06 1.53 1.06.89 1.56 2.34 1.11 2.91.85.09-.66.35-1.11.63-1.37-2.22-.26-4.55-1.14-4.55-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.31.1-2.73 0 0 .84-.27 2.75 1.05A9.3 9.3 0 0 1 12 6.84c.85 0 1.71.12 2.51.35 1.91-1.32 2.75-1.05 2.75-1.05.55 1.42.2 2.47.1 2.73.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.8-4.57 5.06.36.32.68.94.68 1.9 0 1.37-.01 2.47-.01 2.81 0 .26.18.58.69.48A10.03 10.03 0 0 0 22 12.26C22 6.58 17.52 2 12 2z"/></svg>
+        <span>Flow</span>
+      </a>
+      <a class="pill" href="https://github.com/godofecht/doom-flow" rel="noopener" title="This repo on GitHub">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.58 2 12.26c0 4.52 2.87 8.35 6.84 9.71.5.1.68-.22.68-.48 0-.24-.01-.87-.01-1.71-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.5-1.11-1.5-.91-.64.07-.63.07-.63 1 .07 1.53 1.06 1.53 1.06.89 1.56 2.34 1.11 2.91.85.09-.66.35-1.11.63-1.37-2.22-.26-4.55-1.14-4.55-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.31.1-2.73 0 0 .84-.27 2.75 1.05A9.3 9.3 0 0 1 12 6.84c.85 0 1.71.12 2.51.35 1.91-1.32 2.75-1.05 2.75-1.05.55 1.42.2 2.47.1 2.73.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.8-4.57 5.06.36.32.68.94.68 1.9 0 1.37-.01 2.47-.01 2.81 0 .26.18.58.69.48A10.03 10.03 0 0 0 22 12.26C22 6.58 17.52 2 12 2z"/></svg>
+        <span>Repo</span>
+      </a>
+    </nav>
   </header>
 
   <main class="hero">
     <div class="bezel">
-      <div class="bezel-label">
-        <span id="mode-label">PLAY</span>
-        <span class="sep">/</span>
-        <span id="status">ready</span>
+      <div class="bezel-chrome">
+        <div class="lamps" aria-hidden="true">
+          <span class="lamp is-live"></span>
+          <span class="lamp"></span>
+          <span class="lamp"></span>
+        </div>
+        <p class="bezel-id">
+          <span id="mode-label">PLAY</span>
+          <span class="sep">·</span>
+          <span id="status">ready</span>
+        </p>
+        <p class="bezel-path">Flow → C → WASM</p>
       </div>
+
       <div class="stage">
         <canvas id="canvas" width="640" height="400"></canvas>
+        <div class="scan" aria-hidden="true"></div>
         <div class="overlay" id="overlay">
           <p class="overlay-brand">DOOM</p>
-          <p class="overlay-copy" id="overlay-copy">Flow → C → WebAssembly. Click to load the shareware episode.</p>
-          <button type="button" id="start">Start</button>
+          <p class="overlay-copy" id="overlay-copy">Flow source, C backend, Emscripten. Click to boot the shareware episode.</p>
+          <button type="button" id="start">
+            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M8 5.14v14l11-7-11-7z"/></svg>
+            Boot
+          </button>
         </div>
       </div>
+
       <div class="bezel-foot">
-        <p id="hint">Arrows / WASD move · X fire · E use · Esc menu</p>
+        <p id="hint">Arrows / WASD · X fire · E use · Esc menu</p>
         <button type="button" id="stop" disabled>Stop</button>
       </div>
     </div>
   </main>
 
-  <section class="about">
-    <h1>Doom, rewritten in Flow, running in your browser.</h1>
-    <p>
-      The engine is Flow source at the repo root. This page is that same program
-      compiled with Flow’s WASM gfx backend (<code>gfx_wasm.c</code> + ASYNCIFY)
-      and the shareware IWAD preloaded into the virtual filesystem.
+  <section class="pipeline" aria-label="Compile pipeline">
+    <h2 class="pipeline-title">How this page is built</h2>
+    <ol class="pipe">
+      <li>
+        <span class="pipe-ico" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M4 4h7v7H4V4zm9 0h7v7h-7V4zM4 13h7v7H4v-7zm9 3h3v3h-3v-3zm4 0h3v3h-3v-3zm-4 4h3v3h-3v-3zm4 0h3v3h-3v-3z"/></svg>
+        </span>
+        <strong>Flow</strong>
+        <span>engine as <code>*.flow</code></span>
+      </li>
+      <li class="pipe-arrow" aria-hidden="true">→</li>
+      <li>
+        <span class="pipe-ico" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M5 3h14a2 2 0 0 1 2 2v14l-4-3H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm2 4v2h10V7H7zm0 4v2h7v-2H7z"/></svg>
+        </span>
+        <strong>C</strong>
+        <span><code>flow.transpiler --c</code></span>
+      </li>
+      <li class="pipe-arrow" aria-hidden="true">→</li>
+      <li>
+        <span class="pipe-ico" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 6h18v2H3V6zm0 5h18v2H3v-2zm0 5h12v2H3v-2z"/></svg>
+        </span>
+        <strong>emcc</strong>
+        <span><code>gfx_wasm</code> + ASYNCIFY</span>
+      </li>
+      <li class="pipe-arrow" aria-hidden="true">→</li>
+      <li>
+        <span class="pipe-ico" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M4 4h6v6H4V4zm10 0h6v6h-6V4zM4 14h6v6H4v-6zm13 1h-3v3h-3v3h3v3h3v-3h3v-3h-3v-3z"/></svg>
+        </span>
+        <strong>WASM</strong>
+        <span>this tab</span>
+      </li>
+    </ol>
+    <p class="pipeline-note">
+      Flow also ships an <strong>MLIR → LLVM</strong> CPU backend.
+      This Doom build uses the C path — same sources, different sink.
+      <a href="https://flooooooooooow.github.io/flow/" rel="noopener">Read the Flow wiki →</a>
     </p>
-    <ul>
-      <li><strong>Play</strong> — you take the controls.</li>
-      <li><strong>Watch AI</strong> — a Flow pilot boots a new game and drives the engine.</li>
-      <li><strong>RL Arena</strong> — tabular Q-learning from <a href="https://github.com/godofecht/doom-flow-rl">doom-flow-rl</a> trains, then plays live on a grid.</li>
-    </ul>
+  </section>
+
+  <section class="links">
+    <a class="card" href="https://flooooooooooow.github.io/flow/" rel="noopener">
+      <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6 2h9l5 5v15a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm8 1.5V8h4.5L14 3.5z"/></svg>
+      <div>
+        <strong>Flow wiki</strong>
+        <span>Language, tutorials, demos</span>
+      </div>
+    </a>
+    <a class="card" href="https://flooooooooooow.github.io/flow/wasm/" rel="noopener">
+      <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 4h6v6H4V4zm10 0h6v6h-6V4zM4 14h6v6H4v-6zm10 2h2v2h-2v-2zm4 0h2v2h-2v-2zm-4 4h2v2h-2v-2zm4 0h2v2h-2v-2z"/></svg>
+      <div>
+        <strong>WASM gallery</strong>
+        <span>Games &amp; sims in the browser</span>
+      </div>
+    </a>
+    <a class="card" href="https://github.com/flooooooooooow/flow" rel="noopener">
+      <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.58 2 12.26c0 4.52 2.87 8.35 6.84 9.71.5.1.68-.22.68-.48 0-.24-.01-.87-.01-1.71-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.5-1.11-1.5-.91-.64.07-.63.07-.63 1 .07 1.53 1.06 1.53 1.06.89 1.56 2.34 1.11 2.91.85.09-.66.35-1.11.63-1.37-2.22-.26-4.55-1.14-4.55-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.31.1-2.73 0 0 .84-.27 2.75 1.05A9.3 9.3 0 0 1 12 6.84c.85 0 1.71.12 2.51.35 1.91-1.32 2.75-1.05 2.75-1.05.55 1.42.2 2.47.1 2.73.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.8-4.57 5.06.36.32.68.94.68 1.9 0 1.37-.01 2.47-.01 2.81 0 .26.18.58.69.48A10.03 10.03 0 0 0 22 12.26C22 6.58 17.52 2 12 2z"/></svg>
+      <div>
+        <strong>Flow source</strong>
+        <span>github.com/flooooooooooow/flow</span>
+      </div>
+    </a>
+    <a class="card" href="https://github.com/godofecht/doom-flow-rl" rel="noopener">
+      <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a4 4 0 0 1 4 4v1h1a3 3 0 0 1 3 3v2h-2v-2a1 1 0 0 0-1-1h-1v1a1 1 0 1 1-2 0V9H10v1a1 1 0 1 1-2 0V9H7a1 1 0 0 0-1 1v2H4v-2a3 3 0 0 1 3-3h1V6a4 4 0 0 1 4-4zm-5 12h2v6H7v-6zm8 0h2v6h-2v-6zM9 14h6v2H9v-2z"/></svg>
+      <div>
+        <strong>doom-flow-rl</strong>
+        <span>Q-learning sister repo</span>
+      </div>
+    </a>
   </section>
 
   <footer class="foot">
-    <span>Port of doomgeneric · GPL-2.0 · shareware <code>doom1.wad</code></span>
-    <span><a href="https://github.com/flooooooooooow/flow">Flow</a> · <a href="https://github.com/godofecht/doom-flow-rl">RL sister repo</a></span>
+    <p>doomgeneric lineage · GPL-2.0 · shareware <code>doom1.wad</code></p>
+    <p>
+      <a href="https://github.com/godofecht/doom-flow" rel="noopener">doom-flow</a>
+      ·
+      <a href="https://flooooooooooow.github.io/flow/playground/" rel="noopener">Flow playground</a>
+      ·
+      <a href="https://discord.gg/YK7VaHy24T" rel="noopener">Discord</a>
+    </p>
   </footer>
 
   <pre id="out" class="log" hidden></pre>
-
   <script src="app.js"></script>
 </body>
 </html>
