@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Build doom-flow (and the Q-DOOM watch agent) to WebAssembly for GitHub Pages.
 #
+# Flow's browser path today is:
+#   doom.flow  --(flow.transpiler --c)-->  build/wasm/*.c  --(emcc)-->  .wasm/.js
+#
+# The .c is a throwaway intermediate (same as `./flow wasm` / `flow build-native`).
+# Source of truth stays the *.flow files. Intermediate C never ships in site/.
+#
 # Requires: emcc on PATH, Flow checkout at FLOW_DIR (default ../flow).
 #
 #   FLOW_DIR=~/flow ./scripts/build_wasm.sh
@@ -13,6 +19,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FLOW_DIR="${FLOW_DIR:-$ROOT/../flow}"
 OUT_DOOM="$ROOT/site/wasm/doom"
 OUT_AI="$ROOT/site/wasm/ai"
+TMP="$ROOT/build/wasm"
 DO_DOOM=1
 DO_AI=1
 
@@ -46,8 +53,7 @@ fi
 
 export PYTHONPATH="$FLOW_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 FLOWC=flow.transpiler
-
-mkdir -p "$ROOT/assets"
+mkdir -p "$TMP"
 
 emcc_common=(
   -O2
@@ -68,9 +74,9 @@ emcc_common=(
 )
 
 build_doom() {
-  echo "==> doom WASM"
+  echo "==> doom.flow → C (scratch) → WASM"
   mkdir -p "$OUT_DOOM"
-  local c="$OUT_DOOM/doom.c"
+  local c="$TMP/doom.c"
   local wad="$ROOT/DOOM1.WAD"
   if [ ! -f "$wad" ]; then
     echo "missing $wad" >&2
@@ -90,9 +96,9 @@ build_doom() {
 }
 
 build_ai() {
-  echo "==> Q-DOOM watch WASM"
+  echo "==> q_doom_watch.flow → C (scratch) → WASM"
   mkdir -p "$OUT_AI"
-  local c="$OUT_AI/ai.c"
+  local c="$TMP/ai.c"
   python3 -m "$FLOWC" "$ROOT/site/ai/q_doom_watch.flow" --c --lenient -o "$c"
   emcc "$c" \
     "$FLOW_DIR/runtime/gfx_wasm.c" \
@@ -101,13 +107,11 @@ build_ai() {
     -sINITIAL_MEMORY=32MB \
     -o "$OUT_AI/ai.js"
   rm -f "$c"
-  # createFlowModule export name is shared; rename file stays ai.js
   ls -lh "$OUT_AI"/ai.{js,wasm}
 }
 
 [ "$DO_DOOM" = 1 ] && build_doom
 [ "$DO_AI" = 1 ] && build_ai
 
-# Ensure Pages serves wasm as static files
 touch "$ROOT/site/.nojekyll"
-echo "done → $ROOT/site/wasm"
+echo "done → $ROOT/site/wasm  (no .c shipped; scratch under build/wasm/)"
