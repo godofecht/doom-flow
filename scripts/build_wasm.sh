@@ -68,7 +68,7 @@ emcc_common=(
   -sINVOKE_RUN=0
   -sEXIT_RUNTIME=0
   -sEXPORTED_RUNTIME_METHODS=callMain,ccall,ENV
-  -sEXPORTED_FUNCTIONS=_main,_malloc,_free
+  -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai
   -Wno-implicit-function-declaration
   -lm
 )

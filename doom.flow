@@ -100,6 +100,31 @@ extern { function strlen(s: string) -> i64 }
 extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
 extern { function printf(fmt: string) -> i32 }
 
+# Pages "Watch AI" sets this via exported doomflow_set_ai() before callMain.
+# More reliable than Emscripten ENV/getenv (empty ENV + cached environ).
+let mut doomflow_ai_js: i32 = 0
+
+@flow_api
+function doomflow_set_ai(v: i32) -> void {
+    doomflow_ai_js = v
+}
+
+@flow_api
+function doomflow_get_ai() -> i32 {
+    return doomflow_ai_js
+}
+
+function doomflow_ai_wanted() -> i32 {
+    if doomflow_get_ai() != 0 {
+        return 1
+    }
+    let ai_env: ptr<u8> = getenv("DOOMFLOW_AI")
+    if (ai_env as i64) != 0 and ai_env[0] as i32 != 0 {
+        return 1
+    }
+    return 0
+}
+
 extern { function argvflow_set_args(argc: i32, argv: ptr<i64>) -> void }
 extern { function M_FindResponseFile() -> void }
 extern { function D_DoomMain() -> void }
@@ -119,6 +144,10 @@ function doom_bootstrap(wad: string) -> void {
     argc = argc + 1
 
     let extra: ptr<u8> = getenv("DOOMFLOW_ARGS")
+    # Watch AI: skip the title/menu keyscript and drop straight onto E1M1.
+    if ((extra as i64) == 0 or extra[0] as i32 == 0) and doomflow_ai_wanted() != 0 {
+        extra = "-skill 3 -warp 1 1" as ptr<u8>
+    }
     if (extra as i64) != 0 and extra[0] as i32 != 0 {
         let len: i64 = strlen(extra as string)
         let buf: ptr<u8> = malloc(len + 1) as ptr<u8>
@@ -237,7 +266,8 @@ function pump_ai(frame: i32) -> void {
     if ai_pilot == 0 {
         return
     }
-    if frame < 220 {
+    # In-level shortly after autostart warp (no long menu wait).
+    if frame < 40 {
         return
     }
     if ai_fwd == 0 {
@@ -310,6 +340,11 @@ function main() -> i32 {
     let h: i32 = dg_resy()
     let g: Gfx = gfx_open(w, h, "DOOM (Flow)")
 
+    if doomflow_ai_wanted() != 0 {
+        ai_pilot = 1
+        printf("doom-flow: AI pilot armed (warp E1M1 + open-loop combat)\n")
+    }
+
     doom_bootstrap("doom1.wad")
 
     let npix: i32 = w * h
@@ -317,15 +352,6 @@ function main() -> i32 {
     let src: ptr<u8> = dg_screen()
 
     keyscript = getenv("DOOMFLOW_KEYSCRIPT")
-    let ai_env: ptr<u8> = getenv("DOOMFLOW_AI")
-    if (ai_env as i64) != 0 and ai_env[0] as i32 != 0 {
-        ai_pilot = 1
-        # Boot a new game from the title/menu, then the pilot takes over.
-        if (keyscript as i64) == 0 {
-            keyscript = "80:13:1,88:13:0,130:13:1,138:13:0,170:13:1,178:13:0,200:13:1,208:13:0" as ptr<u8>
-        }
-        printf("doom-flow: AI pilot armed (menu keyscript + open-loop combat)\n")
-    }
     let mut frame: i32 = 0
 
     while !gfx_should_close(g) {

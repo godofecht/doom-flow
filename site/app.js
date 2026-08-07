@@ -33,9 +33,10 @@
       assetDir: "wasm/doom/",
       canvasW: 640,
       canvasH: 400,
-      copy: "A Flow pilot opens a new game and takes the stick. Sit back.",
-      hint: "DOOMFLOW_AI pilot · menu boot · open-loop combat",
-      env: { DOOMFLOW_AI: "1" }
+      copy: "Warps into E1M1 and an open-loop Flow pilot takes the stick.",
+      hint: "doomflow_set_ai · warp E1M1 · forward / turn / fire",
+      env: { DOOMFLOW_AI: "1" },
+      setAi: 1
     },
     arena: {
       label: "RL ARENA",
@@ -170,6 +171,14 @@
       .then(function (mod) {
         activeModule = mod;
         applyEnv(mod.ENV);
+        // Prefer the exported flag over ENV — getenv is flaky with MODULARIZE.
+        if (typeof mod._doomflow_set_ai === "function") {
+          mod._doomflow_set_ai(cfg.setAi ? 1 : 0);
+        } else if (mod.ccall) {
+          try {
+            mod.ccall("doomflow_set_ai", null, ["number"], [cfg.setAi ? 1 : 0]);
+          } catch (e) { /* older bundle */ }
+        }
         stopBtn.disabled = false;
         setStatus("running");
         window.flowGfxOnStart = function (title, w, h) {
