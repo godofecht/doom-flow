@@ -1,0 +1,160 @@
+# Keyboard input, ported from i_input.c to Flow.
+#
+# vanilla_keyboard_mapping was extern in i_video.h for unported menu /
+# config C; menu.flow reads it via INPUT_vanilla_keyboard_mapping().
+# Key/event state stays in this module: shiftdown and a stack InputEvent
+# struct for D_PostEvent.
+
+extern { function D_PostEvent(ev: ptr<void>) -> void }
+extern { function calloc(nmemb: i64, size: i64) -> ptr<void> }
+
+# ---- key queue (formerly dg_shim.c's DG_GetKey / dg_push_key) ---------
+
+const DG_KEYQ_SIZE: i32 = 64
+
+let mut dg_keyq_ptr: ptr<u16> = null
+let mut dg_keyq_r: i32 = 0
+let mut dg_keyq_w: i32 = 0
+
+function dg_keyq() -> ptr<u16> {
+    if (dg_keyq_ptr as i64) == 0 {
+        dg_keyq_ptr = calloc(DG_KEYQ_SIZE as i64, 2) as ptr<u16>
+    }
+    return dg_keyq_ptr
+}
+
+@flow_api
+function dg_push_key(pressed: i32, doomkey: i32) -> void {
+    let q: ptr<u16> = dg_keyq()
+    let next: i32 = (dg_keyq_w + 1) % DG_KEYQ_SIZE
+    if next == dg_keyq_r {
+        return
+    }
+    q[dg_keyq_w] = (((pressed & 1) << 8) | (doomkey & 0xFF)) as u16
+    dg_keyq_w = next
+}
+
+function dg_pop_key(pressed: ptr<i32>, doomKey: ptr<u8>) -> i32 {
+    if dg_keyq_r == dg_keyq_w {
+        return 0
+    }
+    let q: ptr<u16> = dg_keyq()
+    let v: i32 = q[dg_keyq_r] as i32
+    dg_keyq_r = (dg_keyq_r + 1) % DG_KEYQ_SIZE
+    pressed[0] = (v >> 8) & 1
+    doomKey[0] = (v & 0xFF) as u8
+    return 1
+}
+
+# d_event.h evtype_t
+const INPUT_EV_KEYDOWN: i32 = 0
+const INPUT_EV_KEYUP: i32 = 1
+
+# doomkeys.h
+const INPUT_KEY_RSHIFT: i32 = 0x80 + 0x36
+
+# arrlen(shiftxform) in C
+const INPUT_SHIFTXFORM_LEN: i32 = 128
+
+# event_t layout for D_PostEvent
+struct InputEvent {
+    typ: i32,
+    data1: i32,
+    data2: i32,
+    data3: i32,
+    data4: i32
+}
+
+let mut vanilla_keyboard_mapping: i32 = 1
+let mut shiftdown: i32 = 0
+
+@flow_api
+function INPUT_vanilla_keyboard_mapping() -> i32 {
+    return vanilla_keyboard_mapping
+}
+
+# American QWERTY shift map from i_input.c (128 entries, indices 0..127).
+let mut shiftxform: array<u8, 128> = [
+    0, 1, 2, 3, 4, 5, 6, 7,
+    8, 9, 10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23,
+    24, 25, 26, 27, 28, 29, 30, 31,
+    32, 33, 34, 35, 36, 37, 38, 34,
+    40, 41, 42, 43, 60, 95, 62, 63,
+    41, 33, 64, 35, 36, 37, 94, 38,
+    42, 40, 58, 58, 60, 43, 62, 63,
+    64, 65, 66, 67, 68, 69, 70, 71,
+    72, 73, 74, 75, 76, 77, 78, 79,
+    80, 81, 82, 83, 84, 85, 86, 87,
+    88, 89, 90, 91, 33, 93, 34, 95,
+    39, 65, 66, 67, 68, 69, 70, 71,
+    72, 73, 74, 75, 76, 77, 78, 79,
+    80, 81, 82, 83, 84, 85, 86, 87,
+    88, 89, 90, 123, 124, 125, 126, 127
+]
+
+function TranslateKey(key: u8) -> u8 {
+    # C body returns key; at_to_doom path is commented out.
+    return key
+}
+
+function GetTypedChar(key: u8) -> u8 {
+    let mut k: u8 = TranslateKey(key)
+    if shiftdown > 0 {
+        let ki: i32 = k as i32
+        if ki >= 0 and ki < INPUT_SHIFTXFORM_LEN {
+            k = shiftxform[ki]
+        } else {
+            k = 0 as u8
+        }
+    }
+    return k
+}
+
+function UpdateShiftStatus(pressed: i32, key: u8) -> void {
+    let mut change: i32 = 0 - 1
+    if pressed != 0 {
+        change = 1
+    }
+    if (key as i32) == INPUT_KEY_RSHIFT {
+        shiftdown = shiftdown + change
+    }
+}
+
+@flow_api
+function I_GetEvent() -> void {
+    let mut pressed: i32 = 0
+    let mut key: u8 = 0 as u8
+    let mut event: InputEvent = InputEvent {
+        typ: 0, data1: 0, data2: 0, data3: 0, data4: 0
+    }
+
+    while dg_pop_key(&pressed, &key) != 0 {
+        UpdateShiftStatus(pressed, key)
+
+        if pressed != 0 {
+            event.typ = INPUT_EV_KEYDOWN
+            event.data1 = TranslateKey(key) as i32
+            event.data2 = GetTypedChar(key) as i32
+            event.data3 = 0
+            event.data4 = 0
+            if event.data1 != 0 {
+                D_PostEvent(&event as ptr<void>)
+            }
+        } else {
+            event.typ = INPUT_EV_KEYUP
+            event.data1 = TranslateKey(key) as i32
+            event.data2 = 0
+            event.data3 = 0
+            event.data4 = 0
+            if event.data1 != 0 {
+                D_PostEvent(&event as ptr<void>)
+            }
+            break
+        }
+    }
+}
+
+@flow_api
+function I_InitInput() -> void {
+}

@@ -1,0 +1,16 @@
+# Exit text-mode ENDOOM screen, ported from i_endoom.c to Flow.
+#
+# In this doomgeneric build neither ORIGCODE nor __DJGPP__ is set, so
+# I_Endoom is a complete no-op (the TXT_ / DOS text-mode paths are
+# compiled out). ABI from i_endoom.h is preserved for the shutdown call
+# in d_main.c.
+
+# i_endoom.c (unused on this platform; kept for layout/docs).
+const ENDOOM_W: i32 = 80
+const ENDOOM_H: i32 = 25
+
+@flow_api
+function I_Endoom(endoom_data: ptr<u8>) -> void {
+    # No-op: text-mode ENDOOM display is not available here.
+    return
+}

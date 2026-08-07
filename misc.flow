@@ -1,0 +1,419 @@
+# Miscellaneous helpers, ported from m_misc.c to Flow.
+#
+# File I/O, path/string utilities. Variadic M_StringJoin / M_snprintf are
+# unused — callers use fixed-arity helpers in Flow. mkdir(2) arity and
+# errno/EISDIR differ by platform; those go through platform_stub.c
+# miscshim_* helpers. M_TempFile joins paths in Flow (3 fixed parts).
+
+extern { function fopen(path: string, mode: string) -> ptr<void> }
+extern { function fclose(f: ptr<void>) -> i32 }
+extern { function fread(dest: ptr<void>, size: i64, n: i64, f: ptr<void>) -> i64 }
+extern { function fwrite(src: ptr<void>, size: i64, n: i64, f: ptr<void>) -> i64 }
+extern { function fseek(f: ptr<void>, off: i64, whence: i32) -> i32 }
+extern { function ftell(f: ptr<void>) -> i64 }
+extern { function malloc(n: i64) -> ptr<void> }
+extern { function memset(dest: ptr<void>, c: i32, n: i64) -> ptr<void> }
+extern { function strlen(s: string) -> i64 }
+
+extern { function I_Error(msg: string) -> void }
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+
+extern { function miscshim_mkdir(path: ptr<u8>) -> void }
+extern { function miscshim_errno_is_isdir() -> i32 }
+extern { function printf(fmt: string, a: string, b: string) -> i32 }
+
+function miscshim_warn_trunc(filename: ptr<u8>, dest: ptr<u8>) -> void {
+    printf("Warning: Truncated '%s' lump name to '%.8s'.\n",
+           filename as string, dest as string)
+}
+
+# stdio.h
+const MISC_SEEK_SET: i32 = 0
+const MISC_SEEK_END: i32 = 2
+
+# doomtype.h (non-Windows): DIR_SEPARATOR == '/'
+const MISC_DIR_SEPARATOR: i32 = 47
+
+# z_zone.h
+const MISC_PU_STATIC: i32 = 1
+
+# ---- local string helpers ---------------------------------------------
+
+function misc_toupper(c: i32) -> i32 {
+    if c >= 97 and c <= 122 {
+        return c - 32
+    }
+    return c
+}
+
+function misc_is_space(c: i32) -> bool {
+    if c == 32 {
+        return true
+    }
+    return c >= 9 and c <= 13
+}
+
+function misc_skip_spaces(s: ptr<u8>, start: i32) -> i32 {
+    let mut i: i32 = start
+    while misc_is_space(s[i] as i32) {
+        i = i + 1
+    }
+    return i
+}
+
+function misc_streq_at(s: ptr<u8>, off: i32, other: ptr<u8>, n: i32) -> bool {
+    for i in 0 to n {
+        if s[off + i] as i32 != other[i] as i32 {
+            return false
+        }
+    }
+    return true
+}
+
+function misc_find_substr(hay: ptr<u8>, needle: ptr<u8>, needle_len: i32) -> i32 {
+    let hay_len: i32 = strlen(hay as string) as i32
+    if needle_len > hay_len {
+        return 0 - 1
+    }
+    let last: i32 = hay_len - needle_len
+    for i in 0 to last + 1 {
+        if misc_streq_at(hay, i, needle, needle_len) {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+function misc_hex_digit(c: i32) -> i32 {
+    if c >= 48 and c <= 57 {
+        return c - 48
+    }
+    if c >= 65 and c <= 70 {
+        return c - 55
+    }
+    if c >= 97 and c <= 102 {
+        return c - 87
+    }
+    return 0 - 1
+}
+
+# ---- file / path ------------------------------------------------------
+
+@flow_api
+function M_MakeDirectory(path: ptr<u8>) -> void {
+    miscshim_mkdir(path)
+}
+
+@flow_api
+function M_FileExists(filename: ptr<u8>) -> i32 {
+    let fstream: ptr<void> = fopen(filename as string, "r")
+    if (fstream as i64) != 0 {
+        fclose(fstream)
+        return 1
+    }
+    # Directory that cannot be fopen'd still "exists".
+    return miscshim_errno_is_isdir()
+}
+
+@flow_api
+function M_FileLength(fh: ptr<void>) -> i64 {
+    let savedpos: i64 = ftell(fh)
+    fseek(fh, 0, MISC_SEEK_END)
+    let length: i64 = ftell(fh)
+    fseek(fh, savedpos, MISC_SEEK_SET)
+    return length
+}
+
+@flow_api
+function M_WriteFile(name: ptr<u8>, source: ptr<void>, length: i32) -> i32 {
+    let fh: ptr<void> = fopen(name as string, "wb")
+    if (fh as i64) == 0 {
+        return 0
+    }
+    let count: i32 = fwrite(source, 1, length as i64, fh) as i32
+    fclose(fh)
+    if count < length {
+        return 0
+    }
+    return 1
+}
+
+@flow_api
+function M_ReadFile(name: ptr<u8>, buffer: ptr<ptr<u8> >) -> i32 {
+    let fh: ptr<void> = fopen(name as string, "rb")
+    if (fh as i64) == 0 {
+        I_Error("Couldn't read file")
+    }
+    let length: i32 = M_FileLength(fh) as i32
+    let buf: ptr<u8> = Z_Malloc(length, MISC_PU_STATIC, null) as ptr<u8>
+    let count: i32 = fread(buf as ptr<void>, 1, length as i64, fh) as i32
+    fclose(fh)
+    if count < length {
+        I_Error("Couldn't read file")
+    }
+    buffer[0] = buf
+    return length
+}
+
+@flow_api
+function M_TempFile(s: ptr<u8>) -> ptr<u8> {
+    # Non-Windows / non-DJGPP path from m_misc.c: "/tmp" + "/" + s.
+    let result_len: i64 = strlen("/tmp") + 1 + strlen(s as string) + 1
+    let result: ptr<u8> = malloc(result_len) as ptr<u8>
+    if (result as i64) == 0 {
+        I_Error("M_StringJoin: Failed to allocate new string.")
+        return null
+    }
+    M_StringCopy(result, "/tmp" as ptr<u8>, result_len)
+    M_StringConcat(result, "/" as ptr<u8>, result_len)
+    M_StringConcat(result, s, result_len)
+    return result
+}
+
+@flow_api
+function M_StrToInt(str: ptr<u8>, result: ptr<i32>) -> i32 {
+    # Matches sscanf order in m_misc.c: 0x%x, 0X%x, 0%o, %d.
+    let mut i: i32 = misc_skip_spaces(str, 0)
+
+    if str[i] as i32 == 48 and (str[i + 1] as i32 == 120 or str[i + 1] as i32 == 88) {
+        let mut j: i32 = i + 2
+        if misc_hex_digit(str[j] as i32) >= 0 {
+            let mut v: i32 = 0
+            while misc_hex_digit(str[j] as i32) >= 0 {
+                v = (v << 4) + misc_hex_digit(str[j] as i32)
+                j = j + 1
+            }
+            result[0] = v
+            return 1
+        }
+    }
+
+    i = misc_skip_spaces(str, 0)
+    if str[i] as i32 == 48 {
+        let mut j: i32 = i + 1
+        let c0: i32 = str[j] as i32
+        if c0 >= 48 and c0 <= 55 {
+            let mut v: i32 = 0
+            let mut cj: i32 = str[j] as i32
+            while cj >= 48 and cj <= 55 {
+                v = (v << 3) + (cj - 48)
+                j = j + 1
+                cj = str[j] as i32
+            }
+            result[0] = v
+            return 1
+        }
+    }
+
+    i = misc_skip_spaces(str, 0)
+    let mut sign: i32 = 1
+    if str[i] as i32 == 45 {
+        sign = 0 - 1
+        i = i + 1
+    } elif str[i] as i32 == 43 {
+        i = i + 1
+    }
+    let c: i32 = str[i] as i32
+    if c < 48 or c > 57 {
+        return 0
+    }
+    let mut v: i32 = 0
+    let mut cd: i32 = str[i] as i32
+    while cd >= 48 and cd <= 57 {
+        v = v * 10 + (cd - 48)
+        i = i + 1
+        cd = str[i] as i32
+    }
+    result[0] = v * sign
+    return 1
+}
+
+# Signature matches wad.flow's extern (string / ptr<void>); path bytes via cast.
+@flow_api
+function M_ExtractFileBase(path: string, dest: ptr<void>) -> void {
+    let p: ptr<u8> = path as ptr<u8>
+    let d: ptr<u8> = dest as ptr<u8>
+    let plen: i32 = strlen(path) as i32
+    let mut src: i32 = plen - 1
+
+    # back up until a DIR_SEPARATOR or the start
+    while src != 0 {
+        if p[src - 1] as i32 == MISC_DIR_SEPARATOR {
+            break
+        }
+        src = src - 1
+    }
+
+    let filename: ptr<u8> = ((p as i64) + src as i64) as ptr<u8>
+    let mut length: i32 = 0
+    memset(dest, 0, 8)
+
+    while p[src] as i32 != 0 and p[src] as i32 != 46 {
+        if length >= 8 {
+            miscshim_warn_trunc(filename, d)
+            break
+        }
+        d[length] = misc_toupper(p[src] as i32) as u8
+        length = length + 1
+        src = src + 1
+    }
+}
+
+@flow_api
+function M_ForceUppercase(text: ptr<u8>) -> void {
+    let mut i: i32 = 0
+    while text[i] as i32 != 0 {
+        text[i] = misc_toupper(text[i] as i32) as u8
+        i = i + 1
+    }
+}
+
+@flow_api
+function M_StrCaseStr(haystack: ptr<u8>, needle: ptr<u8>) -> ptr<u8> {
+    let haystack_len: i32 = strlen(haystack as string) as i32
+    let needle_len: i32 = strlen(needle as string) as i32
+    if haystack_len < needle_len {
+        return null
+    }
+    let len: i32 = haystack_len - needle_len
+    for i in 0 to len + 1 {
+        let mut ok: bool = true
+        for j in 0 to needle_len {
+            let a: i32 = misc_toupper(haystack[i + j] as i32)
+            let b: i32 = misc_toupper(needle[j] as i32)
+            if a != b {
+                ok = false
+                break
+            }
+        }
+        if ok {
+            return ((haystack as i64) + i as i64) as ptr<u8>
+        }
+    }
+    return null
+}
+
+@flow_api
+function M_StringDuplicate(orig: ptr<u8>) -> ptr<u8> {
+    let n: i64 = strlen(orig as string) + 1
+    let result: ptr<u8> = malloc(n) as ptr<u8>
+    if (result as i64) == 0 {
+        I_Error("Failed to duplicate string")
+    }
+    M_StringCopy(result, orig, n)
+    return result
+}
+
+@flow_api
+function M_StringReplace(haystack: ptr<u8>, needle: ptr<u8>, replacement: ptr<u8>) -> ptr<u8> {
+    let needle_len: i32 = strlen(needle as string) as i32
+    let repl_len: i32 = strlen(replacement as string) as i32
+    let mut result_len: i64 = strlen(haystack as string) + 1
+    let mut p: i32 = 0
+    let mut scanning: bool = true
+    while scanning {
+        let at: i32 = misc_find_substr(
+            ((haystack as i64) + p as i64) as ptr<u8>,
+            needle,
+            needle_len
+        )
+        if at < 0 {
+            scanning = false
+        } else {
+            p = p + at + needle_len
+            result_len = result_len + (repl_len - needle_len) as i64
+        }
+    }
+
+    let result: ptr<u8> = malloc(result_len) as ptr<u8>
+    if (result as i64) == 0 {
+        I_Error("M_StringReplace: Failed to allocate new string")
+        return null
+    }
+
+    let mut dst: i32 = 0
+    let mut dst_len: i64 = result_len
+    p = 0
+    while haystack[p] as i32 != 0 {
+        if misc_streq_at(haystack, p, needle, needle_len) {
+            let dptr: ptr<u8> = ((result as i64) + dst as i64) as ptr<u8>
+            M_StringCopy(dptr, replacement, dst_len)
+            p = p + needle_len
+            dst = dst + repl_len
+            dst_len = dst_len - repl_len as i64
+        } else {
+            result[dst] = haystack[p]
+            dst = dst + 1
+            dst_len = dst_len - 1
+            p = p + 1
+        }
+    }
+    result[dst] = 0 as u8
+    return result
+}
+
+@flow_api
+function M_StringCopy(dest: ptr<u8>, src: ptr<u8>, dest_size: i64) -> i32 {
+    if dest_size >= 1 {
+        dest[(dest_size - 1) as i32] = 0 as u8
+        let mut i: i64 = 0
+        while i < dest_size - 1 {
+            let c: u8 = src[i as i32]
+            dest[i as i32] = c
+            if c as i32 == 0 {
+                break
+            }
+            i = i + 1
+        }
+        if i == dest_size - 1 {
+            dest[i as i32] = 0 as u8
+        }
+    } else {
+        return 0
+    }
+    let len: i64 = strlen(dest as string)
+    if src[len as i32] as i32 == 0 {
+        return 1
+    }
+    return 0
+}
+
+@flow_api
+function M_StringConcat(dest: ptr<u8>, src: ptr<u8>, dest_size: i64) -> i32 {
+    let mut offset: i64 = strlen(dest as string)
+    if offset > dest_size {
+        offset = dest_size
+    }
+    let d: ptr<u8> = ((dest as i64) + offset) as ptr<u8>
+    return M_StringCopy(d, src, dest_size - offset)
+}
+
+@flow_api
+function M_StringStartsWith(s: ptr<u8>, prefix: ptr<u8>) -> i32 {
+    let sl: i64 = strlen(s as string)
+    let pl: i64 = strlen(prefix as string)
+    # Vanilla quirk: strict `>` so an exact match returns false.
+    if sl > pl and misc_streq_at(s, 0, prefix, pl as i32) {
+        return 1
+    }
+    return 0
+}
+
+@flow_api
+function M_StringEndsWith(s: ptr<u8>, suffix: ptr<u8>) -> i32 {
+    let sl: i64 = strlen(s as string)
+    let pl: i64 = strlen(suffix as string)
+    if sl >= pl {
+        let off: i32 = (sl - pl) as i32
+        if misc_streq_at(s, off, suffix, pl as i32) {
+            return 1
+        }
+    }
+    return 0
+}
+
+# Non-Windows path from m_misc.c — identity duplicate.
+@flow_api
+function M_OEMToUTF8(oem: ptr<u8>) -> ptr<u8> {
+    return M_StringDuplicate(oem)
+}

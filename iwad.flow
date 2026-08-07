@@ -1,0 +1,381 @@
+# IWAD search / identification, ported from d_iwad.c to Flow.
+#
+# ORIGCODE is #undef (config.h), so BuildIWADDirList only adds FILES_DIR
+# ("."). Windows registry / DOOMWADPATH / Unix share paths are absent.
+# FEATURE_DEHACKED is off, so DEH_String is the identity.
+#
+# iwad_t search-table entries are Flow structs (module-private). A heap
+# mirror exists so D_FindAllIWADs can return stable C pointers into it.
+# No C-visible globals — all state stays here.
+
+extern { function malloc(n: i64) -> ptr<void> }
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+extern { function free(p: ptr<void>) -> void }
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+extern { function strlen(s: ptr<u8>) -> i64 }
+extern { function printf(fmt: string, s: string) -> i32 }
+
+extern { function M_FileExists(filename: ptr<u8>) -> i32 }
+extern { function M_StringDuplicate(orig: ptr<u8>) -> ptr<u8> }
+extern { function M_CheckParmWithArgs(check: string, num_args: i32) -> i32 }
+extern { function I_Error(msg: string) -> void }
+
+extern { function argvflow_argv() -> ptr<i64> }
+
+# ---- Flow structs (iwad_t / search entries) ----------------------------
+
+struct IwadEntry {
+    name: string,
+    mission: i32,
+    mode: i32,
+    description: string
+}
+
+# GameMission_t / GameMode_t from d_mode.h
+const IWAD_MISSION_DOOM: i32 = 0
+const IWAD_MISSION_DOOM2: i32 = 1
+const IWAD_MISSION_PACK_TNT: i32 = 2
+const IWAD_MISSION_PACK_PLUT: i32 = 3
+const IWAD_MISSION_PACK_CHEX: i32 = 4
+const IWAD_MISSION_PACK_HACX: i32 = 5
+const IWAD_MISSION_HERETIC: i32 = 6
+const IWAD_MISSION_HEXEN: i32 = 7
+const IWAD_MISSION_STRIFE: i32 = 8
+const IWAD_MISSION_NONE: i32 = 9
+
+const IWAD_MODE_SHAREWARE: i32 = 0
+const IWAD_MODE_REGISTERED: i32 = 1
+const IWAD_MODE_COMMERCIAL: i32 = 2
+const IWAD_MODE_RETAIL: i32 = 3
+const IWAD_MODE_INDETERMINED: i32 = 4
+
+const IWAD_COUNT: i32 = 14
+const IWAD_SIZEOF_ENTRY: i32 = 24       # sizeof(iwad_t) LP64
+const IWAD_MAX_DIRS: i32 = 128
+const IWAD_DIR_SEPARATOR: i32 = 47      # '/' (doomtype.h, non-Windows)
+
+# FILES_DIR from config.h when ORIGCODE is off.
+const IWAD_FILES_DIR: string = "."
+
+let mut iwads: array<IwadEntry, 14> = [
+    IwadEntry { name: "doom2.wad", mission: 1, mode: 2, description: "Doom II" },
+    IwadEntry { name: "plutonia.wad", mission: 3, mode: 2, description: "Final Doom: Plutonia Experiment" },
+    IwadEntry { name: "tnt.wad", mission: 2, mode: 2, description: "Final Doom: TNT: Evilution" },
+    IwadEntry { name: "doom.wad", mission: 0, mode: 3, description: "Doom" },
+    IwadEntry { name: "doom1.wad", mission: 0, mode: 0, description: "Doom Shareware" },
+    IwadEntry { name: "chex.wad", mission: 4, mode: 0, description: "Chex Quest" },
+    IwadEntry { name: "hacx.wad", mission: 5, mode: 2, description: "Hacx" },
+    IwadEntry { name: "freedm.wad", mission: 1, mode: 2, description: "FreeDM" },
+    IwadEntry { name: "freedoom2.wad", mission: 1, mode: 2, description: "Freedoom: Phase 2" },
+    IwadEntry { name: "freedoom1.wad", mission: 0, mode: 3, description: "Freedoom: Phase 1" },
+    IwadEntry { name: "heretic.wad", mission: 6, mode: 3, description: "Heretic" },
+    IwadEntry { name: "heretic1.wad", mission: 6, mode: 0, description: "Heretic Shareware" },
+    IwadEntry { name: "hexen.wad", mission: 7, mode: 2, description: "Hexen" },
+    IwadEntry { name: "strife1.wad", mission: 8, mode: 2, description: "Strife" }
+]
+
+# Heap mirror of iwads[] so D_FindAllIWADs can hand out stable pointers.
+let mut iwads_heap: ptr<u8> = null
+
+# Search directories (char* table, like C's iwad_dirs[]).
+let mut iwad_dirs: ptr<i64> = null
+let mut num_iwad_dirs: i32 = 0
+let mut iwad_dirs_built: i32 = 0
+
+function iwad_ensure_dirs() -> void {
+    if (iwad_dirs as i64) == 0 {
+        iwad_dirs = calloc(IWAD_MAX_DIRS as i64, 8) as ptr<i64>
+    }
+}
+
+function iwad_ensure_heap() -> void {
+    if (iwads_heap as i64) != 0 {
+        return
+    }
+    iwads_heap = calloc(IWAD_COUNT as i64, IWAD_SIZEOF_ENTRY as i64) as ptr<u8>
+    for j in 0 to IWAD_COUNT {
+        let p: ptr<IwadEntry> = ((iwads_heap as i64) + (j * IWAD_SIZEOF_ENTRY) as i64) as ptr<IwadEntry>
+        p[0] = iwads[j]
+    }
+}
+
+function iwad_entry_ptr(i: i32) -> ptr<void> {
+    iwad_ensure_heap()
+    return ((iwads_heap as i64) + (i * IWAD_SIZEOF_ENTRY) as i64) as ptr<void>
+}
+
+function iwad_argv_at(i: i32) -> ptr<u8> {
+    let words: ptr<i64> = argvflow_argv()
+    return words[i] as ptr<u8>
+}
+
+function iwad_to_lower(c: i32) -> i32 {
+    if c >= 65 and c <= 90 {
+        return c + 32
+    }
+    return c
+}
+
+function iwad_str_iequal(a: ptr<u8>, b: ptr<u8>) -> bool {
+    let mut j: i32 = 0
+    let mut ca: i32 = iwad_to_lower(a[0] as i32)
+    let mut cb: i32 = iwad_to_lower(b[0] as i32)
+    while ca == cb {
+        if ca == 0 {
+            return true
+        }
+        j = j + 1
+        ca = iwad_to_lower(a[j] as i32)
+        cb = iwad_to_lower(b[j] as i32)
+    }
+    return false
+}
+
+function iwad_str_equal(a: ptr<u8>, b: ptr<u8>) -> bool {
+    let mut j: i32 = 0
+    while a[j] as i32 == b[j] as i32 {
+        if a[j] as i32 == 0 {
+            return true
+        }
+        j = j + 1
+    }
+    return false
+}
+
+# Join dir + "/" + name (fixed-arity stand-in for M_StringJoin).
+function iwad_join_path(dir: string, name: string) -> string {
+    let d: ptr<u8> = dir as ptr<u8>
+    let n: ptr<u8> = name as ptr<u8>
+    let dlen: i32 = strlen(d) as i32
+    let nlen: i32 = strlen(n) as i32
+    let buf: ptr<u8> = malloc((dlen + 1 + nlen + 1) as i64) as ptr<u8>
+    memcpy(buf as ptr<void>, d as ptr<void>, dlen as i64)
+    buf[dlen] = IWAD_DIR_SEPARATOR as u8
+    memcpy(((buf as i64) + (dlen + 1) as i64) as ptr<void>, n as ptr<void>, nlen as i64)
+    buf[dlen + 1 + nlen] = 0 as u8
+    return buf as string
+}
+
+function iwad_error_not_found(name: string) -> void {
+    let n: ptr<u8> = name as ptr<u8>
+    let nlen: i32 = strlen(n) as i32
+    let pre: ptr<u8> = "IWAD file '" as ptr<u8>
+    let post: ptr<u8> = "' not found!" as ptr<u8>
+    let buf: ptr<u8> = malloc((11 + nlen + 13 + 1) as i64) as ptr<u8>
+    memcpy(buf as ptr<void>, pre as ptr<void>, 11)
+    memcpy(((buf as i64) + 11) as ptr<void>, n as ptr<void>, nlen as i64)
+    memcpy(((buf as i64) + (11 + nlen) as i64) as ptr<void>, post as ptr<void>, 13)
+    buf[11 + nlen + 13] = 0 as u8
+    I_Error(buf as string)
+}
+
+function AddIWADDir(dir: ptr<u8>) -> void {
+    iwad_ensure_dirs()
+    if num_iwad_dirs < IWAD_MAX_DIRS {
+        iwad_dirs[num_iwad_dirs] = dir as i64
+        num_iwad_dirs = num_iwad_dirs + 1
+    }
+}
+
+function DirIsFile(path: string, filename: string) -> i32 {
+    let p: ptr<u8> = path as ptr<u8>
+    let f: ptr<u8> = filename as ptr<u8>
+    let path_len: i32 = strlen(p) as i32
+    let filename_len: i32 = strlen(f) as i32
+    if path_len < filename_len + 1 {
+        return 0
+    }
+    if p[path_len - filename_len - 1] as i32 != IWAD_DIR_SEPARATOR {
+        return 0
+    }
+    let tail: ptr<u8> = ((p as i64) + (path_len - filename_len) as i64) as ptr<u8>
+    if iwad_str_iequal(tail, f) {
+        return 1
+    }
+    return 0
+}
+
+function CheckDirectoryHasIWAD(dir: string, iwadname: string) -> ptr<u8> {
+    if DirIsFile(dir, iwadname) != 0 and M_FileExists(dir as ptr<u8>) != 0 {
+        return M_StringDuplicate(dir as ptr<u8>)
+    }
+
+    let mut filename: ptr<u8> = null
+    if iwad_str_equal(dir as ptr<u8>, "." as ptr<u8>) {
+        filename = M_StringDuplicate(iwadname as ptr<u8>)
+    } else {
+        filename = iwad_join_path(dir, iwadname) as ptr<u8>
+    }
+
+    printf("Trying IWAD file:%s\n", filename as string)
+
+    if M_FileExists(filename) != 0 {
+        return filename
+    }
+
+    free(filename as ptr<void>)
+    return null
+}
+
+function SearchDirectoryForIWAD(dir: string, mask: i32, mission: ptr<i32>) -> ptr<u8> {
+    for i in 0 to IWAD_COUNT {
+        let e: IwadEntry = iwads[i]
+        if ((1 << e.mission) & mask) != 0 {
+            let filename: ptr<u8> = CheckDirectoryHasIWAD(dir, e.name)
+            if (filename as i64) != 0 {
+                mission[0] = e.mission
+                return filename
+            }
+        }
+    }
+    return null
+}
+
+function IdentifyIWADByName(name: string, mask: i32) -> i32 {
+    let mut base: ptr<u8> = name as ptr<u8>
+    let mut j: i32 = 0
+    let mut sep: i32 = 0 - 1
+    while base[j] as i32 != 0 {
+        if base[j] as i32 == IWAD_DIR_SEPARATOR {
+            sep = j
+        }
+        j = j + 1
+    }
+    if sep >= 0 {
+        base = ((base as i64) + (sep + 1) as i64) as ptr<u8>
+    }
+
+    let mut mission: i32 = IWAD_MISSION_NONE
+    for i in 0 to IWAD_COUNT {
+        let e: IwadEntry = iwads[i]
+        if ((1 << e.mission) & mask) != 0 and iwad_str_iequal(base, e.name as ptr<u8>) {
+            mission = e.mission
+            return mission
+        }
+    }
+    return mission
+}
+
+function BuildIWADDirList() -> void {
+    if iwad_dirs_built != 0 {
+        return
+    }
+    # #else branch of ORIGCODE in d_iwad.c
+    AddIWADDir(IWAD_FILES_DIR as ptr<u8>)
+    iwad_dirs_built = 1
+}
+
+@flow_api
+function D_FindWADByName(name: string) -> string {
+    if M_FileExists(name as ptr<u8>) != 0 {
+        return name
+    }
+
+    BuildIWADDirList()
+
+    for i in 0 to num_iwad_dirs {
+        let dir: ptr<u8> = iwad_dirs[i] as ptr<u8>
+        if DirIsFile(dir as string, name) != 0 and M_FileExists(dir) != 0 {
+            return M_StringDuplicate(dir) as string
+        }
+        let path: ptr<u8> = iwad_join_path(dir as string, name) as ptr<u8>
+        if M_FileExists(path) != 0 {
+            return path as string
+        }
+        free(path as ptr<void>)
+    }
+
+    let none: ptr<u8> = null
+    return none as string
+}
+
+@flow_api
+function D_TryFindWADByName(filename: string) -> string {
+    let result: ptr<u8> = D_FindWADByName(filename) as ptr<u8>
+    if (result as i64) != 0 {
+        return result as string
+    }
+    return filename
+}
+
+@flow_api
+function D_FindIWAD(mask: i32, mission: ptr<i32>) -> string {
+    let iwadparm: i32 = M_CheckParmWithArgs("-iwad", 1)
+
+    if iwadparm != 0 {
+        let iwadfile: string = iwad_argv_at(iwadparm + 1) as string
+        let result: ptr<u8> = D_FindWADByName(iwadfile) as ptr<u8>
+        if (result as i64) == 0 {
+            iwad_error_not_found(iwadfile)
+        }
+        mission[0] = IdentifyIWADByName(result as string, mask)
+        return result as string
+    }
+
+    printf("-iwad not specified, trying a few iwad names%s\n", "")
+
+    let mut result: ptr<u8> = null
+    BuildIWADDirList()
+
+    let mut i: i32 = 0
+    while (result as i64) == 0 and i < num_iwad_dirs {
+        let dir: ptr<u8> = iwad_dirs[i] as ptr<u8>
+        result = SearchDirectoryForIWAD(dir as string, mask, mission)
+        i = i + 1
+    }
+
+    return result as string
+}
+
+@flow_api
+function D_FindAllIWADs(mask: i32) -> ptr<i64> {
+    let result: ptr<i64> = malloc(((IWAD_COUNT + 1) * 8) as i64) as ptr<i64>
+    let mut result_len: i32 = 0
+
+    for i in 0 to IWAD_COUNT {
+        let e: IwadEntry = iwads[i]
+        if ((1 << e.mission) & mask) != 0 {
+            let filename: ptr<u8> = D_FindWADByName(e.name) as ptr<u8>
+            if (filename as i64) != 0 {
+                result[result_len] = iwad_entry_ptr(i) as i64
+                result_len = result_len + 1
+            }
+        }
+    }
+
+    result[result_len] = 0
+    return result
+}
+
+@flow_api
+function D_SaveGameIWADName(gamemission: i32) -> string {
+    for i in 0 to IWAD_COUNT {
+        let e: IwadEntry = iwads[i]
+        if gamemission == e.mission {
+            return e.name
+        }
+    }
+    return "unknown.wad"
+}
+
+@flow_api
+function D_SuggestIWADName(mission: i32, mode: i32) -> string {
+    for i in 0 to IWAD_COUNT {
+        let e: IwadEntry = iwads[i]
+        if e.mission == mission and e.mode == mode {
+            return e.name
+        }
+    }
+    return "unknown.wad"
+}
+
+@flow_api
+function D_SuggestGameName(mission: i32, mode: i32) -> string {
+    for i in 0 to IWAD_COUNT {
+        let e: IwadEntry = iwads[i]
+        if e.mission == mission and (mode == IWAD_MODE_INDETERMINED or e.mode == mode) {
+            return e.description
+        }
+    }
+    return "Unknown game?"
+}

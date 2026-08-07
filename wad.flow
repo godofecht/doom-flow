@@ -1,0 +1,441 @@
+# WAD file loading, ported from w_wad.c / w_file_stdc.c to Flow.
+#
+# This module owns the engine's lump directory. The exported symbols keep
+# the exact C names and ABI, and the lumpinfo array keeps the exact
+# lumpinfo_t memory layout, because C modules (r_things.c, d_main.c,
+# w_checksum.c) index lumpinfo[] directly:
+#
+#   struct lumpinfo_s {          offset
+#       char        name[8];        0
+#       wad_file_t *wad_file;       8
+#       int         position;      16
+#       int         size;          20
+#       void       *cache;         24
+#       lumpinfo_t *next;          32
+#   };                     stride  40
+#
+# The next field is only read by this module, so hash chains store
+# lump index + 1 rather than a pointer (0 means end of chain).
+
+extern { function fopen(path: string, mode: string) -> ptr<void> }
+extern { function fclose(f: ptr<void>) -> i32 }
+extern { function fseek(f: ptr<void>, off: i64, whence: i32) -> i32 }
+extern { function ftell(f: ptr<void>) -> i64 }
+extern { function fread(dest: ptr<void>, size: i64, n: i64, f: ptr<void>) -> i64 }
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+extern { function malloc(n: i64) -> ptr<void> }
+extern { function free(p: ptr<void>) -> void }
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+extern { function strlen(s: string) -> i64 }
+extern { function printf(fmt: string, s: string) -> i32 }
+
+extern { function I_Error(msg: string) -> void }
+extern { function I_BeginRead() -> void }
+extern { function I_EndRead() -> void }
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function Z_ChangeTag2(p: ptr<void>, tag: i32, file: string, line: i32) -> void }
+extern { function Z_ChangeUser(p: ptr<void>, user: ptr<void>) -> void }
+extern { function M_ExtractFileBase(path: string, dest: ptr<void>) -> void }
+
+const LUMP_STRIDE: i32 = 40
+const PU_CACHE_TAG: i32 = 8
+
+# GameMission_t values from d_mode.h.
+const MISSION_DOOM: i32 = 0
+const MISSION_HERETIC: i32 = 6
+const MISSION_HEXEN: i32 = 7
+const MISSION_STRIFE: i32 = 8
+
+# The engine-visible globals. Emitted as plain C symbols; w_wad.h's
+# extern declarations resolve to these.
+let mut wlumpinfo: ptr<u8> = null
+let mut wnumlumps: u32 = 0
+
+# Cross-module accessors (formerly dg_shim.c's wadflow_lumpinfo/numlumps,
+# synced through wadflow_set_dir). things.flow / dmain.flow / checksum.flow
+# read the directory through these now that it's Flow-owned outright.
+@flow_api
+function wadflow_lumpinfo() -> ptr<u8> { return wlumpinfo }
+
+@flow_api
+function wadflow_numlumps() -> u32 { return wnumlumps }
+
+let mut wad_lumphash: ptr<i64> = null
+
+# ---- lumpinfo field access, by explicit layout ------------------------
+
+function lump_name_byte(i: i32, j: i32) -> u8 {
+    return wlumpinfo[i * LUMP_STRIDE + j]
+}
+
+function lump_name_ptr(i: i32) -> ptr<u8> {
+    return ((wlumpinfo as i64) + (i * LUMP_STRIDE) as i64) as ptr<u8>
+}
+
+function lump_position(i: i32) -> i32 {
+    let ints: ptr<i32> = wlumpinfo as ptr<i32>
+    return ints[i * 10 + 4]
+}
+
+function lump_size(i: i32) -> i32 {
+    let ints: ptr<i32> = wlumpinfo as ptr<i32>
+    return ints[i * 10 + 5]
+}
+
+function lump_wadfile(i: i32) -> i64 {
+    let words: ptr<i64> = wlumpinfo as ptr<i64>
+    return words[i * 5 + 1]
+}
+
+function lump_cache(i: i32) -> i64 {
+    let words: ptr<i64> = wlumpinfo as ptr<i64>
+    return words[i * 5 + 3]
+}
+
+function lump_cache_addr(i: i32) -> ptr<void> {
+    return ((wlumpinfo as i64) + (i * LUMP_STRIDE + 24) as i64) as ptr<void>
+}
+
+function lump_set_cache(i: i32, v: i64) -> void {
+    let words: ptr<i64> = wlumpinfo as ptr<i64>
+    words[i * 5 + 3] = v
+}
+
+function lump_next(i: i32) -> i64 {
+    let words: ptr<i64> = wlumpinfo as ptr<i64>
+    return words[i * 5 + 4]
+}
+
+function lump_set_next(i: i32, v: i64) -> void {
+    let words: ptr<i64> = wlumpinfo as ptr<i64>
+    words[i * 5 + 4] = v
+}
+
+# ---- wad_file handles -------------------------------------------------
+#
+# Opaque outside this module; w_checksum.c only compares the pointers
+# for identity. Layout: FILE* at 0, file length at 8.
+
+function wadfile_stream(wf: i64) -> ptr<void> {
+    let words: ptr<i64> = wf as ptr<i64>
+    return words[0] as ptr<void>
+}
+
+function wadfile_length(wf: i64) -> i64 {
+    let words: ptr<i64> = wf as ptr<i64>
+    return words[1]
+}
+
+function wad_open(path: string) -> i64 {
+    let f: ptr<void> = fopen(path, "rb")
+    if (f as i64) == 0 {
+        return 0
+    }
+    fseek(f, 0, 2)
+    let len: i64 = ftell(f)
+    let wf: ptr<i64> = calloc(2, 8) as ptr<i64>
+    wf[0] = f as i64
+    wf[1] = len
+    return wf as i64
+}
+
+function wad_read(wf: i64, offset: i32, dest: ptr<void>, len: i32) -> i32 {
+    let f: ptr<void> = wadfile_stream(wf)
+    fseek(f, offset as i64, 0)
+    return fread(dest, 1, len as i64, f) as i32
+}
+
+# ---- name handling ----------------------------------------------------
+
+function upper(c: i32) -> i32 {
+    if c >= 97 and c <= 122 {
+        return c - 32
+    }
+    return c
+}
+
+function names_equal(a: ptr<u8>, b: ptr<u8>) -> bool {
+    let mut j: i32 = 0
+    while j < 8 {
+        let ca: i32 = upper(a[j] as i32)
+        let cb: i32 = upper(b[j] as i32)
+        if ca != cb {
+            return false
+        }
+        if ca == 0 {
+            return true
+        }
+        j = j + 1
+    }
+    return true
+}
+
+# djb2 over at most 8 uppercased chars, exactly as w_wad.c had it.
+@flow_api
+function W_LumpNameHash(s: ptr<u8>) -> u32 {
+    let mut result: u32 = 5381
+    let mut i: i32 = 0
+    while i < 8 {
+        let c: i32 = s[i] as i32
+        if c == 0 {
+            return result
+        }
+        result = ((result << 5) ^ result) ^ (upper(c) as u32)
+        i = i + 1
+    }
+    return result
+}
+
+# ---- directory management ---------------------------------------------
+
+function extend_lumpinfo(newnumlumps: i32) -> void {
+    let newinfo: ptr<u8> = calloc(newnumlumps as i64, LUMP_STRIDE as i64) as ptr<u8>
+    if (newinfo as i64) == 0 {
+        I_Error("Couldn't realloc wlumpinfo")
+    }
+    let mut i: i32 = 0
+    while (i as u32) < wnumlumps and i < newnumlumps {
+        let src: ptr<void> = lump_name_ptr(i) as ptr<void>
+        let dst: ptr<void> = ((newinfo as i64) + (i * LUMP_STRIDE) as i64) as ptr<void>
+        memcpy(dst, src, LUMP_STRIDE as i64)
+        i = i + 1
+    }
+    let old: ptr<u8> = wlumpinfo
+    wlumpinfo = newinfo
+    wnumlumps = newnumlumps as u32
+    # Cached lumps register &lump->cache as their zone user pointer; tell
+    # the zone allocator those slots moved.
+    let mut k: i32 = 0
+    while k < i {
+        if lump_cache(k) != 0 {
+            Z_ChangeUser(lump_cache(k) as ptr<void>, lump_cache_addr(k))
+        }
+        k = k + 1
+    }
+    if (old as i64) != 0 {
+        free(old as ptr<void>)
+    }
+}
+
+@flow_api
+function W_AddFile(filename: string) -> ptr<void> {
+    let wf: i64 = wad_open(filename)
+    if wf == 0 {
+        printf(" couldn't open %s\n", filename)
+        return null
+    }
+
+    let mut newnumlumps: i32 = wnumlumps as i32
+    let mut fileinfo: ptr<u8> = null
+    let fname: ptr<u8> = filename as ptr<u8>
+    let flen: i32 = strlen(filename) as i32
+
+    let mut is_wad: bool = false
+    if flen >= 3 {
+        let e0: i32 = upper(fname[flen - 3] as i32)
+        let e1: i32 = upper(fname[flen - 2] as i32)
+        let e2: i32 = upper(fname[flen - 1] as i32)
+        if e0 == 87 and e1 == 65 and e2 == 68 {
+            is_wad = true
+        }
+    }
+
+    if !is_wad {
+        # Single lump file: fake a one-entry WAD directory.
+        fileinfo = malloc(16) as ptr<u8>
+        let fi: ptr<i32> = fileinfo as ptr<i32>
+        fi[0] = 0
+        fi[1] = wadfile_length(wf) as i32
+        M_ExtractFileBase(filename, ((fileinfo as i64) + 8) as ptr<void>)
+        newnumlumps = newnumlumps + 1
+    } else {
+        # WAD file: header is "IWAD"/"PWAD", wnumlumps, infotableofs.
+        let header: ptr<u8> = malloc(12) as ptr<u8>
+        wad_read(wf, 0, header as ptr<void>, 12)
+        let id1: i32 = header[1] as i32
+        let id2: i32 = header[2] as i32
+        let id3: i32 = header[3] as i32
+        # byte 0 is 'I' or 'P'; bytes 1-3 must be "WAD"
+        if id1 != 87 or id2 != 65 or id3 != 68 {
+            I_Error("Wad file doesn't have IWAD or PWAD id")
+        }
+        let hints: ptr<i32> = header as ptr<i32>
+        let wadlumps: i32 = hints[1]
+        let infotableofs: i32 = hints[2]
+        free(header as ptr<void>)
+
+        let dirlen: i32 = wadlumps * 16
+        fileinfo = malloc(dirlen as i64) as ptr<u8>
+        wad_read(wf, infotableofs, fileinfo as ptr<void>, dirlen)
+        newnumlumps = newnumlumps + wadlumps
+    }
+
+    let startlump: i32 = wnumlumps as i32
+    extend_lumpinfo(newnumlumps)
+
+    # Fill the new directory entries. filelump_t is 16 bytes:
+    # filepos, size, name[8].
+    let mut i: i32 = startlump
+    let mut j: i32 = 0
+    while (i as u32) < wnumlumps {
+        let fi: ptr<i32> = ((fileinfo as i64) + (j * 16) as i64) as ptr<i32>
+        let ints: ptr<i32> = wlumpinfo as ptr<i32>
+        let words: ptr<i64> = wlumpinfo as ptr<i64>
+        words[i * 5 + 1] = wf           # wad_file
+        ints[i * 10 + 4] = fi[0]        # position
+        ints[i * 10 + 5] = fi[1]        # size
+        words[i * 5 + 3] = 0            # cache
+        let mut b: i32 = 0
+        while b < 8 {
+            wlumpinfo[i * LUMP_STRIDE + b] = fileinfo[j * 16 + 8 + b]
+            b = b + 1
+        }
+        i = i + 1
+        j = j + 1
+    }
+
+    free(fileinfo as ptr<void>)
+
+    if (wad_lumphash as i64) != 0 {
+        free(wad_lumphash as ptr<void>)
+        wad_lumphash = null
+    }
+
+    return wf as ptr<void>
+}
+
+@flow_api
+function W_NumLumps() -> i32 {
+    return wnumlumps as i32
+}
+
+@flow_api
+function W_CheckNumForName(name: string) -> i32 {
+    let np: ptr<u8> = name as ptr<u8>
+
+    if (wad_lumphash as i64) != 0 {
+        let hash: u32 = W_LumpNameHash(np) % wnumlumps
+        let mut idx: i64 = wad_lumphash[hash as i32]
+        while idx != 0 {
+            let i: i32 = (idx - 1) as i32
+            if names_equal(lump_name_ptr(i), np) {
+                return i
+            }
+            idx = lump_next(i)
+        }
+    } else {
+        # No hash table yet: scan backwards so patch lumps take precedence.
+        let mut i: i32 = (wnumlumps as i32) - 1
+        while i >= 0 {
+            if names_equal(lump_name_ptr(i), np) {
+                return i
+            }
+            i = i - 1
+        }
+    }
+
+    return 0 - 1
+}
+
+@flow_api
+function W_GetNumForName(name: string) -> i32 {
+    let i: i32 = W_CheckNumForName(name)
+    if i < 0 {
+        printf("W_GetNumForName: %s not found!\n", name)
+        I_Error("W_GetNumForName: lump not found")
+    }
+    return i
+}
+
+@flow_api
+function W_LumpLength(lump: u32) -> i32 {
+    if lump >= wnumlumps {
+        I_Error("W_LumpLength: lump >= wnumlumps")
+    }
+    return lump_size(lump as i32)
+}
+
+@flow_api
+function W_ReadLump(lump: u32, dest: ptr<void>) -> void {
+    if lump >= wnumlumps {
+        I_Error("W_ReadLump: lump >= wnumlumps")
+    }
+    let i: i32 = lump as i32
+    I_BeginRead()
+    let c: i32 = wad_read(lump_wadfile(i), lump_position(i), dest, lump_size(i))
+    if c < lump_size(i) {
+        I_Error("W_ReadLump: incomplete read")
+    }
+    I_EndRead()
+}
+
+@flow_api
+function W_CacheLumpNum(lumpnum: i32, tag: i32) -> ptr<void> {
+    if (lumpnum as u32) >= wnumlumps {
+        I_Error("W_CacheLumpNum: lumpnum >= wnumlumps")
+    }
+
+    if lump_cache(lumpnum) != 0 {
+        # Already cached: just switch the zone tag.
+        Z_ChangeTag2(lump_cache(lumpnum) as ptr<void>, tag, "wad.flow", 0)
+    } else {
+        let p: ptr<void> = Z_Malloc(lump_size(lumpnum), tag, lump_cache_addr(lumpnum))
+        lump_set_cache(lumpnum, p as i64)
+        W_ReadLump(lumpnum as u32, p)
+    }
+
+    return lump_cache(lumpnum) as ptr<void>
+}
+
+@flow_api
+function W_CacheLumpName(name: string, tag: i32) -> ptr<void> {
+    return W_CacheLumpNum(W_GetNumForName(name), tag)
+}
+
+@flow_api
+function W_GenerateHashTable() -> void {
+    if (wad_lumphash as i64) != 0 {
+        free(wad_lumphash as ptr<void>)
+        wad_lumphash = null
+    }
+    if wnumlumps > 0 {
+        wad_lumphash = calloc(wnumlumps as i64, 8) as ptr<i64>
+        let mut i: i32 = 0
+        while (i as u32) < wnumlumps {
+            let hash: u32 = W_LumpNameHash(lump_name_ptr(i)) % wnumlumps
+            lump_set_next(i, wad_lumphash[hash as i32])
+            wad_lumphash[hash as i32] = (i + 1) as i64
+            i = i + 1
+        }
+    }
+}
+
+@flow_api
+function W_ReleaseLumpNum(lumpnum: i32) -> void {
+    if (lumpnum as u32) >= wnumlumps {
+        I_Error("W_ReleaseLumpNum: lumpnum >= wnumlumps")
+    }
+    Z_ChangeTag2(lump_cache(lumpnum) as ptr<void>, PU_CACHE_TAG, "wad.flow", 0)
+}
+
+@flow_api
+function W_ReleaseLumpName(name: string) -> void {
+    W_ReleaseLumpNum(W_GetNumForName(name))
+}
+
+function check_unique_lump(mission: i32, owner: i32, name: string) -> void {
+    if mission != owner {
+        if W_CheckNumForName(name) >= 0 {
+            printf("Found lump %s from a different game's IWAD.\n", name)
+            I_Error("You are using the wrong IWAD for this game.")
+        }
+    }
+}
+
+@flow_api
+function W_CheckCorrectIWAD(mission: i32) -> void {
+    check_unique_lump(mission, MISSION_DOOM, "POSSA1")
+    check_unique_lump(mission, MISSION_HERETIC, "IMPXA1")
+    check_unique_lump(mission, MISSION_HEXEN, "ETTNA1")
+    check_unique_lump(mission, MISSION_STRIFE, "AGRDA1")
+}

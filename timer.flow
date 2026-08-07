@@ -1,0 +1,68 @@
+# Timer functions, ported from i_timer.c to Flow.
+#
+# Uses Flow runtime clock / sleep (flow_rt_time_ms / flow_rt_usleep) so
+# the generated C TU does not need POSIX headers.
+
+extern { function flow_rt_time_ms() -> u32 }
+extern { function flow_rt_usleep(usec: i32) -> void }
+
+# TICRATE from i_timer.h.
+const TICRATE: i32 = 35
+
+let mut basetime: u32 = 0
+
+@flow_api
+function DG_GetTicksMs() -> u32 {
+    return flow_rt_time_ms()
+}
+
+@flow_api
+function DG_SleepMs(ms: u32) -> void {
+    flow_rt_usleep((ms * (1000 as u32)) as i32)
+}
+
+@flow_api
+function I_GetTicks() -> i32 {
+    return flow_rt_time_ms() as i32
+}
+
+# Returns time in 1/35th second tics. The multiply and divide stay in
+# uint32, wrapping exactly as the C version does.
+@flow_api
+function I_GetTime() -> i32 {
+    let mut ticks: u32 = flow_rt_time_ms()
+    if basetime == 0 {
+        basetime = ticks
+    }
+    ticks = ticks - basetime
+    return ((ticks * (TICRATE as u32)) / (1000 as u32)) as i32
+}
+
+# Same as I_GetTime, but in milliseconds.
+@flow_api
+function I_GetTimeMS() -> i32 {
+    let ticks: u32 = flow_rt_time_ms()
+    if basetime == 0 {
+        basetime = ticks
+    }
+    return (ticks - basetime) as i32
+}
+
+@flow_api
+function I_Sleep(ms: i32) -> void {
+    flow_rt_usleep(ms * 1000)
+}
+
+# No-op in doomgeneric (the SDL sleep is commented out there too).
+@flow_api
+function I_WaitVBL(count: i32) -> void {
+    if count == 0 {
+        return
+    }
+}
+
+# No-op in doomgeneric; there is no SDL timer subsystem to initialize.
+@flow_api
+function I_InitTimer() -> void {
+    return
+}

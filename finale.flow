@@ -1,0 +1,885 @@
+# Game completion / final screen animation, ported from f_finale.c to Flow.
+#
+# Public ABI (f_finale.h): F_StartFinale, F_Responder, F_Ticker, F_Drawer.
+# Cast helpers and drawers stay module-private. Finale-owned globals,
+# textscreen/cast tables, and cast sfx picker live here. Long text blobs
+# live in this module (@flow_api finaledata_*).
+
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+extern { function strlen(s: string) -> i64 }
+
+extern { function W_CacheLumpName(name: string, tag: i32) -> ptr<void> }
+extern { function W_CacheLumpNum(lumpnum: i32, tag: i32) -> ptr<void> }
+extern { function V_MarkRect(x: i32, y: i32, width: i32, height: i32) -> void }
+extern { function V_DrawPatch(x: i32, y: i32, patch: ptr<void>) -> void }
+extern { function V_DrawPatchFlipped(x: i32, y: i32, patch: ptr<void>) -> void }
+extern { function S_ChangeMusic(music_id: i32, looping: i32) -> void }
+extern { function S_StartMusic(music_id: i32) -> void }
+extern { function S_StartSound(origin: ptr<void>, sound_id: i32) -> void }
+
+extern { function VIDEO_buffer() -> ptr<u8> }
+
+# hu_shim.c (hu_font owned there; m_menu.c / this module index it)
+extern { function hushim_hu_font() -> ptr<void> }
+extern { function PATCH_width(p: ptr<void>) -> i32 }
+extern { function PATCH_columnofs(p: ptr<void>, col: i32) -> i32 }
+
+extern { function STAT_logical_gamemission() -> i32 }
+
+# am_shim.c owns automapactive
+extern { function STAT_set_automapactive(v: i32) -> void }
+
+extern { function thingshim_sprite_frame_lump(sprite: i32, frame: i32, rot: i32) -> i32 }
+extern { function thingshim_sprite_frame_flip(sprite: i32, frame: i32, rot: i32) -> i32 }
+extern { function STAT_set_gamestate(v: i32) -> void }
+extern { function STAT_set_wipegamestate(v: i32) -> void }
+extern { function STAT_set_viewactive(v: i32) -> void }
+extern { function PLAYER_i_cmd_buttons(i: i32) -> i32 }
+extern { function STATE_at(i: i32) -> ptr<void> }
+extern { function STATE_tics(st: ptr<void>) -> i32 }
+extern { function STATE_nextstate(st: ptr<void>) -> i32 }
+extern { function STATE_sprite(st: ptr<void>) -> i32 }
+extern { function STATE_frame(st: ptr<void>) -> i32 }
+extern { function MOBJINFO_seestate(mtype: i32) -> i32 }
+extern { function MOBJINFO_meleestate(mtype: i32) -> i32 }
+extern { function MOBJINFO_missilestate(mtype: i32) -> i32 }
+extern { function MOBJINFO_deathstate(mtype: i32) -> i32 }
+extern { function MOBJINFO_seesound(mtype: i32) -> i32 }
+extern { function MOBJINFO_deathsound(mtype: i32) -> i32 }
+extern { function RDATA_firstspritelump() -> i32 }
+extern { function STAT_set_gameaction(v: i32) -> void }
+
+# ---- constants (prefixed: one Flow TU) --------------------------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+const F_SCREENWIDTH: i32 = 320
+const F_SCREENHEIGHT: i32 = 200
+
+const F_PU_LEVEL: i32 = 5
+const F_PU_CACHE: i32 = 8
+
+const F_TEXTSPEED: i32 = 3
+const F_TEXTWAIT: i32 = 250
+
+const F_STAGE_TEXT: i32 = 0
+const F_STAGE_ARTSCREEN: i32 = 1
+const F_STAGE_CAST: i32 = 2
+
+const F_GA_NOTHING: i32 = 0
+const F_GA_WORLDDONE: i32 = 8
+const F_GS_FINALE: i32 = 2
+
+const F_GM_COMMERCIAL: i32 = 2
+const F_GM_RETAIL: i32 = 3
+const F_EXE_CHEX: i32 = 9
+
+const F_MISSION_DOOM: i32 = 0
+const F_MISSION_DOOM2: i32 = 1
+const F_MISSION_PACK_TNT: i32 = 2
+const F_MISSION_PACK_PLUT: i32 = 3
+
+const F_MAXPLAYERS: i32 = 4
+const F_HU_FONTSTART: i32 = 33
+const F_HU_FONTSIZE: i32 = 63
+
+const F_EV_KEYDOWN: i32 = 0
+
+const F_MUS_BUNNY: i32 = 30
+const F_MUS_VICTOR: i32 = 31
+const F_MUS_EVIL: i32 = 63
+const F_MUS_READ_M: i32 = 65
+
+const F_SFX_PISTOL: i32 = 1
+const F_SFX_SHOTGN: i32 = 2
+const F_SFX_DSHTGN: i32 = 4
+const F_SFX_PLASMA: i32 = 8
+const F_SFX_RLAUNC: i32 = 14
+const F_SFX_FIRSHT: i32 = 16
+const F_SFX_SKLATK: i32 = 51
+const F_SFX_SGTATK: i32 = 52
+const F_SFX_SKEPCH: i32 = 53
+const F_SFX_VILATK: i32 = 54
+const F_SFX_CLAW: i32 = 55
+const F_SFX_SKESWG: i32 = 56
+const F_SFX_SKEATK: i32 = 107
+
+const F_S_NULL: i32 = 0
+const F_S_PLAY_ATK1: i32 = 154
+const F_S_POSS_ATK2: i32 = 185
+const F_S_SPOS_ATK2: i32 = 218
+const F_S_VILE_ATK2: i32 = 256
+const F_S_SKEL_FIST2: i32 = 336
+const F_S_SKEL_FIST4: i32 = 338
+const F_S_SKEL_MISS2: i32 = 340
+const F_S_FATT_ATK2: i32 = 377
+const F_S_FATT_ATK5: i32 = 380
+const F_S_FATT_ATK8: i32 = 383
+const F_S_CPOS_ATK2: i32 = 417
+const F_S_CPOS_ATK3: i32 = 418
+const F_S_CPOS_ATK4: i32 = 419
+const F_S_TROO_ATK3: i32 = 454
+const F_S_SARG_ATK2: i32 = 486
+const F_S_HEAD_ATK2: i32 = 505
+const F_S_BOSS_ATK2: i32 = 538
+const F_S_BOS2_ATK2: i32 = 567
+const F_S_SKULL_ATK2: i32 = 590
+const F_S_SPID_ATK2: i32 = 616
+const F_S_SPID_ATK3: i32 = 617
+const F_S_BSPI_ATK2: i32 = 648
+const F_S_CYBER_ATK2: i32 = 685
+const F_S_CYBER_ATK4: i32 = 687
+const F_S_CYBER_ATK6: i32 = 689
+const F_S_PAIN_ATK3: i32 = 710
+const F_FF_FRAMEMASK: i32 = 32767
+
+struct FTextScreen {
+    mission: i32,
+    episode: i32,
+    level: i32,
+    background: string,
+    text_id: i32
+}
+
+struct FCastEntry {
+    name: string,
+    mtype: i32
+}
+
+let mut f_textscreens: array<FTextScreen, 22> = [
+    FTextScreen { mission: 0, episode: 1, level: 8, background: "FLOOR4_8", text_id: 0 },
+    FTextScreen { mission: 0, episode: 2, level: 8, background: "SFLR6_1", text_id: 1 },
+    FTextScreen { mission: 0, episode: 3, level: 8, background: "MFLR8_4", text_id: 2 },
+    FTextScreen { mission: 0, episode: 4, level: 8, background: "MFLR8_3", text_id: 3 },
+    FTextScreen { mission: 1, episode: 1, level: 6, background: "SLIME16", text_id: 4 },
+    FTextScreen { mission: 1, episode: 1, level: 11, background: "RROCK14", text_id: 5 },
+    FTextScreen { mission: 1, episode: 1, level: 20, background: "RROCK07", text_id: 6 },
+    FTextScreen { mission: 1, episode: 1, level: 30, background: "RROCK17", text_id: 7 },
+    FTextScreen { mission: 1, episode: 1, level: 15, background: "RROCK13", text_id: 8 },
+    FTextScreen { mission: 1, episode: 1, level: 31, background: "RROCK19", text_id: 9 },
+    FTextScreen { mission: 2, episode: 1, level: 6, background: "SLIME16", text_id: 10 },
+    FTextScreen { mission: 2, episode: 1, level: 11, background: "RROCK14", text_id: 11 },
+    FTextScreen { mission: 2, episode: 1, level: 20, background: "RROCK07", text_id: 12 },
+    FTextScreen { mission: 2, episode: 1, level: 30, background: "RROCK17", text_id: 13 },
+    FTextScreen { mission: 2, episode: 1, level: 15, background: "RROCK13", text_id: 14 },
+    FTextScreen { mission: 2, episode: 1, level: 31, background: "RROCK19", text_id: 15 },
+    FTextScreen { mission: 3, episode: 1, level: 6, background: "SLIME16", text_id: 16 },
+    FTextScreen { mission: 3, episode: 1, level: 11, background: "RROCK14", text_id: 17 },
+    FTextScreen { mission: 3, episode: 1, level: 20, background: "RROCK07", text_id: 18 },
+    FTextScreen { mission: 3, episode: 1, level: 30, background: "RROCK17", text_id: 19 },
+    FTextScreen { mission: 3, episode: 1, level: 15, background: "RROCK13", text_id: 20 },
+    FTextScreen { mission: 3, episode: 1, level: 31, background: "RROCK19", text_id: 21 }
+]
+
+let mut f_castorder: array<FCastEntry, 18> = [
+    FCastEntry { name: "ZOMBIEMAN", mtype: 1 },
+    FCastEntry { name: "SHOTGUN GUY", mtype: 2 },
+    FCastEntry { name: "HEAVY WEAPON DUDE", mtype: 10 },
+    FCastEntry { name: "IMP", mtype: 11 },
+    FCastEntry { name: "DEMON", mtype: 12 },
+    FCastEntry { name: "LOST SOUL", mtype: 18 },
+    FCastEntry { name: "CACODEMON", mtype: 14 },
+    FCastEntry { name: "HELL KNIGHT", mtype: 17 },
+    FCastEntry { name: "BARON OF HELL", mtype: 15 },
+    FCastEntry { name: "ARACHNOTRON", mtype: 20 },
+    FCastEntry { name: "PAIN ELEMENTAL", mtype: 22 },
+    FCastEntry { name: "REVENANT", mtype: 5 },
+    FCastEntry { name: "MANCUBUS", mtype: 8 },
+    FCastEntry { name: "ARCH-VILE", mtype: 3 },
+    FCastEntry { name: "THE SPIDER MASTERMIND", mtype: 19 },
+    FCastEntry { name: "THE CYBERDEMON", mtype: 21 },
+    FCastEntry { name: "OUR HERO", mtype: 0 },
+    FCastEntry { name: "", mtype: 0 }
+]
+
+let mut f_end_names: array<string, 7> = [
+    "END0", "END1", "END2", "END3", "END4", "END5", "END6"
+]
+
+# ---- module state (was file-scope in f_finale.c) -----------------------
+
+let mut finalestage: i32 = 0
+let mut finalecount: i32 = 0
+let mut finaletext: ptr<u8> = null
+let mut finaleflat: ptr<u8> = null
+
+let mut castnum: i32 = 0
+let mut casttics: i32 = 0
+let mut caststate: i32 = 0       # index into states[]
+let mut castdeath: i32 = 0
+let mut castframes: i32 = 0
+let mut castonmelee: i32 = 0
+let mut castattacking: i32 = 0
+
+# static int laststage in F_BunnyScroll
+let mut bunny_laststage: i32 = 0
+
+# ---- helpers -----------------------------------------------------------
+
+function f_toupper(c: i32) -> i32 {
+    if c >= 97 and c <= 122 {
+        return c - 32
+    }
+    return c
+}
+
+function f_font_patch(idx: i32) -> ptr<void> {
+    let words: ptr<i64> = hushim_hu_font() as ptr<i64>
+    return words[idx] as ptr<void>
+}
+
+function f_addr(base: ptr<u8>, off: i32) -> ptr<u8> {
+    return ((base as i64) + off as i64) as ptr<u8>
+}
+
+# ---- finale text blobs (was finale_data.c / d_englsh.h) ------------
+
+let mut finale_e1text: string = "Once you beat the big badasses and\nclean out the moon base you're supposed\nto win, aren't you? Aren't you? Where's\nyour fat reward and ticket home? What\nthe hell is this? It's not supposed to\nend this way!\n\nIt stinks like rotten meat, but looks\nlike the lost Deimos base.  Looks like\nyou're stuck on The Shores of Hell.\nThe only way out is through.\n\nTo continue the DOOM experience, play\nThe Shores of Hell and its amazing\nsequel, Inferno!\n"
+@flow_api
+function finaledata_e1text() -> string { return finale_e1text }
+
+let mut finale_e2text: string = "You've done it! The hideous cyber-\ndemon lord that ruled the lost Deimos\nmoon base has been slain and you\nare triumphant! But ... where are\nyou? You clamber to the edge of the\nmoon and look down to see the awful\ntruth.\n\nDeimos floats above Hell itself!\nYou've never heard of anyone escaping\nfrom Hell, but you'll make the bastards\nsorry they ever heard of you! Quickly,\nyou rappel down to  the surface of\nHell.\n\nNow, it's on to the final chapter of\nDOOM! -- Inferno."
+@flow_api
+function finaledata_e2text() -> string { return finale_e2text }
+
+let mut finale_e3text: string = "The loathsome spiderdemon that\nmasterminded the invasion of the moon\nbases and caused so much death has had\nits ass kicked for all time.\n\nA hidden doorway opens and you enter.\nYou've proven too tough for Hell to\ncontain, and now Hell at last plays\nfair -- for you emerge from the door\nto see the green fields of Earth!\nHome at last.\n\nYou wonder what's been happening on\nEarth while you were battling evil\nunleashed. It's good that no Hell-\nspawn could have come through that\ndoor with you ..."
+@flow_api
+function finaledata_e3text() -> string { return finale_e3text }
+
+let mut finale_e4text: string = "the spider mastermind must have sent forth\nits legions of hellspawn before your\nfinal confrontation with that terrible\nbeast from hell.  but you stepped forward\nand brought forth eternal damnation and\nsuffering upon the horde as a true hero\nwould in the face of something so evil.\n\nbesides, someone was gonna pay for what\nhappened to daisy, your pet rabbit.\n\nbut now, you see spread before you more\npotential pain and gibbitude as a nation\nof demons run amok among our cities.\n\nnext stop, hell on earth!"
+@flow_api
+function finaledata_e4text() -> string { return finale_e4text }
+
+let mut finale_c1text: string = "YOU HAVE ENTERED DEEPLY INTO THE INFESTED\nSTARPORT. BUT SOMETHING IS WRONG. THE\nMONSTERS HAVE BROUGHT THEIR OWN REALITY\nWITH THEM, AND THE STARPORT'S TECHNOLOGY\nIS BEING SUBVERTED BY THEIR PRESENCE.\n\nAHEAD, YOU SEE AN OUTPOST OF HELL, A\nFORTIFIED ZONE. IF YOU CAN GET PAST IT,\nYOU CAN PENETRATE INTO THE HAUNTED HEART\nOF THE STARBASE AND FIND THE CONTROLLING\nSWITCH WHICH HOLDS EARTH'S POPULATION\nHOSTAGE."
+@flow_api
+function finaledata_c1text() -> string { return finale_c1text }
+
+let mut finale_c2text: string = "YOU HAVE WON! YOUR VICTORY HAS ENABLED\nHUMANKIND TO EVACUATE EARTH AND ESCAPE\nTHE NIGHTMARE.  NOW YOU ARE THE ONLY\nHUMAN LEFT ON THE FACE OF THE PLANET.\nCANNIBAL MUTATIONS, CARNIVOROUS ALIENS,\nAND EVIL SPIRITS ARE YOUR ONLY NEIGHBORS.\nYOU SIT BACK AND WAIT FOR DEATH, CONTENT\nTHAT YOU HAVE SAVED YOUR SPECIES.\n\nBUT THEN, EARTH CONTROL BEAMS DOWN A\nMESSAGE FROM SPACE: \"SENSORS HAVE LOCATED\nTHE SOURCE OF THE ALIEN INVASION. IF YOU\nGO THERE, YOU MAY BE ABLE TO BLOCK THEIR\nENTRY.  THE ALIEN BASE IS IN THE HEART OF\nYOUR OWN HOME CITY, NOT FAR FROM THE\nSTARPORT.\" SLOWLY AND PAINFULLY YOU GET\nUP AND RETURN TO THE FRAY."
+@flow_api
+function finaledata_c2text() -> string { return finale_c2text }
+
+let mut finale_c3text: string = "YOU ARE AT THE CORRUPT HEART OF THE CITY,\nSURROUNDED BY THE CORPSES OF YOUR ENEMIES.\nYOU SEE NO WAY TO DESTROY THE CREATURES'\nENTRYWAY ON THIS SIDE, SO YOU CLENCH YOUR\nTEETH AND PLUNGE THROUGH IT.\n\nTHERE MUST BE A WAY TO CLOSE IT ON THE\nOTHER SIDE. WHAT DO YOU CARE IF YOU'VE\nGOT TO GO THROUGH HELL TO GET TO IT?"
+@flow_api
+function finaledata_c3text() -> string { return finale_c3text }
+
+let mut finale_c4text: string = "THE HORRENDOUS VISAGE OF THE BIGGEST\nDEMON YOU'VE EVER SEEN CRUMBLES BEFORE\nYOU, AFTER YOU PUMP YOUR ROCKETS INTO\nHIS EXPOSED BRAIN. THE MONSTER SHRIVELS\nUP AND DIES, ITS THRASHING LIMBS\nDEVASTATING UNTOLD MILES OF HELL'S\nSURFACE.\n\nYOU'VE DONE IT. THE INVASION IS OVER.\nEARTH IS SAVED. HELL IS A WRECK. YOU\nWONDER WHERE BAD FOLKS WILL GO WHEN THEY\nDIE, NOW. WIPING THE SWEAT FROM YOUR\nFOREHEAD YOU BEGIN THE LONG TREK BACK\nHOME. REBUILDING EARTH OUGHT TO BE A\nLOT MORE FUN THAN RUINING IT WAS.\n"
+@flow_api
+function finaledata_c4text() -> string { return finale_c4text }
+
+let mut finale_c5text: string = "CONGRATULATIONS, YOU'VE FOUND THE SECRET\nLEVEL! LOOKS LIKE IT'S BEEN BUILT BY\nHUMANS, RATHER THAN DEMONS. YOU WONDER\nWHO THE INMATES OF THIS CORNER OF HELL\nWILL BE."
+@flow_api
+function finaledata_c5text() -> string { return finale_c5text }
+
+let mut finale_c6text: string = "CONGRATULATIONS, YOU'VE FOUND THE\nSUPER SECRET LEVEL!  YOU'D BETTER\nBLAZE THROUGH THIS ONE!\n"
+@flow_api
+function finaledata_c6text() -> string { return finale_c6text }
+
+let mut finale_t1text: string = "You've fought your way out of the infested\nexperimental labs.   It seems that UAC has\nonce again gulped it down.  With their\nhigh turnover, it must be hard for poor\nold UAC to buy corporate health insurance\nnowadays..\n\nAhead lies the military complex, now\nswarming with diseased horrors hot to get\ntheir teeth into you. With luck, the\ncomplex still has some warlike ordnance\nlaying around."
+@flow_api
+function finaledata_t1text() -> string { return finale_t1text }
+
+let mut finale_t2text: string = "You hear the grinding of heavy machinery\nahead.  You sure hope they're not stamping\nout new hellspawn, but you're ready to\nream out a whole herd if you have to.\nThey might be planning a blood feast, but\nyou feel about as mean as two thousand\nmaniacs packed into one mad killer.\n\nYou don't plan to go down easy."
+@flow_api
+function finaledata_t2text() -> string { return finale_t2text }
+
+let mut finale_t3text: string = "The vista opening ahead looks real damn\nfamiliar. Smells familiar, too -- like\nfried excrement. You didn't like this\nplace before, and you sure as hell ain't\nplanning to like it now. The more you\nbrood on it, the madder you get.\nHefting your gun, an evil grin trickles\nonto your face. Time to take some names."
+@flow_api
+function finaledata_t3text() -> string { return finale_t3text }
+
+let mut finale_t4text: string = "Suddenly, all is silent, from one horizon\nto the other. The agonizing echo of Hell\nfades away, the nightmare sky turns to\nblue, the heaps of monster corpses start \nto evaporate along with the evil stench \nthat filled the air. Jeeze, maybe you've\ndone it. Have you really won?\n\nSomething rumbles in the distance.\nA blue light begins to glow inside the\nruined skull of the demon-spitter."
+@flow_api
+function finaledata_t4text() -> string { return finale_t4text }
+
+let mut finale_t5text: string = "What now? Looks totally different. Kind\nof like King Tut's condo. Well,\nwhatever's here can't be any worse\nthan usual. Can it?  Or maybe it's best\nto let sleeping gods lie.."
+@flow_api
+function finaledata_t5text() -> string { return finale_t5text }
+
+let mut finale_t6text: string = "Time for a vacation. You've burst the\nbowels of hell and by golly you're ready\nfor a break. You mutter to yourself,\nMaybe someone else can kick Hell's ass\nnext time around. Ahead lies a quiet town,\nwith peaceful flowing water, quaint\nbuildings, and presumably no Hellspawn.\n\nAs you step off the transport, you hear\nthe stomp of a cyberdemon's iron shoe."
+@flow_api
+function finaledata_t6text() -> string { return finale_t6text }
+
+let mut finale_p1text: string = "You gloat over the steaming carcass of the\nGuardian.  With its death, you've wrested\nthe Accelerator from the stinking claws\nof Hell.  You relax and glance around the\nroom.  Damn!  There was supposed to be at\nleast one working prototype, but you can't\nsee it. The demons must have taken it.\n\nYou must find the prototype, or all your\nstruggles will have been wasted. Keep\nmoving, keep fighting, keep killing.\nOh yes, keep living, too."
+@flow_api
+function finaledata_p1text() -> string { return finale_p1text }
+
+let mut finale_p2text: string = "Even the deadly Arch-Vile labyrinth could\nnot stop you, and you've gotten to the\nprototype Accelerator which is soon\nefficiently and permanently deactivated.\n\nYou're good at that kind of thing."
+@flow_api
+function finaledata_p2text() -> string { return finale_p2text }
+
+let mut finale_p3text: string = "You've bashed and battered your way into\nthe heart of the devil-hive.  Time for a\nSearch-and-Destroy mission, aimed at the\nGatekeeper, whose foul offspring is\ncascading to Earth.  Yeah, he's bad. But\nyou know who's worse!\n\nGrinning evilly, you check your gear, and\nget ready to give the bastard a little Hell\nof your own making!"
+@flow_api
+function finaledata_p3text() -> string { return finale_p3text }
+
+let mut finale_p4text: string = "The Gatekeeper's evil face is splattered\nall over the place.  As its tattered corpse\ncollapses, an inverted Gate forms and\nsucks down the shards of the last\nprototype Accelerator, not to mention the\nfew remaining demons.  You're done. Hell\nhas gone back to pounding bad dead folks \ninstead of good live ones.  Remember to\ntell your grandkids to put a rocket\nlauncher in your coffin. If you go to Hell\nwhen you die, you'll need it for some\nfinal cleaning-up ..."
+@flow_api
+function finaledata_p4text() -> string { return finale_p4text }
+
+let mut finale_p5text: string = "You've found the second-hardest level we\ngot. Hope you have a saved game a level or\ntwo previous.  If not, be prepared to die\naplenty. For master marines only."
+@flow_api
+function finaledata_p5text() -> string { return finale_p5text }
+
+let mut finale_p6text: string = "Betcha wondered just what WAS the hardest\nlevel we had ready for ya?  Now you know.\nNo one gets out alive."
+@flow_api
+function finaledata_p6text() -> string { return finale_p6text }
+
+function f_text_by_id(id: i32) -> string {
+    if id == 0 { return finaledata_e1text() }
+    elif id == 1 { return finaledata_e2text() }
+    elif id == 2 { return finaledata_e3text() }
+    elif id == 3 { return finaledata_e4text() }
+    elif id == 4 { return finaledata_c1text() }
+    elif id == 5 { return finaledata_c2text() }
+    elif id == 6 { return finaledata_c3text() }
+    elif id == 7 { return finaledata_c4text() }
+    elif id == 8 { return finaledata_c5text() }
+    elif id == 9 { return finaledata_c6text() }
+    elif id == 10 { return finaledata_t1text() }
+    elif id == 11 { return finaledata_t2text() }
+    elif id == 12 { return finaledata_t3text() }
+    elif id == 13 { return finaledata_t4text() }
+    elif id == 14 { return finaledata_t5text() }
+    elif id == 15 { return finaledata_t6text() }
+    elif id == 16 { return finaledata_p1text() }
+    elif id == 17 { return finaledata_p2text() }
+    elif id == 18 { return finaledata_p3text() }
+    elif id == 19 { return finaledata_p4text() }
+    elif id == 20 { return finaledata_p5text() }
+    else { return finaledata_p6text() }
+}
+
+function f_pick_textscreen(mission: i32, episode: i32, gamemap: i32, gameversion: i32) -> void {
+    for i in 0 to 22 {
+        let mut screen: FTextScreen = f_textscreens[i]
+        if gameversion == F_EXE_CHEX and screen.mission == F_MISSION_DOOM {
+            screen.level = 5
+            f_textscreens[i] = screen
+        }
+        screen = f_textscreens[i]
+        if mission == screen.mission
+            and (mission != F_MISSION_DOOM or episode == screen.episode)
+            and gamemap == screen.level {
+            finaletext = f_text_by_id(screen.text_id) as ptr<u8>
+            finaleflat = screen.background as ptr<u8>
+        }
+    }
+}
+
+function f_cast_name(i: i32) -> string {
+    return f_castorder[i].name
+}
+
+function f_cast_type(i: i32) -> i32 {
+    return f_castorder[i].mtype
+}
+
+function f_cast_at_end(i: i32) -> i32 {
+    if f_castorder[i].name == "" {
+        return 1
+    }
+    return 0
+}
+
+function f_cast_sfx(st: i32) -> i32 {
+    if st == F_S_PLAY_ATK1 { return F_SFX_DSHTGN }
+    elif st == F_S_POSS_ATK2 { return F_SFX_PISTOL }
+    elif st == F_S_SPOS_ATK2 { return F_SFX_SHOTGN }
+    elif st == F_S_VILE_ATK2 { return F_SFX_VILATK }
+    elif st == F_S_SKEL_FIST2 { return F_SFX_SKESWG }
+    elif st == F_S_SKEL_FIST4 { return F_SFX_SKEPCH }
+    elif st == F_S_SKEL_MISS2 { return F_SFX_SKEATK }
+    elif st == F_S_FATT_ATK8 or st == F_S_FATT_ATK5 or st == F_S_FATT_ATK2 { return F_SFX_FIRSHT }
+    elif st == F_S_CPOS_ATK2 or st == F_S_CPOS_ATK3 or st == F_S_CPOS_ATK4 { return F_SFX_SHOTGN }
+    elif st == F_S_TROO_ATK3 { return F_SFX_CLAW }
+    elif st == F_S_SARG_ATK2 { return F_SFX_SGTATK }
+    elif st == F_S_BOSS_ATK2 or st == F_S_BOS2_ATK2 or st == F_S_HEAD_ATK2 { return F_SFX_FIRSHT }
+    elif st == F_S_SKULL_ATK2 { return F_SFX_SKLATK }
+    elif st == F_S_SPID_ATK2 or st == F_S_SPID_ATK3 { return F_SFX_SHOTGN }
+    elif st == F_S_BSPI_ATK2 { return F_SFX_PLASMA }
+    elif st == F_S_CYBER_ATK2 or st == F_S_CYBER_ATK4 or st == F_S_CYBER_ATK6 { return F_SFX_RLAUNC }
+    elif st == F_S_PAIN_ATK3 { return F_SFX_SKLATK }
+    else { return 0 }
+}
+
+function f_end_name(stage: i32) -> string {
+    if stage < 0 {
+        return f_end_names[0]
+    }
+    if stage > 6 {
+        return f_end_names[6]
+    }
+    return f_end_names[stage]
+}
+
+
+#
+# F_StartFinale
+#
+@flow_api
+function F_StartFinale() -> void {
+    STAT_set_gameaction(F_GA_NOTHING)
+    STAT_set_gamestate(F_GS_FINALE)
+    STAT_set_viewactive(0)
+    STAT_set_automapactive(0)
+
+    if STAT_logical_gamemission() == F_MISSION_DOOM {
+        S_ChangeMusic(F_MUS_VICTOR, 1)
+    } else {
+        S_ChangeMusic(F_MUS_READ_M, 1)
+    }
+
+    finaletext = null
+    finaleflat = null
+    f_pick_textscreen(
+        STAT_logical_gamemission(),
+        STAT_gameepisode(),
+        STAT_gamemap(),
+        STAT_gameversion())
+
+    # DEH_String is identity without FEATURE_DEHACKED
+
+    finalestage = F_STAGE_TEXT
+    finalecount = 0
+}
+
+#
+# F_CastResponder
+#
+function F_CastResponder(ev: ptr<i32>) -> i32 {
+    if ev[0] != F_EV_KEYDOWN {
+        return 0
+    }
+    if castdeath != 0 {
+        return 1
+    }
+
+    castdeath = 1
+    let mtype: i32 = f_cast_type(castnum)
+    caststate = MOBJINFO_deathstate(mtype)
+    casttics = STATE_tics(STATE_at(caststate))
+    castframes = 0
+    castattacking = 0
+    let ds: i32 = MOBJINFO_deathsound(mtype)
+    if ds != 0 {
+        S_StartSound(null, ds)
+    }
+    return 1
+}
+
+#
+# F_Responder
+#
+@flow_api
+function F_Responder(ev: ptr<i32>) -> i32 {
+    if finalestage == F_STAGE_CAST {
+        return F_CastResponder(ev)
+    }
+    return 0
+}
+
+#
+# F_StartCast
+#
+function F_StartCast() -> void {
+    STAT_set_wipegamestate(0 - 1)
+    castnum = 0
+    caststate = MOBJINFO_seestate(f_cast_type(castnum))
+    casttics = STATE_tics(STATE_at(caststate))
+    castdeath = 0
+    finalestage = F_STAGE_CAST
+    castframes = 0
+    castonmelee = 0
+    castattacking = 0
+    S_ChangeMusic(F_MUS_EVIL, 1)
+}
+
+#
+# F_CastTicker
+#
+function F_CastTicker() -> void {
+    casttics = casttics - 1
+    if casttics > 0 {
+        return
+    }
+
+    let mut do_stopattack: i32 = 0
+
+    if STATE_tics(STATE_at(caststate)) == 0 - 1 or STATE_nextstate(STATE_at(caststate)) == F_S_NULL {
+        castnum = castnum + 1
+        castdeath = 0
+        if f_cast_at_end(castnum) != 0 {
+            castnum = 0
+        }
+        let mtype: i32 = f_cast_type(castnum)
+        let seesnd: i32 = MOBJINFO_seesound(mtype)
+        if seesnd != 0 {
+            S_StartSound(null, seesnd)
+        }
+        caststate = MOBJINFO_seestate(mtype)
+        castframes = 0
+    } else {
+        # Oh, gross hack! goto stopattack when current state is S_PLAY_ATK1
+        if caststate == F_S_PLAY_ATK1 {
+            do_stopattack = 1
+        } else {
+            let st: i32 = STATE_nextstate(STATE_at(caststate))
+            caststate = st
+            castframes = castframes + 1
+            let sfx: i32 = f_cast_sfx(st)
+            if sfx != 0 {
+                S_StartSound(null, sfx)
+            }
+        }
+    }
+
+    if do_stopattack == 0 {
+        if castframes == 12 {
+            castattacking = 1
+            let mtype2: i32 = f_cast_type(castnum)
+            if castonmelee != 0 {
+                caststate = MOBJINFO_meleestate(mtype2)
+            } else {
+                caststate = MOBJINFO_missilestate(mtype2)
+            }
+            castonmelee = castonmelee ^ 1
+            if caststate == F_S_NULL {
+                if castonmelee != 0 {
+                    caststate = MOBJINFO_meleestate(mtype2)
+                } else {
+                    caststate = MOBJINFO_missilestate(mtype2)
+                }
+            }
+        }
+
+        if castattacking != 0 {
+            let seestate: i32 = MOBJINFO_seestate(f_cast_type(castnum))
+            if castframes == 24 or caststate == seestate {
+                do_stopattack = 1
+            }
+        }
+    }
+
+    if do_stopattack != 0 {
+        castattacking = 0
+        castframes = 0
+        caststate = MOBJINFO_seestate(f_cast_type(castnum))
+    }
+
+    casttics = STATE_tics(STATE_at(caststate))
+    if casttics == 0 - 1 {
+        casttics = 15
+    }
+}
+
+#
+# F_Ticker
+#
+@flow_api
+function F_Ticker() -> void {
+    if STAT_gamemode() == F_GM_COMMERCIAL and finalecount > 50 {
+        let mut i: i32 = 0
+        while i < F_MAXPLAYERS {
+            if PLAYER_i_cmd_buttons(i) != 0 {
+                break
+            }
+            i = i + 1
+        }
+        if i < F_MAXPLAYERS {
+            if STAT_gamemap() == 30 {
+                F_StartCast()
+            } else {
+                STAT_set_gameaction(F_GA_WORLDDONE)
+            }
+        }
+    }
+
+    finalecount = finalecount + 1
+
+    if finalestage == F_STAGE_CAST {
+        F_CastTicker()
+        return
+    }
+
+    if STAT_gamemode() == F_GM_COMMERCIAL {
+        return
+    }
+
+    if finalestage == F_STAGE_TEXT {
+        let tlen: i32 = strlen(finaletext as string) as i32
+        if finalecount > tlen * F_TEXTSPEED + F_TEXTWAIT {
+            finalecount = 0
+            finalestage = F_STAGE_ARTSCREEN
+            STAT_set_wipegamestate(0 - 1)
+            if STAT_gameepisode() == 3 {
+                S_StartMusic(F_MUS_BUNNY)
+            }
+        }
+    }
+}
+
+#
+# F_TextWrite
+#
+function F_TextWrite() -> void {
+    let src: ptr<u8> = W_CacheLumpName(finaleflat as string, F_PU_CACHE) as ptr<u8>
+    let mut dest: ptr<u8> = VIDEO_buffer()
+
+    let mut y: i32 = 0
+    while y < F_SCREENHEIGHT {
+        let mut x: i32 = 0
+        while x < F_SCREENWIDTH / 64 {
+            memcpy(dest as ptr<void>, f_addr(src, (y & 63) << 6) as ptr<void>, 64)
+            dest = f_addr(dest, 64)
+            x = x + 1
+        }
+        if (F_SCREENWIDTH & 63) != 0 {
+            let n: i32 = F_SCREENWIDTH & 63
+            memcpy(dest as ptr<void>, f_addr(src, (y & 63) << 6) as ptr<void>, n as i64)
+            dest = f_addr(dest, n)
+        }
+        y = y + 1
+    }
+
+    V_MarkRect(0, 0, F_SCREENWIDTH, F_SCREENHEIGHT)
+
+    let mut cx: i32 = 10
+    let mut cy: i32 = 10
+    let ch: ptr<u8> = finaletext
+
+    let mut count: i32 = (finalecount - 10) / F_TEXTSPEED
+    if count < 0 {
+        count = 0
+    }
+
+    let mut ch_i: i32 = 0
+    while count != 0 {
+        count = count - 1
+        let c0: i32 = ch[ch_i] as i32
+        ch_i = ch_i + 1
+        if c0 == 0 {
+            break
+        }
+        if c0 == 10 {
+            cx = 10
+            cy = cy + 11
+        } else {
+            let mut c: i32 = f_toupper(c0) - F_HU_FONTSTART
+            if c < 0 or c > F_HU_FONTSIZE {
+                cx = cx + 4
+            } else {
+                let patch: ptr<void> = f_font_patch(c)
+                let w: i32 = PATCH_width(patch)
+                if cx + w > F_SCREENWIDTH {
+                    break
+                }
+                V_DrawPatch(cx, cy, patch)
+                cx = cx + w
+            }
+        }
+    }
+}
+
+#
+# F_CastPrint
+#
+function F_CastPrint(text: string) -> void {
+    let ch: ptr<u8> = text as ptr<u8>
+    let mut width: i32 = 0
+    let mut i: i32 = 0
+
+    while 1 == 1 {
+        let c0: i32 = ch[i] as i32
+        i = i + 1
+        if c0 == 0 {
+            break
+        }
+        let mut c: i32 = f_toupper(c0) - F_HU_FONTSTART
+        if c < 0 or c > F_HU_FONTSIZE {
+            width = width + 4
+        } else {
+            width = width + PATCH_width(f_font_patch(c))
+        }
+    }
+
+    let mut cx: i32 = 160 - width / 2
+    i = 0
+    while 1 == 1 {
+        let c0: i32 = ch[i] as i32
+        i = i + 1
+        if c0 == 0 {
+            break
+        }
+        let mut c: i32 = f_toupper(c0) - F_HU_FONTSTART
+        if c < 0 or c > F_HU_FONTSIZE {
+            cx = cx + 4
+        } else {
+            let patch: ptr<void> = f_font_patch(c)
+            let w: i32 = PATCH_width(patch)
+            V_DrawPatch(cx, 180, patch)
+            cx = cx + w
+        }
+    }
+}
+
+#
+# F_CastDrawer
+#
+function F_CastDrawer() -> void {
+    V_DrawPatch(0, 0, W_CacheLumpName("BOSSBACK", F_PU_CACHE))
+
+    F_CastPrint(f_cast_name(castnum))
+
+    let sprite: i32 = STATE_sprite(STATE_at(caststate))
+    let frame: i32 = STATE_frame(STATE_at(caststate))
+    let lump: i32 = thingshim_sprite_frame_lump(sprite, frame & F_FF_FRAMEMASK, 0)
+    let flip: i32 = thingshim_sprite_frame_flip(sprite, frame & F_FF_FRAMEMASK, 0)
+
+    let patch: ptr<void> = W_CacheLumpNum(lump + RDATA_firstspritelump(), F_PU_CACHE)
+    if flip != 0 {
+        V_DrawPatchFlipped(160, 170, patch)
+    } else {
+        V_DrawPatch(160, 170, patch)
+    }
+}
+
+#
+# F_DrawPatchCol
+#
+function F_DrawPatchCol(x: i32, patch: ptr<void>, col: i32) -> void {
+    let p: ptr<u8> = patch as ptr<u8>
+    let mut column: ptr<u8> = f_addr(p, PATCH_columnofs(p as ptr<void>, col))
+    let desttop: ptr<u8> = f_addr(VIDEO_buffer(), x)
+
+    while column[0] as i32 != 255 {
+        let source: ptr<u8> = f_addr(column, 3)
+        let mut dest: ptr<u8> = f_addr(desttop, (column[0] as i32) * F_SCREENWIDTH)
+        let mut count: i32 = column[1] as i32
+        let mut si: i32 = 0
+        while count > 0 {
+            dest[0] = source[si]
+            si = si + 1
+            dest = f_addr(dest, F_SCREENWIDTH)
+            count = count - 1
+        }
+        column = f_addr(column, (column[1] as i32) + 4)
+    }
+}
+
+#
+# F_BunnyScroll
+#
+function F_BunnyScroll() -> void {
+    let p1: ptr<void> = W_CacheLumpName("PFUB2", F_PU_LEVEL)
+    let p2: ptr<void> = W_CacheLumpName("PFUB1", F_PU_LEVEL)
+
+    V_MarkRect(0, 0, F_SCREENWIDTH, F_SCREENHEIGHT)
+
+    let mut scrolled: i32 = 320 - (finalecount - 230) / 2
+    if scrolled > 320 {
+        scrolled = 320
+    }
+    if scrolled < 0 {
+        scrolled = 0
+    }
+
+    let mut x: i32 = 0
+    while x < F_SCREENWIDTH {
+        if x + scrolled < 320 {
+            F_DrawPatchCol(x, p1, x + scrolled)
+        } else {
+            F_DrawPatchCol(x, p2, x + scrolled - 320)
+        }
+        x = x + 1
+    }
+
+    if finalecount < 1130 {
+        return
+    }
+    if finalecount < 1180 {
+        V_DrawPatch((F_SCREENWIDTH - 13 * 8) / 2,
+                    (F_SCREENHEIGHT - 8 * 8) / 2,
+                    W_CacheLumpName("END0", F_PU_CACHE))
+        bunny_laststage = 0
+        return
+    }
+
+    let mut stage: i32 = (finalecount - 1180) / 5
+    if stage > 6 {
+        stage = 6
+    }
+    if stage > bunny_laststage {
+        S_StartSound(null, F_SFX_PISTOL)
+        bunny_laststage = stage
+    }
+
+    V_DrawPatch((F_SCREENWIDTH - 13 * 8) / 2,
+                (F_SCREENHEIGHT - 8 * 8) / 2,
+                W_CacheLumpName(f_end_name(stage), F_PU_CACHE))
+}
+
+#
+# F_ArtScreenDrawer
+#
+function F_ArtScreenDrawer() -> void {
+    if STAT_gameepisode() == 3 {
+        F_BunnyScroll()
+        return
+    }
+
+    let mut lumpname: string = ""
+    let ep: i32 = STAT_gameepisode()
+    if ep == 1 {
+        if STAT_gamemode() == F_GM_RETAIL {
+            lumpname = "CREDIT"
+        } else {
+            lumpname = "HELP2"
+        }
+    } else {
+        if ep == 2 {
+            lumpname = "VICTORY2"
+        } else {
+            if ep == 4 {
+                lumpname = "ENDPIC"
+            } else {
+                return
+            }
+        }
+    }
+
+    V_DrawPatch(0, 0, W_CacheLumpName(lumpname, F_PU_CACHE))
+}
+
+#
+# F_Drawer
+#
+@flow_api
+function F_Drawer() -> void {
+    if finalestage == F_STAGE_CAST {
+        F_CastDrawer()
+    } else {
+        if finalestage == F_STAGE_TEXT {
+            F_TextWrite()
+        } else {
+            if finalestage == F_STAGE_ARTSCREEN {
+                F_ArtScreenDrawer()
+            }
+        }
+    }
+}

@@ -1,0 +1,795 @@
+# Wall segment drawing / clipping, ported from r_segs.c to Flow.
+#
+# Shared renderer scalars (segtextured, markfloor/ceiling, rw_x/stopx,
+# rw_distance/normalangle/angle1, walllights) are Flow-owned. drawseg state
+# uses BSP_*; clip/plane arrays use PLANES_*; sprite clip scratch uses
+# THINGS_*. Line/sector bindings and masked-column helpers remain on
+# segshim_* for rw_* scalars / colfunc only; drawseg / wall pointers use BSP_*.
+
+extern { function malloc(n: i64) -> ptr<void> }
+
+extern { function FixedMul(a: i32, b: i32) -> i32 }
+extern { function R_PointToDist(x: i32, y: i32) -> i32 }
+extern { function R_ScaleFromGlobalAngle(visangle: u32) -> i32 }
+extern { function R_GetColumn(tex: i32, col: i32) -> ptr<u8> }
+extern { function R_DrawMaskedColumn(column: ptr<void>) -> void }
+extern { function R_CheckPlane(pl: ptr<void>, start: i32, stop: i32) -> ptr<void> }
+extern { function TABLES_finesine(idx: i32) -> i32 }
+extern { function TABLES_finecosine(idx: i32) -> i32 }
+extern { function TABLES_finetangent(idx: i32) -> i32 }
+extern { function DRAW_viewheight() -> i32 }
+extern { function DRAW_dc_texturemid() -> i32 }
+extern { function DRAW_set_dc_texturemid(v: i32) -> void }
+extern { function DRAW_set_dc_colormap(p: ptr<void>) -> void }
+extern { function DRAW_set_dc_x(v: i32) -> void }
+extern { function DRAW_set_dc_yl(v: i32) -> void }
+extern { function DRAW_set_dc_yh(v: i32) -> void }
+extern { function DRAW_set_dc_iscale(v: i32) -> void }
+extern { function DRAW_set_dc_source(p: ptr<void>) -> void }
+extern { function RMAIN_viewz() -> i32 }
+extern { function RMAIN_viewangle() -> u32 }
+extern { function RMAIN_extralight() -> i32 }
+extern { function RMAIN_fixedcolormap() -> ptr<void> }
+extern { function RMAIN_centeryfrac() -> i32 }
+extern { function RMAIN_xtoviewangle(x: i32) -> u32 }
+extern { function SKY_skyflatnum() -> i32 }
+extern { function RMAIN_scalelight_row(lightnum: i32) -> ptr<ptr<void> > }
+extern { function RMAIN_scalelightfixed() -> ptr<ptr<void> > }
+
+# ---- texture / drawseg / sector bindings --------------------------------
+extern { function RDATA_texturetranslation(tex: i32) -> i32 }
+extern { function RDATA_textureheight(tex: i32) -> i32 }
+
+extern { function rmainshim_call_colfunc() -> void }
+
+extern { function BSP_curline() -> ptr<void> }
+extern { function BSP_bind_sidedef_linedef() -> void }
+extern { function BSP_bind_from_drawseg(ds: ptr<void>) -> void }
+extern { function BSP_sidedef() -> ptr<void> }
+extern { function BSP_linedef() -> ptr<void> }
+extern { function BSP_frontsector() -> ptr<void> }
+extern { function BSP_backsector() -> ptr<void> }
+
+extern { function GEOM_seg_v1(seg: ptr<void>) -> ptr<void> }
+extern { function GEOM_seg_v2(seg: ptr<void>) -> ptr<void> }
+extern { function GEOM_seg_offset(seg: ptr<void>) -> i32 }
+extern { function GEOM_seg_angle(seg: ptr<void>) -> u32 }
+extern { function GEOM_seg_sidedef(seg: ptr<void>) -> ptr<void> }
+extern { function GEOM_seg_linedef(seg: ptr<void>) -> ptr<void> }
+
+extern { function GEOM_side_rowoffset(side: ptr<void>) -> i32 }
+
+extern { function GEOM_line_flags(ld: ptr<void>) -> i32 }
+extern { function GEOM_line_set_flags(ld: ptr<void>, v: i32) -> void }
+
+function segs_line_or_flags(line: ptr<void>, bits: i32) -> void {
+    GEOM_line_set_flags(line, GEOM_line_flags(line) | bits)
+}
+
+function segs_maskedcol_at(col: ptr<void>, x: i32) -> i32 {
+    let p: ptr<i16> = ((col as i64) + (x as i64) * 2) as ptr<i16>
+    return p[0] as i32
+}
+
+function segs_maskedcol_set(col: ptr<void>, x: i32, v: i32) -> void {
+    let p: ptr<i16> = ((col as i64) + (x as i64) * 2) as ptr<i16>
+    p[0] = v as i16
+}
+
+extern { function GEOM_side_bottomtexture(sd: ptr<void>) -> i32 }
+
+extern { function BSP_ds_full() -> i32 }
+extern { function BSP_ds_p() -> ptr<void> }
+extern { function BSP_ds_advance() -> void }
+extern { function BSP_ds_x1(ds: ptr<void>) -> i32 }
+extern { function BSP_ds_set_x1(ds: ptr<void>, v: i32) -> void }
+extern { function BSP_ds_set_x2(ds: ptr<void>, v: i32) -> void }
+extern { function BSP_ds_scale1(ds: ptr<void>) -> i32 }
+extern { function BSP_ds_set_scale1(ds: ptr<void>, v: i32) -> void }
+extern { function BSP_ds_set_scale2(ds: ptr<void>, v: i32) -> void }
+extern { function BSP_ds_scalestep(ds: ptr<void>) -> i32 }
+extern { function BSP_ds_set_scalestep(ds: ptr<void>, v: i32) -> void }
+extern { function BSP_ds_set_curline(ds: ptr<void>, seg: ptr<void>) -> void }
+extern { function BSP_ds_silhouette(ds: ptr<void>) -> i32 }
+extern { function BSP_ds_set_silhouette(ds: ptr<void>, v: i32) -> void }
+extern { function BSP_ds_or_silhouette(ds: ptr<void>, bits: i32) -> void }
+extern { function BSP_ds_set_bsilheight(ds: ptr<void>, v: i32) -> void }
+extern { function BSP_ds_set_tsilheight(ds: ptr<void>, v: i32) -> void }
+extern { function BSP_ds_sprtopclip(ds: ptr<void>) -> ptr<void> }
+extern { function BSP_ds_set_sprtopclip(ds: ptr<void>, p: ptr<void>) -> void }
+extern { function BSP_ds_sprbottomclip(ds: ptr<void>) -> ptr<void> }
+extern { function BSP_ds_set_sprbottomclip(ds: ptr<void>, p: ptr<void>) -> void }
+extern { function BSP_ds_maskedtexturecol(ds: ptr<void>) -> ptr<void> }
+extern { function BSP_ds_set_maskedtexturecol(ds: ptr<void>, p: ptr<void>) -> void }
+
+extern { function THINGS_negonearray() -> ptr<void> }
+extern { function THINGS_screenheightarray() -> ptr<void> }
+extern { function THINGS_spryscale() -> i32 }
+extern { function THINGS_set_spryscale(v: i32) -> void }
+extern { function THINGS_set_sprtopscreen(v: i32) -> void }
+extern { function THINGS_set_mfloorclip(p: ptr<void>) -> void }
+extern { function THINGS_set_mceilingclip(p: ptr<void>) -> void }
+
+extern { function PLANES_ceilingclip() -> ptr<i16> }
+extern { function PLANES_floorclip() -> ptr<i16> }
+extern { function PLANES_maskedcol_from_lastopening(rwx: i32) -> ptr<void> }
+extern { function PLANES_lastopening_advance(n: i32) -> void }
+extern { function PLANES_save_ceilingclip(start: i32, count: i32) -> ptr<void> }
+extern { function PLANES_save_floorclip(start: i32, count: i32) -> ptr<void> }
+extern { function PLANES_ceilingplane() -> ptr<void> }
+extern { function PLANES_set_ceilingplane(p: ptr<void>) -> void }
+extern { function PLANES_floorplane() -> ptr<void> }
+extern { function PLANES_set_floorplane(p: ptr<void>) -> void }
+extern { function PLANES_plane_set_top(pl: ptr<void>, x: i32, v: i32) -> void }
+extern { function PLANES_plane_set_bottom(pl: ptr<void>, x: i32, v: i32) -> void }
+
+extern { function GEOM_sector_floorheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_ceilingheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_floorpic(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_ceilingpic(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_lightlevel(s: ptr<void>) -> i32 }
+
+# ---- bsp.flow (drawseg) / plane.flow / things_shim.c ------------------
+extern { function GEOM_side_midtexture(sd: ptr<void>) -> i32 }
+extern { function GEOM_side_textureoffset(sd: ptr<void>) -> i32 }
+extern { function GEOM_side_toptexture(sd: ptr<void>) -> i32 }
+extern { function GEOM_vertex_x(v: ptr<void>) -> i32 }
+extern { function GEOM_vertex_y(v: ptr<void>) -> i32 }
+
+# ---- constants (r_segs.c / tables.h / doomdata.h / r_defs.h / r_main.h) -
+
+const SEGS_HEIGHTBITS: i32 = 12
+const SEGS_HEIGHTUNIT: i32 = 4096          # 1 << HEIGHTBITS
+const SEGS_FRACBITS: i32 = 16
+const SEGS_ANGLETOFINESHIFT: i32 = 19
+const SEGS_LIGHTSEGSHIFT: i32 = 4
+const SEGS_LIGHTLEVELS: i32 = 16
+const SEGS_MAXLIGHTSCALE: i32 = 48
+const SEGS_LIGHTSCALESHIFT: i32 = 12
+
+const SEGS_ANG90: u32 = 1073741824         # 0x40000000
+const SEGS_ANG180: u32 = 2147483648        # 0x80000000
+
+const SEGS_ML_DONTPEGTOP: i32 = 8
+const SEGS_ML_DONTPEGBOTTOM: i32 = 16
+const SEGS_ML_MAPPED: i32 = 256
+
+const SEGS_SIL_BOTTOM: i32 = 1
+const SEGS_SIL_TOP: i32 = 2
+const SEGS_SIL_BOTH: i32 = 3
+
+const SEGS_INT_MAX: i32 = 2147483647
+const SEGS_INT_MIN: i32 = -2147483648
+const SEGS_SHRT_MAX: i32 = 32767
+
+# ---- shared globals (were DEFINEd in r_segs.c) ------------------------
+
+let mut segtextured: i32 = 0
+let mut markfloor: i32 = 0
+let mut markceiling: i32 = 0
+let mut rw_x: i32 = 0
+let mut rw_stopx: i32 = 0
+let mut rw_normalangle: u32 = 0
+let mut rw_angle1: i32 = 0
+let mut rw_distance: i32 = 0
+let mut walllights: ptr<ptr<void> > = null
+
+@flow_api
+function segshim_rw_x_addr() -> ptr<i32> { return &rw_x }
+
+@flow_api
+function segshim_rw_stopx_addr() -> ptr<i32> { return &rw_stopx }
+
+@flow_api
+function segshim_rw_angle1_addr() -> ptr<i32> { return &rw_angle1 }
+
+@flow_api
+function segshim_rw_distance_addr() -> ptr<i32> { return &rw_distance }
+
+@flow_api
+function segshim_rw_normalangle_addr() -> ptr<u32> { return &rw_normalangle }
+
+@flow_api
+function SEGS_rw_distance() -> i32 { return rw_distance }
+
+@flow_api
+function SEGS_rw_normalangle() -> u32 { return rw_normalangle }
+
+@flow_api
+function segshim_segtextured() -> i32 { return segtextured }
+
+@flow_api
+function segshim_set_segtextured(v: i32) -> void { segtextured = v }
+
+@flow_api
+function segshim_markfloor() -> i32 { return markfloor }
+
+@flow_api
+function segshim_set_markfloor(v: i32) -> void { markfloor = v }
+
+@flow_api
+function segshim_markceiling() -> i32 { return markceiling }
+
+@flow_api
+function segshim_set_markceiling(v: i32) -> void { markceiling = v }
+
+@flow_api
+function segshim_abs_rw_angle_diff() -> u32 {
+    let d: i32 = (rw_normalangle as i32) - rw_angle1
+    if d < 0 {
+        d = 0 - d
+    }
+    return d as u32
+}
+
+@flow_api
+function segshim_iscale_from_scale(scale: i32) -> i32 {
+    return (0xffffffff as u32 / (scale as u32)) as i32
+}
+
+@flow_api
+function segshim_set_walllights_level(lightnum: i32) -> void {
+    if lightnum < 0 {
+        walllights = RMAIN_scalelight_row(0)
+    } elif lightnum >= SEGS_LIGHTLEVELS {
+        walllights = RMAIN_scalelight_row(SEGS_LIGHTLEVELS - 1)
+    } else {
+        walllights = RMAIN_scalelight_row(lightnum)
+    }
+}
+
+@flow_api
+function segshim_walllights_at(index: i32) -> ptr<void> {
+    return walllights[index]
+}
+
+@flow_api
+function SEGS_set_walllights_fixed() -> void {
+    walllights = RMAIN_scalelightfixed()
+}
+
+# Private clip/edge stepper (was file-static world*/pix*/frac* in C).
+# Module statics cannot hold structs, so this lives behind a pointer.
+struct SegEdge {
+    worldtop: i32,
+    worldbottom: i32,
+    worldhigh: i32,
+    worldlow: i32,
+    pixhigh: i32,
+    pixlow: i32,
+    pixhighstep: i32,
+    pixlowstep: i32,
+    topfrac: i32,
+    topstep: i32,
+    bottomfrac: i32,
+    bottomstep: i32
+}
+
+const SEGS_SIZEOF_EDGE: i64 = 48
+
+let mut edge: ptr<SegEdge> = null
+
+function segs_edge() -> ptr<SegEdge> {
+    if (edge as i64) == 0 {
+        edge = malloc(SEGS_SIZEOF_EDGE) as ptr<SegEdge>
+        edge[0] = SegEdge {
+            worldtop: 0,
+            worldbottom: 0,
+            worldhigh: 0,
+            worldlow: 0,
+            pixhigh: 0,
+            pixlow: 0,
+            pixhighstep: 0,
+            pixlowstep: 0,
+            topfrac: 0,
+            topstep: 0,
+            bottomfrac: 0,
+            bottomstep: 0
+        }
+    }
+    return edge
+}
+
+let mut maskedtexture: i32 = 0
+let mut toptexture: i32 = 0
+let mut bottomtexture: i32 = 0
+let mut midtexture: i32 = 0
+
+let mut rw_centerangle: u32 = 0
+let mut rw_offset: i32 = 0
+let mut rw_scale: i32 = 0
+let mut rw_scalestep: i32 = 0
+let mut rw_midtexturemid: i32 = 0
+let mut rw_toptexturemid: i32 = 0
+let mut rw_bottomtexturemid: i32 = 0
+
+let mut maskedtexturecol: ptr<void> = null
+
+# ---- R_RenderMaskedSegRange -------------------------------------------
+
+@flow_api
+function R_RenderMaskedSegRange(ds: ptr<void>, x1: i32, x2: i32) -> void {
+    BSP_bind_from_drawseg(ds)
+    let curline: ptr<void> = BSP_curline()
+    let front: ptr<void> = BSP_frontsector()
+    let back: ptr<void> = BSP_backsector()
+    let side: ptr<void> = GEOM_seg_sidedef(curline)
+    let texnum: i32 = RDATA_texturetranslation(GEOM_side_midtexture(side))
+
+    let mut lightnum: i32 = (GEOM_sector_lightlevel(front) >> SEGS_LIGHTSEGSHIFT) + RMAIN_extralight()
+    let v1: ptr<void> = GEOM_seg_v1(curline)
+    let v2: ptr<void> = GEOM_seg_v2(curline)
+    if GEOM_vertex_y(v1) == GEOM_vertex_y(v2) {
+        lightnum = lightnum - 1
+    } elif GEOM_vertex_x(v1) == GEOM_vertex_x(v2) {
+        lightnum = lightnum + 1
+    }
+    segshim_set_walllights_level(lightnum)
+
+    maskedtexturecol = BSP_ds_maskedtexturecol(ds)
+    rw_scalestep = BSP_ds_scalestep(ds)
+
+    THINGS_set_spryscale(BSP_ds_scale1(ds) + (x1 - BSP_ds_x1(ds)) * rw_scalestep)
+    THINGS_set_mfloorclip(BSP_ds_sprbottomclip(ds))
+    THINGS_set_mceilingclip(BSP_ds_sprtopclip(ds))
+
+    # find positioning (masked midtexture peg quirks)
+    if (GEOM_line_flags(GEOM_seg_linedef(curline)) & SEGS_ML_DONTPEGBOTTOM) != 0 {
+        let mut mid: i32 = 0
+        if GEOM_sector_floorheight(front) > GEOM_sector_floorheight(back) {
+            mid = GEOM_sector_floorheight(front)
+        } else {
+            mid = GEOM_sector_floorheight(back)
+        }
+        DRAW_set_dc_texturemid(mid + RDATA_textureheight(texnum) - RMAIN_viewz())
+    } else {
+        let mut mid2: i32 = 0
+        if GEOM_sector_ceilingheight(front) < GEOM_sector_ceilingheight(back) {
+            mid2 = GEOM_sector_ceilingheight(front)
+        } else {
+            mid2 = GEOM_sector_ceilingheight(back)
+        }
+        DRAW_set_dc_texturemid(mid2 - RMAIN_viewz())
+    }
+    DRAW_set_dc_texturemid(DRAW_dc_texturemid() + GEOM_side_rowoffset(side))
+
+    let fc: ptr<void> = RMAIN_fixedcolormap()
+    if (fc as i64) != 0 {
+        DRAW_set_dc_colormap(fc)
+    }
+
+    # draw the columns (inclusive x2)
+    for x in x1 to (x2 + 1) {
+        if segs_maskedcol_at(maskedtexturecol, x) != SEGS_SHRT_MAX {
+            if (fc as i64) == 0 {
+                let mut index: i32 = THINGS_spryscale() >> SEGS_LIGHTSCALESHIFT
+                if index >= SEGS_MAXLIGHTSCALE {
+                    index = SEGS_MAXLIGHTSCALE - 1
+                }
+                DRAW_set_dc_colormap(segshim_walllights_at(index))
+            }
+
+            THINGS_set_sprtopscreen(RMAIN_centeryfrac() - FixedMul(DRAW_dc_texturemid(), THINGS_spryscale()))
+            DRAW_set_dc_iscale(segshim_iscale_from_scale(THINGS_spryscale()))
+            DRAW_set_dc_x(x)
+
+            # column_t* = R_GetColumn(...) - 3  (vanilla post header quirk)
+            let col: ptr<u8> = ((R_GetColumn(texnum, segs_maskedcol_at(maskedtexturecol, x)) as i64) - 3) as ptr<u8>
+            R_DrawMaskedColumn(col as ptr<void>)
+            segs_maskedcol_set(maskedtexturecol, x, SEGS_SHRT_MAX)
+        }
+        THINGS_set_spryscale(THINGS_spryscale() + rw_scalestep)
+    }
+}
+
+# ---- R_RenderSegLoop --------------------------------------------------
+
+function R_RenderSegLoop() -> void {
+    let e: ptr<SegEdge> = segs_edge()
+    let cc: ptr<i16> = PLANES_ceilingclip()
+    let fc: ptr<i16> = PLANES_floorclip()
+    let rw_x_p: ptr<i32> = segshim_rw_x_addr()
+    let stopx: i32 = segshim_rw_stopx_addr()[0]
+    let startx: i32 = rw_x_p[0]
+    let dist: i32 = segshim_rw_distance_addr()[0]
+
+    for x in startx to stopx {
+        let mut yl: i32 = (e[0].topfrac + SEGS_HEIGHTUNIT - 1) >> SEGS_HEIGHTBITS
+        if yl < (cc[x] as i32) + 1 {
+            yl = (cc[x] as i32) + 1
+        }
+
+        if segshim_markceiling() != 0 {
+            let mut top: i32 = (cc[x] as i32) + 1
+            let mut bottom: i32 = yl - 1
+            if bottom >= (fc[x] as i32) {
+                bottom = (fc[x] as i32) - 1
+            }
+            if top <= bottom {
+                PLANES_plane_set_top(PLANES_ceilingplane(), x, top)
+                PLANES_plane_set_bottom(PLANES_ceilingplane(), x, bottom)
+            }
+        }
+
+        let mut yh: i32 = e[0].bottomfrac >> SEGS_HEIGHTBITS
+        if yh >= (fc[x] as i32) {
+            yh = (fc[x] as i32) - 1
+        }
+
+        if segshim_markfloor() != 0 {
+            let mut top2: i32 = yh + 1
+            let mut bottom2: i32 = (fc[x] as i32) - 1
+            if top2 <= (cc[x] as i32) {
+                top2 = (cc[x] as i32) + 1
+            }
+            if top2 <= bottom2 {
+                PLANES_plane_set_top(PLANES_floorplane(), x, top2)
+                PLANES_plane_set_bottom(PLANES_floorplane(), x, bottom2)
+            }
+        }
+
+        let mut texturecolumn: i32 = 0
+        if segshim_segtextured() != 0 {
+            let angle: u32 = (rw_centerangle + RMAIN_xtoviewangle(x)) >> SEGS_ANGLETOFINESHIFT
+            texturecolumn = rw_offset - FixedMul(TABLES_finetangent(angle as i32), dist)
+            texturecolumn = texturecolumn >> SEGS_FRACBITS
+
+            let mut index: i32 = rw_scale >> SEGS_LIGHTSCALESHIFT
+            if index >= SEGS_MAXLIGHTSCALE {
+                index = SEGS_MAXLIGHTSCALE - 1
+            }
+            DRAW_set_dc_colormap(segshim_walllights_at(index))
+            DRAW_set_dc_x(x)
+            DRAW_set_dc_iscale(segshim_iscale_from_scale(rw_scale))
+        }
+
+        if midtexture != 0 {
+            DRAW_set_dc_yl(yl)
+            DRAW_set_dc_yh(yh)
+            DRAW_set_dc_texturemid(rw_midtexturemid)
+            DRAW_set_dc_source(R_GetColumn(midtexture, texturecolumn) as ptr<void>)
+            rmainshim_call_colfunc()
+            cc[x] = (DRAW_viewheight() as i16)
+            fc[x] = (0 - 1) as i16
+        } else {
+            # two sided line
+            if toptexture != 0 {
+                let mut mid: i32 = e[0].pixhigh >> SEGS_HEIGHTBITS
+                e[0].pixhigh = e[0].pixhigh + e[0].pixhighstep
+
+                if mid >= (fc[x] as i32) {
+                    mid = (fc[x] as i32) - 1
+                }
+
+                if mid >= yl {
+                    DRAW_set_dc_yl(yl)
+                    DRAW_set_dc_yh(mid)
+                    DRAW_set_dc_texturemid(rw_toptexturemid)
+                    DRAW_set_dc_source(R_GetColumn(toptexture, texturecolumn) as ptr<void>)
+                    rmainshim_call_colfunc()
+                    cc[x] = (mid) as i16
+                } else {
+                    cc[x] = (yl - 1) as i16
+                }
+            } elif segshim_markceiling() != 0 {
+                # no top wall
+                cc[x] = (yl - 1) as i16
+            }
+
+            if bottomtexture != 0 {
+                let mut midb: i32 = (e[0].pixlow + SEGS_HEIGHTUNIT - 1) >> SEGS_HEIGHTBITS
+                e[0].pixlow = e[0].pixlow + e[0].pixlowstep
+
+                if midb <= (cc[x] as i32) {
+                    midb = (cc[x] as i32) + 1
+                }
+
+                if midb <= yh {
+                    DRAW_set_dc_yl(midb)
+                    DRAW_set_dc_yh(yh)
+                    DRAW_set_dc_texturemid(rw_bottomtexturemid)
+                    DRAW_set_dc_source(R_GetColumn(bottomtexture, texturecolumn) as ptr<void>)
+                    rmainshim_call_colfunc()
+                    fc[x] = (midb) as i16
+                } else {
+                    fc[x] = (yh + 1) as i16
+                }
+            } elif segshim_markfloor() != 0 {
+                # no bottom wall
+                fc[x] = (yh + 1) as i16
+            }
+
+            if maskedtexture != 0 {
+                segs_maskedcol_set(maskedtexturecol, x, texturecolumn)
+            }
+        }
+
+        rw_scale = rw_scale + rw_scalestep
+        e[0].topfrac = e[0].topfrac + e[0].topstep
+        e[0].bottomfrac = e[0].bottomfrac + e[0].bottomstep
+    }
+
+    # C leaves rw_x == rw_stopx after the loop
+    rw_x_p[0] = stopx
+}
+
+# ---- R_StoreWallRange -------------------------------------------------
+
+@flow_api
+function R_StoreWallRange(start: i32, stop: i32) -> void {
+    if BSP_ds_full() != 0 {
+        return
+    }
+
+    let e: ptr<SegEdge> = segs_edge()
+    BSP_bind_sidedef_linedef()
+    let ds: ptr<void> = BSP_ds_p()
+    let curline: ptr<void> = BSP_curline()
+    let side: ptr<void> = BSP_sidedef()
+    let line: ptr<void> = BSP_linedef()
+    let front: ptr<void> = BSP_frontsector()
+    let back: ptr<void> = BSP_backsector()
+
+    # mark the segment as visible for auto map
+    segs_line_or_flags(line, SEGS_ML_MAPPED)
+
+    let na: ptr<u32> = segshim_rw_normalangle_addr()
+    na[0] = GEOM_seg_angle(curline) + SEGS_ANG90
+
+    let mut offsetangle: u32 = segshim_abs_rw_angle_diff()
+    if offsetangle > SEGS_ANG90 {
+        offsetangle = SEGS_ANG90
+    }
+
+    let distangle: u32 = SEGS_ANG90 - offsetangle
+    let v1: ptr<void> = GEOM_seg_v1(curline)
+    let hyp: i32 = R_PointToDist(GEOM_vertex_x(v1), GEOM_vertex_y(v1))
+    let sineval: i32 = TABLES_finesine((distangle >> SEGS_ANGLETOFINESHIFT) as i32)
+    let dist_p: ptr<i32> = segshim_rw_distance_addr()
+    dist_p[0] = FixedMul(hyp, sineval)
+
+    let rw_x_p: ptr<i32> = segshim_rw_x_addr()
+    let rw_stop_p: ptr<i32> = segshim_rw_stopx_addr()
+    rw_x_p[0] = start
+    BSP_ds_set_x1(ds, start)
+    BSP_ds_set_x2(ds, stop)
+    BSP_ds_set_curline(ds, curline)
+    rw_stop_p[0] = stop + 1
+
+    rw_scale = R_ScaleFromGlobalAngle(RMAIN_viewangle() + RMAIN_xtoviewangle(start))
+    BSP_ds_set_scale1(ds, rw_scale)
+
+    if stop > start {
+        let scale2: i32 = R_ScaleFromGlobalAngle(RMAIN_viewangle() + RMAIN_xtoviewangle(stop))
+        BSP_ds_set_scale2(ds, scale2)
+        rw_scalestep = (scale2 - rw_scale) / (stop - start)
+        BSP_ds_set_scalestep(ds, rw_scalestep)
+    } else {
+        BSP_ds_set_scale2(ds, rw_scale)
+    }
+
+    e[0].worldtop = GEOM_sector_ceilingheight(front) - RMAIN_viewz()
+    e[0].worldbottom = GEOM_sector_floorheight(front) - RMAIN_viewz()
+
+    midtexture = 0
+    toptexture = 0
+    bottomtexture = 0
+    maskedtexture = 0
+    BSP_ds_set_maskedtexturecol(ds, null)
+
+    if (back as i64) == 0 {
+        # single sided line
+        midtexture = RDATA_texturetranslation(GEOM_side_midtexture(side))
+        segshim_set_markfloor(1)
+        segshim_set_markceiling(1)
+
+        if (GEOM_line_flags(line) & SEGS_ML_DONTPEGBOTTOM) != 0 {
+            # textureheight uses untranslated midtexture index (vanilla)
+            let vtop: i32 = GEOM_sector_floorheight(front) + RDATA_textureheight(GEOM_side_midtexture(side))
+            rw_midtexturemid = vtop - RMAIN_viewz()
+        } else {
+            rw_midtexturemid = e[0].worldtop
+        }
+        rw_midtexturemid = rw_midtexturemid + GEOM_side_rowoffset(side)
+
+        BSP_ds_set_silhouette(ds, SEGS_SIL_BOTH)
+        BSP_ds_set_sprtopclip(ds, THINGS_screenheightarray())
+        BSP_ds_set_sprbottomclip(ds, THINGS_negonearray())
+        BSP_ds_set_bsilheight(ds, SEGS_INT_MAX)
+        BSP_ds_set_tsilheight(ds, SEGS_INT_MIN)
+    } else {
+        # two sided line
+        BSP_ds_set_sprtopclip(ds, null)
+        BSP_ds_set_sprbottomclip(ds, null)
+        BSP_ds_set_silhouette(ds, 0)
+
+        if GEOM_sector_floorheight(front) > GEOM_sector_floorheight(back) {
+            BSP_ds_set_silhouette(ds, SEGS_SIL_BOTTOM)
+            BSP_ds_set_bsilheight(ds, GEOM_sector_floorheight(front))
+        } elif GEOM_sector_floorheight(back) > RMAIN_viewz() {
+            BSP_ds_set_silhouette(ds, SEGS_SIL_BOTTOM)
+            BSP_ds_set_bsilheight(ds, SEGS_INT_MAX)
+        }
+
+        if GEOM_sector_ceilingheight(front) < GEOM_sector_ceilingheight(back) {
+            BSP_ds_or_silhouette(ds, SEGS_SIL_TOP)
+            BSP_ds_set_tsilheight(ds, GEOM_sector_ceilingheight(front))
+        } elif GEOM_sector_ceilingheight(back) < RMAIN_viewz() {
+            BSP_ds_or_silhouette(ds, SEGS_SIL_TOP)
+            BSP_ds_set_tsilheight(ds, SEGS_INT_MIN)
+        }
+
+        if GEOM_sector_ceilingheight(back) <= GEOM_sector_floorheight(front) {
+            BSP_ds_set_sprbottomclip(ds, THINGS_negonearray())
+            BSP_ds_set_bsilheight(ds, SEGS_INT_MAX)
+            BSP_ds_or_silhouette(ds, SEGS_SIL_BOTTOM)
+        }
+
+        if GEOM_sector_floorheight(back) >= GEOM_sector_ceilingheight(front) {
+            BSP_ds_set_sprtopclip(ds, THINGS_screenheightarray())
+            BSP_ds_set_tsilheight(ds, SEGS_INT_MIN)
+            BSP_ds_or_silhouette(ds, SEGS_SIL_TOP)
+        }
+
+        e[0].worldhigh = GEOM_sector_ceilingheight(back) - RMAIN_viewz()
+        e[0].worldlow = GEOM_sector_floorheight(back) - RMAIN_viewz()
+
+        # hack to allow height changes in outdoor areas
+        if GEOM_sector_ceilingpic(front) == SKY_skyflatnum()
+            and GEOM_sector_ceilingpic(back) == SKY_skyflatnum() {
+            e[0].worldtop = e[0].worldhigh
+        }
+
+        if e[0].worldlow != e[0].worldbottom
+            or GEOM_sector_floorpic(back) != GEOM_sector_floorpic(front)
+            or GEOM_sector_lightlevel(back) != GEOM_sector_lightlevel(front) {
+            segshim_set_markfloor(1)
+        } else {
+            segshim_set_markfloor(0)
+        }
+
+        if e[0].worldhigh != e[0].worldtop
+            or GEOM_sector_ceilingpic(back) != GEOM_sector_ceilingpic(front)
+            or GEOM_sector_lightlevel(back) != GEOM_sector_lightlevel(front) {
+            segshim_set_markceiling(1)
+        } else {
+            segshim_set_markceiling(0)
+        }
+
+        if GEOM_sector_ceilingheight(back) <= GEOM_sector_floorheight(front)
+            or GEOM_sector_floorheight(back) >= GEOM_sector_ceilingheight(front) {
+            # closed door
+            segshim_set_markceiling(1)
+            segshim_set_markfloor(1)
+        }
+
+        if e[0].worldhigh < e[0].worldtop {
+            toptexture = RDATA_texturetranslation(GEOM_side_toptexture(side))
+            if (GEOM_line_flags(line) & SEGS_ML_DONTPEGTOP) != 0 {
+                rw_toptexturemid = e[0].worldtop
+            } else {
+                let vtop2: i32 = GEOM_sector_ceilingheight(back)
+                    + RDATA_textureheight(GEOM_side_toptexture(side))
+                rw_toptexturemid = vtop2 - RMAIN_viewz()
+            }
+        }
+
+        if e[0].worldlow > e[0].worldbottom {
+            bottomtexture = RDATA_texturetranslation(GEOM_side_bottomtexture(side))
+            if (GEOM_line_flags(line) & SEGS_ML_DONTPEGBOTTOM) != 0 {
+                rw_bottomtexturemid = e[0].worldtop
+            } else {
+                rw_bottomtexturemid = e[0].worldlow
+            }
+        }
+
+        rw_toptexturemid = rw_toptexturemid + GEOM_side_rowoffset(side)
+        rw_bottomtexturemid = rw_bottomtexturemid + GEOM_side_rowoffset(side)
+
+        if GEOM_side_midtexture(side) != 0 {
+            maskedtexture = 1
+            maskedtexturecol = PLANES_maskedcol_from_lastopening(rw_x_p[0])
+            BSP_ds_set_maskedtexturecol(ds, maskedtexturecol)
+            PLANES_lastopening_advance(rw_stop_p[0] - rw_x_p[0])
+        }
+    }
+
+    segshim_set_segtextured(midtexture | toptexture | bottomtexture | maskedtexture)
+
+    if segshim_segtextured() != 0 {
+        # unsigned angle wrap: rw_normalangle - rw_angle1
+        let mut oa: u32 = na[0] - (segshim_rw_angle1_addr()[0] as u32)
+
+        if oa > SEGS_ANG180 {
+            oa = (0 as u32) - oa
+        }
+        if oa > SEGS_ANG90 {
+            oa = SEGS_ANG90
+        }
+
+        let sine2: i32 = TABLES_finesine((oa >> SEGS_ANGLETOFINESHIFT) as i32)
+        rw_offset = FixedMul(hyp, sine2)
+
+        if (na[0] - (segshim_rw_angle1_addr()[0] as u32)) < SEGS_ANG180 {
+            rw_offset = 0 - rw_offset
+        }
+
+        rw_offset = rw_offset + GEOM_side_textureoffset(side) + GEOM_seg_offset(curline)
+        rw_centerangle = SEGS_ANG90 + RMAIN_viewangle() - na[0]
+
+        if (RMAIN_fixedcolormap() as i64) == 0 {
+            let mut lightnum: i32 = (GEOM_sector_lightlevel(front) >> SEGS_LIGHTSEGSHIFT) + RMAIN_extralight()
+            let vv1: ptr<void> = GEOM_seg_v1(curline)
+            let vv2: ptr<void> = GEOM_seg_v2(curline)
+            if GEOM_vertex_y(vv1) == GEOM_vertex_y(vv2) {
+                lightnum = lightnum - 1
+            } elif GEOM_vertex_x(vv1) == GEOM_vertex_x(vv2) {
+                lightnum = lightnum + 1
+            }
+            segshim_set_walllights_level(lightnum)
+        }
+    }
+
+    if GEOM_sector_floorheight(front) >= RMAIN_viewz() {
+        segshim_set_markfloor(0)
+    }
+
+    if GEOM_sector_ceilingheight(front) <= RMAIN_viewz()
+        and GEOM_sector_ceilingpic(front) != SKY_skyflatnum() {
+        segshim_set_markceiling(0)
+    }
+
+    e[0].worldtop = e[0].worldtop >> 4
+    e[0].worldbottom = e[0].worldbottom >> 4
+
+    e[0].topstep = 0 - FixedMul(rw_scalestep, e[0].worldtop)
+    e[0].topfrac = (RMAIN_centeryfrac() >> 4) - FixedMul(e[0].worldtop, rw_scale)
+    e[0].bottomstep = 0 - FixedMul(rw_scalestep, e[0].worldbottom)
+    e[0].bottomfrac = (RMAIN_centeryfrac() >> 4) - FixedMul(e[0].worldbottom, rw_scale)
+
+    if (back as i64) != 0 {
+        e[0].worldhigh = e[0].worldhigh >> 4
+        e[0].worldlow = e[0].worldlow >> 4
+
+        if e[0].worldhigh < e[0].worldtop {
+            e[0].pixhigh = (RMAIN_centeryfrac() >> 4) - FixedMul(e[0].worldhigh, rw_scale)
+            e[0].pixhighstep = 0 - FixedMul(rw_scalestep, e[0].worldhigh)
+        }
+
+        if e[0].worldlow > e[0].worldbottom {
+            e[0].pixlow = (RMAIN_centeryfrac() >> 4) - FixedMul(e[0].worldlow, rw_scale)
+            e[0].pixlowstep = 0 - FixedMul(rw_scalestep, e[0].worldlow)
+        }
+    }
+
+    if segshim_markceiling() != 0 {
+        PLANES_set_ceilingplane(R_CheckPlane(PLANES_ceilingplane(), rw_x_p[0], rw_stop_p[0] - 1))
+    }
+    if segshim_markfloor() != 0 {
+        PLANES_set_floorplane(R_CheckPlane(PLANES_floorplane(), rw_x_p[0], rw_stop_p[0] - 1))
+    }
+
+    R_RenderSegLoop()
+
+    # save sprite clipping info
+    if ((BSP_ds_silhouette(ds) & SEGS_SIL_TOP) != 0 or maskedtexture != 0)
+        and (BSP_ds_sprtopclip(ds) as i64) == 0 {
+        BSP_ds_set_sprtopclip(ds, PLANES_save_ceilingclip(start, rw_stop_p[0] - start))
+    }
+
+    if ((BSP_ds_silhouette(ds) & SEGS_SIL_BOTTOM) != 0 or maskedtexture != 0)
+        and (BSP_ds_sprbottomclip(ds) as i64) == 0 {
+        BSP_ds_set_sprbottomclip(ds, PLANES_save_floorclip(start, rw_stop_p[0] - start))
+    }
+
+    if maskedtexture != 0 and (BSP_ds_silhouette(ds) & SEGS_SIL_TOP) == 0 {
+        BSP_ds_or_silhouette(ds, SEGS_SIL_TOP)
+        BSP_ds_set_tsilheight(ds, SEGS_INT_MIN)
+    }
+    if maskedtexture != 0 and (BSP_ds_silhouette(ds) & SEGS_SIL_BOTTOM) == 0 {
+        BSP_ds_or_silhouette(ds, SEGS_SIL_BOTTOM)
+        BSP_ds_set_bsilheight(ds, SEGS_INT_MAX)
+    }
+
+    BSP_ds_advance()
+}

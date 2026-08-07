@@ -1,0 +1,1329 @@
+# The automap, ported from am_map.c to Flow.
+#
+# All automap logic lives here: projection math, panning/zoom, the
+# Cohen-Sutherland line clipper, Bresenham line drawing into the palette
+# framebuffer, walls/players/things/marks/grid drawing and follow mode.
+#
+# Engine data is reached through GEOM_* / PLAYER_* / KEY_* accessors.
+# automapactive and cheat_amap live here (formerly am_shim.c storage).
+#
+# The only struct read by offset here is event_t (d_event.h), which is
+# five plain ints: type, data1, data2, data3, data4.
+
+# ---- externs: libc ----------------------------------------------------
+
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+extern { function memset(dest: ptr<void>, c: i32, n: i64) -> ptr<void> }
+extern { function TABLES_finesine(idx: i32) -> i32 }
+extern { function TABLES_finecosine(idx: i32) -> i32 }
+
+# ---- externs: fixed-point (fixp.flow, exact C names) ------------------
+
+extern { function FixedMul(a: i32, b: i32) -> i32 }
+extern { function FixedDiv(a: i32, b: i32) -> i32 }
+
+# ---- externs: WAD (wad.flow, exact C names) ---------------------------
+
+extern { function W_CacheLumpName(name: string, tag: i32) -> ptr<void> }
+extern { function W_ReleaseLumpName(name: string) -> void }
+
+# ---- externs: engine C ------------------------------------------------
+
+# st_stuff.c; returns boolean, takes event_t*.
+extern { function ST_Responder(ev: ptr<void>) -> i32 }
+# v_video.c
+extern { function V_MarkRect(x: i32, y: i32, w: i32, h: i32) -> void }
+extern { function V_DrawPatch(x: i32, y: i32, patch: ptr<void>) -> void }
+# m_cheat.c cheat checker; cheat_amap buffer lives below.
+extern { function cht_CheckCheat(cht: ptr<u8>, key: u8) -> i32 }
+
+extern { function STAT_set_viewactive(v: i32) -> void }
+extern { function STAT_singledemo() -> i32 }
+extern { function GEOM_numvertexes() -> i32 }
+extern { function GEOM_numlines() -> i32 }
+extern { function GEOM_line_i_v1x(i: i32) -> i32 }
+extern { function GEOM_line_i_v1y(i: i32) -> i32 }
+extern { function GEOM_line_i_v2x(i: i32) -> i32 }
+extern { function GEOM_line_i_v2y(i: i32) -> i32 }
+extern { function GEOM_line_i_flags(i: i32) -> i32 }
+extern { function GEOM_line_i_special(i: i32) -> i32 }
+extern { function GEOM_line(i: i32) -> ptr<void> }
+extern { function GEOM_line_backsector(ld: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_frontsector(ld: ptr<void>) -> ptr<void> }
+extern { function GEOM_sector_floorheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_ceilingheight(s: ptr<void>) -> i32 }
+extern { function GEOM_numsectors() -> i32 }
+extern { function GEOM_sector_thinglist(s: ptr<void>) -> ptr<void> }
+extern { function GEOM_sector(i: i32) -> ptr<void> }
+extern { function MOBJ_x(m: ptr<void>) -> i32 }
+extern { function MOBJ_y(m: ptr<void>) -> i32 }
+extern { function MOBJ_angle(m: ptr<void>) -> u32 }
+extern { function MOBJ_snext(m: ptr<void>) -> ptr<void> }
+extern { function GEOM_bmaporgx() -> i32 }
+extern { function GEOM_bmaporgy() -> i32 }
+extern { function VIDEO_buffer() -> ptr<u8> }
+extern { function KEY_map_north() -> i32 }
+extern { function KEY_map_south() -> i32 }
+extern { function KEY_map_east() -> i32 }
+extern { function KEY_map_west() -> i32 }
+extern { function KEY_map_zoomin() -> i32 }
+extern { function KEY_map_zoomout() -> i32 }
+extern { function KEY_map_toggle() -> i32 }
+extern { function KEY_map_maxzoom() -> i32 }
+extern { function KEY_map_follow() -> i32 }
+extern { function KEY_map_grid() -> i32 }
+extern { function KEY_map_mark() -> i32 }
+extern { function KEY_map_clearmark() -> i32 }
+extern { function GEOM_vertex_i_x(i: i32) -> i32 }
+extern { function GEOM_vertex_i_y(i: i32) -> i32 }
+extern { function PLAYER_at(i: i32) -> ptr<void> }
+extern { function PLAYER_mo(p: ptr<void>) -> ptr<void> }
+extern { function PLAYER_power(p: ptr<void>, pw: i32) -> i32 }
+extern { function PLAYER_set_message(p: ptr<void>, msg: string) -> void }
+
+# ---- constants --------------------------------------------------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_consoleplayer() -> i32 }
+
+const AM_SCREENWIDTH: i32 = 320
+const AM_SCREENHEIGHT: i32 = 200
+
+let mut automapactive: i32 = 0
+
+# cheatseq_t for CHEAT("iddt", 0) — layout documented in cheat.flow
+let mut am_cheat_amap: array<u8, 72> = [
+    105, 100, 100, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    4, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0
+]
+
+let mut am_markmsg_buf: ptr<u8> = null
+let mut am_ammnum_buf: ptr<u8> = null
+
+@flow_api
+function AM_automapactive() -> i32 { return automapactive }
+
+@flow_api
+function AM_set_automapactive(v: i32) -> void { automapactive = v }
+
+function am_marked_spot_message(num: i32) -> string {
+    if (am_markmsg_buf as i64) == 0 {
+        am_markmsg_buf = calloc(20, 1) as ptr<u8>
+    }
+    am_markmsg_buf[0] = 77 as u8   # 'M'
+    am_markmsg_buf[1] = 97 as u8   # 'a'
+    am_markmsg_buf[2] = 114 as u8  # 'r'
+    am_markmsg_buf[3] = 107 as u8  # 'k'
+    am_markmsg_buf[4] = 101 as u8  # 'e'
+    am_markmsg_buf[5] = 100 as u8  # 'd'
+    am_markmsg_buf[6] = 32 as u8   # ' '
+    am_markmsg_buf[7] = 83 as u8   # 'S'
+    am_markmsg_buf[8] = 112 as u8  # 'p'
+    am_markmsg_buf[9] = 111 as u8  # 'o'
+    am_markmsg_buf[10] = 116 as u8 # 't'
+    am_markmsg_buf[11] = 32 as u8  # ' '
+    if num >= 10 {
+        am_markmsg_buf[12] = (48 + num / 10) as u8
+        am_markmsg_buf[13] = (48 + num % 10) as u8
+        am_markmsg_buf[14] = 0
+    } else {
+        am_markmsg_buf[12] = (48 + num) as u8
+        am_markmsg_buf[13] = 0
+    }
+    return am_markmsg_buf as string
+}
+
+function am_ammnum_name(i: i32) -> string {
+    if (am_ammnum_buf as i64) == 0 {
+        am_ammnum_buf = calloc(9, 1) as ptr<u8>
+    }
+    am_ammnum_buf[0] = 65 as u8   # 'A'
+    am_ammnum_buf[1] = 77 as u8   # 'M'
+    am_ammnum_buf[2] = 77 as u8   # 'M'
+    am_ammnum_buf[3] = 78 as u8   # 'N'
+    am_ammnum_buf[4] = 85 as u8   # 'U'
+    am_ammnum_buf[5] = 77 as u8   # 'M'
+    if i >= 10 {
+        am_ammnum_buf[6] = (48 + i / 10) as u8
+        am_ammnum_buf[7] = (48 + i % 10) as u8
+        am_ammnum_buf[8] = 0
+    } else {
+        am_ammnum_buf[6] = (48 + i) as u8
+        am_ammnum_buf[7] = 0
+    }
+    return am_ammnum_buf as string
+}
+
+const AM_FRACBITS: i32 = 16          # m_fixed.h
+const AM_FRACUNIT: i32 = 65536       # m_fixed.h
+const AM_INT_MAX: i32 = 2147483647   # limits.h
+
+# Palette colors, from the #defines at the top of am_map.c:
+#   REDS=176 REDRANGE=16 GREENS=112 GREENRANGE=16 GRAYS=96 GRAYSRANGE=16
+#   BROWNS=64 BROWNRANGE=16 YELLOWS=231 YELLOWRANGE=1 BLACK=0 WHITE=209
+const AM_BACKGROUND: i32 = 0         # BLACK
+const AM_WHITE: i32 = 209            # YOURCOLORS
+const AM_WALLCOLORS: i32 = 176       # REDS
+const AM_WALLRANGE: i32 = 16         # REDRANGE
+const AM_TSWALLCOLORS: i32 = 96      # GRAYS
+const AM_FDWALLCOLORS: i32 = 64      # BROWNS
+const AM_CDWALLCOLORS: i32 = 231     # YELLOWS
+const AM_THINGCOLORS: i32 = 112      # GREENS
+const AM_THINGRANGE: i32 = 16        # GREENRANGE
+const AM_SECRETWALLCOLORS: i32 = 176 # = WALLCOLORS
+const AM_GRIDCOLORS: i32 = 104       # GRAYS + GRAYSRANGE/2
+const AM_XHAIRCOLORS: i32 = 96       # GRAYS
+const AM_GRAYS: i32 = 96
+
+const AM_NUMMARKPOINTS: i32 = 10
+const AM_INITSCALEMTOF: i32 = 13107  # (fixed_t)(.2*FRACUNIT)
+const AM_F_PANINC: i32 = 4
+const AM_M_ZOOMIN: i32 = 66846      # (int)(1.02*FRACUNIT)
+const AM_M_ZOOMOUT: i32 = 64250     # (int)(FRACUNIT/1.02)
+
+# d_event.h evtype_t
+const AM_EV_KEYDOWN: i32 = 0
+const AM_EV_KEYUP: i32 = 1
+
+# am_map.h status-bar notification messages:
+#   AM_MSGHEADER  = ('a'<<24)+('m'<<16)   = 0x616d0000
+#   AM_MSGENTERED = AM_MSGHEADER|('e'<<8) = 0x616d6500
+#   AM_MSGEXITED  = AM_MSGHEADER|('x'<<8) = 0x616d7800
+const AM_MSGENTERED: i32 = 1634559232
+const AM_MSGEXITED: i32 = 1634564096
+
+# doomdata.h line flags
+const AM_ML_SECRET: i32 = 32
+const AM_ML_DONTDRAW: i32 = 128     # LINE_NEVERSEE
+const AM_ML_MAPPED: i32 = 256
+
+# doomdef.h powertype_t
+const AM_PW_INVISIBILITY: i32 = 2
+const AM_PW_ALLMAP: i32 = 4
+
+const AM_MAXPLAYERS: i32 = 4        # doomdef.h
+const AM_PLAYERRADIUS: i32 = 1048576 # p_local.h: 16*FRACUNIT
+const AM_MAPBLOCKSIZE: i32 = 8388608 # p_local.h: MAPBLOCKUNITS(128)<<FRACBITS
+const AM_ANGLETOFINESHIFT: i32 = 19  # tables.h
+const AM_PU_STATIC: i32 = 1          # z_zone.h
+
+# Cohen-Sutherland outcodes (local enum in AM_clipMline)
+const AM_OC_LEFT: i32 = 1
+const AM_OC_RIGHT: i32 = 2
+const AM_OC_BOTTOM: i32 = 4
+const AM_OC_TOP: i32 = 8
+
+# ---- the vector graphics ----------------------------------------------
+#
+# player_arrow / cheat_player_arrow use R = (8*PLAYERRADIUS)/7 = 1198372;
+# thintriangle_guy uses R = FRACUNIT. All values precomputed with C
+# integer/truncation semantics. Layout: ax, ay, bx, by per line.
+
+let mut am_player_arrow: array<i32, 28> = [
+    -1048576, 0, 1198372, 0,          #  { -R+R/8, 0 }, { R, 0 }
+    1198372, 0, 599186, 299593,       #  { R, 0 }, { R-R/2, R/4 }
+    1198372, 0, 599186, -299593,      #  { R, 0 }, { R-R/2, -R/4 }
+    -1048576, 0, -1348168, 299593,    #  { -R+R/8, 0 }, { -R-R/8, R/4 }
+    -1048576, 0, -1348168, -299593,   #  { -R+R/8, 0 }, { -R-R/8, -R/4 }
+    -748983, 0, -1048576, 299593,     #  { -R+3*R/8, 0 }, { -R+R/8, R/4 }
+    -748983, 0, -1048576, -299593     #  { -R+3*R/8, 0 }, { -R+R/8, -R/4 }
+]
+
+let mut am_cheat_player_arrow: array<i32, 64> = [
+    -1048576, 0, 1198372, 0,          #  { -R+R/8, 0 }, { R, 0 }
+    1198372, 0, 599186, 199728,       #  { R, 0 }, { R-R/2, R/6 }
+    1198372, 0, 599186, -199728,      #  { R, 0 }, { R-R/2, -R/6 }
+    -1048576, 0, -1348168, 199728,    #  { -R+R/8, 0 }, { -R-R/8, R/6 }
+    -1048576, 0, -1348168, -199728,   #  { -R+R/8, 0 }, { -R-R/8, -R/6 }
+    -748983, 0, -1048576, 199728,     #  { -R+3*R/8, 0 }, { -R+R/8, R/6 }
+    -748983, 0, -1048576, -199728,    #  { -R+3*R/8, 0 }, { -R+R/8, -R/6 }
+    -599186, 0, -599186, -199728,     #  { -R/2, 0 }, { -R/2, -R/6 }
+    -599186, -199728, -399458, -199728,  #  { -R/2, -R/6 }, { -R/2+R/6, -R/6 }
+    -399458, -199728, -399458, 299593,   #  { -R/2+R/6, -R/6 }, { -R/2+R/6, R/4 }
+    -199728, 0, -199728, -199728,     #  { -R/6, 0 }, { -R/6, -R/6 }
+    -199728, -199728, 0, -199728,     #  { -R/6, -R/6 }, { 0, -R/6 }
+    0, -199728, 0, 299593,            #  { 0, -R/6 }, { 0, R/4 }
+    199728, 299593, 199728, -171196,  #  { R/6, R/4 }, { R/6, -R/7 }
+    199728, -171196, 237177, -208645, #  { R/6, -R/7 }, { R/6+R/32, -R/7-R/32 }
+    237177, -208645, 319565, -171196  #  { R/6+R/32, -R/7-R/32 }, { R/6+R/10, -R/7 }
+]
+
+let mut am_thintriangle_guy: array<i32, 12> = [
+    -32768, -45875, 65536, 0,         #  { -.5*R, -.7*R }, { R, 0 }
+    65536, 0, -32768, 45875,          #  { R, 0 }, { -.5*R, .7*R }
+    -32768, 45875, -32768, -45875     #  { -.5*R, .7*R }, { -.5*R, -.7*R }
+]
+
+# their_colors[] from AM_drawPlayers: { GREENS, GRAYS, BROWNS, REDS }
+let mut am_their_colors: array<i32, 4> = [112, 96, 64, 176]
+
+# ---- module state (statics in am_map.c) -------------------------------
+
+let mut am_cheating: i32 = 0
+let mut am_grid: i32 = 0
+let mut am_leveljuststarted: i32 = 1   # kluge until AM_LevelInit() is called
+
+let mut am_f_x: i32 = 0
+let mut am_f_y: i32 = 0
+let mut am_f_w: i32 = 0
+let mut am_f_h: i32 = 0
+
+let mut am_lightlev: i32 = 0           # used for funky strobing effect
+let mut am_fb: ptr<u8> = null          # pseudo-frame buffer
+let mut am_amclock: i32 = 0
+
+let mut am_paninc_x: i32 = 0           # m_paninc
+let mut am_paninc_y: i32 = 0
+let mut am_mtof_zoommul: i32 = 0
+let mut am_ftom_zoommul: i32 = 0
+
+let mut am_m_x: i32 = 0
+let mut am_m_y: i32 = 0
+let mut am_m_x2: i32 = 0
+let mut am_m_y2: i32 = 0
+let mut am_m_w: i32 = 0
+let mut am_m_h: i32 = 0
+
+let mut am_min_x: i32 = 0
+let mut am_min_y: i32 = 0
+let mut am_max_x: i32 = 0
+let mut am_max_y: i32 = 0
+let mut am_max_w: i32 = 0
+let mut am_max_h: i32 = 0
+let mut am_min_w: i32 = 0
+let mut am_min_h: i32 = 0
+
+let mut am_min_scale_mtof: i32 = 0
+let mut am_max_scale_mtof: i32 = 0
+
+let mut am_old_m_w: i32 = 0
+let mut am_old_m_h: i32 = 0
+let mut am_old_m_x: i32 = 0
+let mut am_old_m_y: i32 = 0
+
+let mut am_f_oldloc_x: i32 = 0
+let mut am_f_oldloc_y: i32 = 0
+
+let mut am_scale_mtof: i32 = 13107     # INITSCALEMTOF
+let mut am_scale_ftom: i32 = 0
+
+let mut am_plr: ptr<void> = null       # the player represented by an arrow
+
+let mut am_marknums: ptr<i64> = null   # patch_t* per digit, allocated lazily
+let mut am_markpoints_x: ptr<i32> = null
+let mut am_markpoints_y: ptr<i32> = null
+let mut am_markpointnum: i32 = 0
+
+let mut am_followplayer: i32 = 1
+let mut am_stopped: i32 = 1            # boolean stopped = true
+
+let mut am_bigstate: i32 = 0           # static in AM_Responder
+let mut am_lastlevel: i32 = -1         # statics in AM_Start
+let mut am_lastepisode: i32 = -1
+
+let mut am_fline_fuck: i32 = 0         # static counter in AM_drawFline
+
+# clip/draw scratch (static fline_t in AM_drawMline)
+let mut am_fl_ax: i32 = 0
+let mut am_fl_ay: i32 = 0
+let mut am_fl_bx: i32 = 0
+let mut am_fl_by: i32 = 0
+
+# AM_rotate output
+let mut am_rot_x: i32 = 0
+let mut am_rot_y: i32 = 0
+
+# scratch event_t buffer for ST_Responder notifications
+let mut am_ev_buf: ptr<i32> = null
+
+function am_ensure_buffers() -> void {
+    if (am_markpoints_x as i64) == 0 {
+        am_markpoints_x = calloc(10, 4) as ptr<i32>
+        am_markpoints_y = calloc(10, 4) as ptr<i32>
+        am_marknums = calloc(10, 8) as ptr<i64>
+        am_ev_buf = calloc(5, 4) as ptr<i32>
+    }
+}
+
+# ---- coordinate translation (FTOM/MTOF/CXMTOF/CYMTOF macros) ----------
+
+function am_ftom(x: i32) -> i32 {
+    return FixedMul(x << 16, am_scale_ftom)
+}
+
+function am_mtof(x: i32) -> i32 {
+    return FixedMul(x, am_scale_mtof) >> 16
+}
+
+function am_cxmtof(x: i32) -> i32 {
+    return am_f_x + am_mtof(x - am_m_x)
+}
+
+function am_cymtof(y: i32) -> i32 {
+    return am_f_y + (am_f_h - am_mtof(y - am_m_y))
+}
+
+# ---- scale / location management --------------------------------------
+
+function AM_activateNewScale() -> void {
+    am_m_x = am_m_x + am_m_w / 2
+    am_m_y = am_m_y + am_m_h / 2
+    am_m_w = am_ftom(am_f_w)
+    am_m_h = am_ftom(am_f_h)
+    am_m_x = am_m_x - am_m_w / 2
+    am_m_y = am_m_y - am_m_h / 2
+    am_m_x2 = am_m_x + am_m_w
+    am_m_y2 = am_m_y + am_m_h
+}
+
+function AM_saveScaleAndLoc() -> void {
+    am_old_m_x = am_m_x
+    am_old_m_y = am_m_y
+    am_old_m_w = am_m_w
+    am_old_m_h = am_m_h
+}
+
+function AM_restoreScaleAndLoc() -> void {
+    am_m_w = am_old_m_w
+    am_m_h = am_old_m_h
+    if am_followplayer == 0 {
+        am_m_x = am_old_m_x
+        am_m_y = am_old_m_y
+    } else {
+        am_m_x = MOBJ_x(PLAYER_mo(am_plr)) - am_m_w / 2
+        am_m_y = MOBJ_y(PLAYER_mo(am_plr)) - am_m_h / 2
+    }
+    am_m_x2 = am_m_x + am_m_w
+    am_m_y2 = am_m_y + am_m_h
+
+    # Change the scaling multipliers
+    am_scale_mtof = FixedDiv(am_f_w << AM_FRACBITS, am_m_w)
+    am_scale_ftom = FixedDiv(AM_FRACUNIT, am_scale_mtof)
+}
+
+# adds a marker at the current location
+function AM_addMark() -> void {
+    am_ensure_buffers()
+    am_markpoints_x[am_markpointnum] = am_m_x + am_m_w / 2
+    am_markpoints_y[am_markpointnum] = am_m_y + am_m_h / 2
+    am_markpointnum = (am_markpointnum + 1) % AM_NUMMARKPOINTS
+}
+
+# Determines bounding box of all vertices, sets global variables
+# controlling zoom range.
+function AM_findMinMaxBoundaries() -> void {
+    am_min_x = AM_INT_MAX
+    am_min_y = AM_INT_MAX
+    am_max_x = 0 - AM_INT_MAX
+    am_max_y = 0 - AM_INT_MAX
+
+    let n: i32 = GEOM_numvertexes()
+    let mut i: i32 = 0
+    while i < n {
+        let vx: i32 = GEOM_vertex_i_x(i)
+        let vy: i32 = GEOM_vertex_i_y(i)
+        if vx < am_min_x {
+            am_min_x = vx
+        } else {
+            if vx > am_max_x {
+                am_max_x = vx
+            }
+        }
+        if vy < am_min_y {
+            am_min_y = vy
+        } else {
+            if vy > am_max_y {
+                am_max_y = vy
+            }
+        }
+        i = i + 1
+    }
+
+    am_max_w = am_max_x - am_min_x
+    am_max_h = am_max_y - am_min_y
+
+    am_min_w = 2 * AM_PLAYERRADIUS   # const? never changed?
+    am_min_h = 2 * AM_PLAYERRADIUS
+
+    let a: i32 = FixedDiv(am_f_w << AM_FRACBITS, am_max_w)
+    let b: i32 = FixedDiv(am_f_h << AM_FRACBITS, am_max_h)
+
+    if a < b {
+        am_min_scale_mtof = a
+    } else {
+        am_min_scale_mtof = b
+    }
+    am_max_scale_mtof = FixedDiv(am_f_h << AM_FRACBITS, 2 * AM_PLAYERRADIUS)
+}
+
+function AM_changeWindowLoc() -> void {
+    if am_paninc_x != 0 or am_paninc_y != 0 {
+        am_followplayer = 0
+        am_f_oldloc_x = AM_INT_MAX
+    }
+
+    am_m_x = am_m_x + am_paninc_x
+    am_m_y = am_m_y + am_paninc_y
+
+    if am_m_x + am_m_w / 2 > am_max_x {
+        am_m_x = am_max_x - am_m_w / 2
+    } else {
+        if am_m_x + am_m_w / 2 < am_min_x {
+            am_m_x = am_min_x - am_m_w / 2
+        }
+    }
+
+    if am_m_y + am_m_h / 2 > am_max_y {
+        am_m_y = am_max_y - am_m_h / 2
+    } else {
+        if am_m_y + am_m_h / 2 < am_min_y {
+            am_m_y = am_min_y - am_m_h / 2
+        }
+    }
+
+    am_m_x2 = am_m_x + am_m_w
+    am_m_y2 = am_m_y + am_m_h
+}
+
+function AM_initVariables() -> void {
+    am_ensure_buffers()
+
+    AM_set_automapactive(1)
+    am_fb = VIDEO_buffer()
+
+    am_f_oldloc_x = AM_INT_MAX
+    am_amclock = 0
+    am_lightlev = 0
+
+    am_paninc_x = 0
+    am_paninc_y = 0
+    am_ftom_zoommul = AM_FRACUNIT
+    am_mtof_zoommul = AM_FRACUNIT
+
+    am_m_w = am_ftom(am_f_w)
+    am_m_h = am_ftom(am_f_h)
+
+    # find player to center on initially
+    if STAT_playeringame(STAT_consoleplayer()) != 0 {
+        am_plr = PLAYER_at(STAT_consoleplayer())
+    } else {
+        am_plr = PLAYER_at(0)
+        let mut pnum: i32 = 0
+        let mut found: i32 = 0
+        while pnum < AM_MAXPLAYERS and found == 0 {
+            if STAT_playeringame(pnum) != 0 {
+                am_plr = PLAYER_at(pnum)
+                found = 1
+            }
+            pnum = pnum + 1
+        }
+    }
+
+    am_m_x = MOBJ_x(PLAYER_mo(am_plr)) - am_m_w / 2
+    am_m_y = MOBJ_y(PLAYER_mo(am_plr)) - am_m_h / 2
+    AM_changeWindowLoc()
+
+    # for saving & restoring
+    am_old_m_x = am_m_x
+    am_old_m_y = am_m_y
+    am_old_m_w = am_m_w
+    am_old_m_h = am_m_h
+
+    # inform the status bar of the change:
+    # static event_t st_notify = { ev_keyup, AM_MSGENTERED, 0, 0 };
+    am_ev_buf[0] = AM_EV_KEYUP
+    am_ev_buf[1] = AM_MSGENTERED
+    am_ev_buf[2] = 0
+    am_ev_buf[3] = 0
+    am_ev_buf[4] = 0
+    ST_Responder(am_ev_buf as ptr<void>)
+}
+
+function AM_loadPics() -> void {
+    am_ensure_buffers()
+    let mut i: i32 = 0
+    while i < 10 {
+        am_marknums[i] = W_CacheLumpName(am_ammnum_name(i), AM_PU_STATIC) as i64
+        i = i + 1
+    }
+}
+
+function AM_unloadPics() -> void {
+    let mut i: i32 = 0
+    while i < 10 {
+        W_ReleaseLumpName(am_ammnum_name(i))
+        i = i + 1
+    }
+}
+
+function AM_clearMarks() -> void {
+    am_ensure_buffers()
+    let mut i: i32 = 0
+    while i < AM_NUMMARKPOINTS {
+        am_markpoints_x[i] = -1   # means empty
+        i = i + 1
+    }
+    am_markpointnum = 0
+}
+
+# should be called at the start of every level
+function AM_LevelInit() -> void {
+    am_leveljuststarted = 0
+
+    am_f_x = 0
+    am_f_y = 0
+    am_f_w = AM_SCREENWIDTH
+    am_f_h = AM_SCREENHEIGHT - 32
+
+    AM_clearMarks()
+
+    AM_findMinMaxBoundaries()
+    # scale_mtof = FixedDiv(min_scale_mtof, (int) (0.7*FRACUNIT));
+    am_scale_mtof = FixedDiv(am_min_scale_mtof, 45875)
+    if am_scale_mtof > am_max_scale_mtof {
+        am_scale_mtof = am_min_scale_mtof
+    }
+    am_scale_ftom = FixedDiv(AM_FRACUNIT, am_scale_mtof)
+}
+
+@flow_api
+function AM_Stop() -> void {
+    am_ensure_buffers()
+    AM_unloadPics()
+    AM_set_automapactive(0)
+    # static event_t st_notify = { 0, ev_keyup, AM_MSGEXITED, 0 };
+    # (quirky original initializer: type=0, data1=ev_keyup, data2=MSGEXITED)
+    am_ev_buf[0] = 0
+    am_ev_buf[1] = AM_EV_KEYUP
+    am_ev_buf[2] = AM_MSGEXITED
+    am_ev_buf[3] = 0
+    am_ev_buf[4] = 0
+    ST_Responder(am_ev_buf as ptr<void>)
+    am_stopped = 1
+}
+
+@flow_api
+function AM_Start() -> void {
+    if am_stopped == 0 {
+        AM_Stop()
+    }
+    am_stopped = 0
+    if am_lastlevel != STAT_gamemap() or am_lastepisode != STAT_gameepisode() {
+        AM_LevelInit()
+        am_lastlevel = STAT_gamemap()
+        am_lastepisode = STAT_gameepisode()
+    }
+    AM_initVariables()
+    AM_loadPics()
+}
+
+# set the window scale to the maximum size
+function AM_minOutWindowScale() -> void {
+    am_scale_mtof = am_min_scale_mtof
+    am_scale_ftom = FixedDiv(AM_FRACUNIT, am_scale_mtof)
+    AM_activateNewScale()
+}
+
+# set the window scale to the minimum size
+function AM_maxOutWindowScale() -> void {
+    am_scale_mtof = am_max_scale_mtof
+    am_scale_ftom = FixedDiv(AM_FRACUNIT, am_scale_mtof)
+    AM_activateNewScale()
+}
+
+# ---- event handling ---------------------------------------------------
+
+@flow_api
+function AM_Responder(ev: ptr<i32>) -> i32 {
+    # event_t layout (d_event.h): type, data1, data2, data3, data4 (5 x i32)
+    let mut rc: i32 = 0
+
+    if automapactive == 0 {
+        if ev[0] == AM_EV_KEYDOWN and ev[1] == KEY_map_toggle() {
+            AM_Start()
+            STAT_set_viewactive(0)
+            rc = 1
+        }
+    } else {
+        if ev[0] == AM_EV_KEYDOWN {
+            rc = 1
+            let key: i32 = ev[1]
+
+            if key == KEY_map_east() {          # pan right
+                if am_followplayer == 0 {
+                    am_paninc_x = am_ftom(AM_F_PANINC)
+                } else {
+                    rc = 0
+                }
+            } else {
+            if key == KEY_map_west() {          # pan left
+                if am_followplayer == 0 {
+                    am_paninc_x = 0 - am_ftom(AM_F_PANINC)
+                } else {
+                    rc = 0
+                }
+            } else {
+            if key == KEY_map_north() {         # pan up
+                if am_followplayer == 0 {
+                    am_paninc_y = am_ftom(AM_F_PANINC)
+                } else {
+                    rc = 0
+                }
+            } else {
+            if key == KEY_map_south() {         # pan down
+                if am_followplayer == 0 {
+                    am_paninc_y = 0 - am_ftom(AM_F_PANINC)
+                } else {
+                    rc = 0
+                }
+            } else {
+            if key == KEY_map_zoomout() {       # zoom out
+                am_mtof_zoommul = AM_M_ZOOMOUT
+                am_ftom_zoommul = AM_M_ZOOMIN
+            } else {
+            if key == KEY_map_zoomin() {        # zoom in
+                am_mtof_zoommul = AM_M_ZOOMIN
+                am_ftom_zoommul = AM_M_ZOOMOUT
+            } else {
+            if key == KEY_map_toggle() {
+                am_bigstate = 0
+                STAT_set_viewactive(1)
+                AM_Stop()
+            } else {
+            if key == KEY_map_maxzoom() {
+                if am_bigstate == 0 {
+                    am_bigstate = 1
+                } else {
+                    am_bigstate = 0
+                }
+                if am_bigstate != 0 {
+                    AM_saveScaleAndLoc()
+                    AM_minOutWindowScale()
+                } else {
+                    AM_restoreScaleAndLoc()
+                }
+            } else {
+            if key == KEY_map_follow() {
+                if am_followplayer == 0 {
+                    am_followplayer = 1
+                } else {
+                    am_followplayer = 0
+                }
+                am_f_oldloc_x = AM_INT_MAX
+                if am_followplayer != 0 {
+                    PLAYER_set_message(am_plr, "Follow Mode ON")   # AMSTR_FOLLOWON
+                } else {
+                    PLAYER_set_message(am_plr, "Follow Mode OFF")  # AMSTR_FOLLOWOFF
+                }
+            } else {
+            if key == KEY_map_grid() {
+                if am_grid == 0 {
+                    am_grid = 1
+                } else {
+                    am_grid = 0
+                }
+                if am_grid != 0 {
+                    PLAYER_set_message(am_plr, "Grid ON")   # AMSTR_GRIDON
+                } else {
+                    PLAYER_set_message(am_plr, "Grid OFF")  # AMSTR_GRIDOFF
+                }
+            } else {
+            if key == KEY_map_mark() {
+                # "%s %d", AMSTR_MARKEDSPOT, markpointnum (static buffer in shim)
+                PLAYER_set_message(am_plr, am_marked_spot_message(am_markpointnum))
+                AM_addMark()
+            } else {
+            if key == KEY_map_clearmark() {
+                AM_clearMarks()
+                PLAYER_set_message(am_plr, "All Marks Cleared")  # AMSTR_MARKSCLEARED
+            } else {
+                rc = 0
+            }}}}}}}}}}}}
+
+            if STAT_deathmatch() == 0 and cht_CheckCheat(&am_cheat_amap[0] as ptr<u8>, ev[2] as u8) != 0 {
+                rc = 0
+                am_cheating = (am_cheating + 1) % 3
+            }
+        } else {
+            if ev[0] == AM_EV_KEYUP {
+                rc = 0
+                let key: i32 = ev[1]
+
+                if key == KEY_map_east() {
+                    if am_followplayer == 0 {
+                        am_paninc_x = 0
+                    }
+                } else {
+                if key == KEY_map_west() {
+                    if am_followplayer == 0 {
+                        am_paninc_x = 0
+                    }
+                } else {
+                if key == KEY_map_north() {
+                    if am_followplayer == 0 {
+                        am_paninc_y = 0
+                    }
+                } else {
+                if key == KEY_map_south() {
+                    if am_followplayer == 0 {
+                        am_paninc_y = 0
+                    }
+                } else {
+                if key == KEY_map_zoomout() or key == KEY_map_zoomin() {
+                    am_mtof_zoommul = AM_FRACUNIT
+                    am_ftom_zoommul = AM_FRACUNIT
+                }}}}}
+            }
+        }
+    }
+
+    return rc
+}
+
+# ---- zooming ----------------------------------------------------------
+
+function AM_changeWindowScale() -> void {
+    # Change the scaling multipliers
+    am_scale_mtof = FixedMul(am_scale_mtof, am_mtof_zoommul)
+    am_scale_ftom = FixedDiv(AM_FRACUNIT, am_scale_mtof)
+
+    if am_scale_mtof < am_min_scale_mtof {
+        AM_minOutWindowScale()
+    } else {
+        if am_scale_mtof > am_max_scale_mtof {
+            AM_maxOutWindowScale()
+        } else {
+            AM_activateNewScale()
+        }
+    }
+}
+
+function AM_doFollowPlayer() -> void {
+    let px: i32 = MOBJ_x(PLAYER_mo(am_plr))
+    let py: i32 = MOBJ_y(PLAYER_mo(am_plr))
+
+    if am_f_oldloc_x != px or am_f_oldloc_y != py {
+        am_m_x = am_ftom(am_mtof(px)) - am_m_w / 2
+        am_m_y = am_ftom(am_mtof(py)) - am_m_h / 2
+        am_m_x2 = am_m_x + am_m_w
+        am_m_y2 = am_m_y + am_m_h
+        am_f_oldloc_x = px
+        am_f_oldloc_y = py
+    }
+}
+
+# ---- per-tic update ---------------------------------------------------
+
+@flow_api
+function AM_Ticker() -> void {
+    if automapactive == 0 {
+        return
+    }
+
+    am_amclock = am_amclock + 1
+
+    if am_followplayer != 0 {
+        AM_doFollowPlayer()
+    }
+
+    # Change the zoom if necessary
+    if am_ftom_zoommul != AM_FRACUNIT {
+        AM_changeWindowScale()
+    }
+
+    # Change x,y location
+    if am_paninc_x != 0 or am_paninc_y != 0 {
+        AM_changeWindowLoc()
+    }
+}
+
+# ---- drawing ----------------------------------------------------------
+
+# Clear automap frame buffer.
+function AM_clearFB(color: i32) -> void {
+    memset(am_fb as ptr<void>, color, (am_f_w * am_f_h) as i64)
+}
+
+# The DOOUTCODE macro from AM_clipMline.
+function am_outcode(mx: i32, my: i32) -> i32 {
+    let mut oc: i32 = 0
+    if my < 0 {
+        oc = oc | AM_OC_TOP
+    } else {
+        if my >= am_f_h {
+            oc = oc | AM_OC_BOTTOM
+        }
+    }
+    if mx < 0 {
+        oc = oc | AM_OC_LEFT
+    } else {
+        if mx >= am_f_w {
+            oc = oc | AM_OC_RIGHT
+        }
+    }
+    return oc
+}
+
+# Automap clipping of lines. Based on Cohen-Sutherland clipping algorithm
+# but with a slightly faster reject and precalculated slopes.
+# Output fline goes to am_fl_ax..am_fl_by; returns true if visible.
+function AM_clipMline(ml_ax: i32, ml_ay: i32, ml_bx: i32, ml_by: i32) -> bool {
+    let mut outcode1: i32 = 0
+    let mut outcode2: i32 = 0
+
+    # do trivial rejects and outcodes
+    if ml_ay > am_m_y2 {
+        outcode1 = AM_OC_TOP
+    } else {
+        if ml_ay < am_m_y {
+            outcode1 = AM_OC_BOTTOM
+        }
+    }
+
+    if ml_by > am_m_y2 {
+        outcode2 = AM_OC_TOP
+    } else {
+        if ml_by < am_m_y {
+            outcode2 = AM_OC_BOTTOM
+        }
+    }
+
+    if (outcode1 & outcode2) != 0 {
+        return false   # trivially outside
+    }
+
+    if ml_ax < am_m_x {
+        outcode1 = outcode1 | AM_OC_LEFT
+    } else {
+        if ml_ax > am_m_x2 {
+            outcode1 = outcode1 | AM_OC_RIGHT
+        }
+    }
+
+    if ml_bx < am_m_x {
+        outcode2 = outcode2 | AM_OC_LEFT
+    } else {
+        if ml_bx > am_m_x2 {
+            outcode2 = outcode2 | AM_OC_RIGHT
+        }
+    }
+
+    if (outcode1 & outcode2) != 0 {
+        return false   # trivially outside
+    }
+
+    # transform to frame-buffer coordinates.
+    am_fl_ax = am_cxmtof(ml_ax)
+    am_fl_ay = am_cymtof(ml_ay)
+    am_fl_bx = am_cxmtof(ml_bx)
+    am_fl_by = am_cymtof(ml_by)
+
+    outcode1 = am_outcode(am_fl_ax, am_fl_ay)
+    outcode2 = am_outcode(am_fl_bx, am_fl_by)
+
+    if (outcode1 & outcode2) != 0 {
+        return false
+    }
+
+    while (outcode1 | outcode2) != 0 {
+        # may be partially inside box; find an outside point
+        let mut outside: i32 = 0
+        if outcode1 != 0 {
+            outside = outcode1
+        } else {
+            outside = outcode2
+        }
+
+        let mut tmp_x: i32 = 0
+        let mut tmp_y: i32 = 0
+        let mut dx: i32 = 0
+        let mut dy: i32 = 0
+
+        # clip to each side
+        if (outside & AM_OC_TOP) != 0 {
+            dy = am_fl_ay - am_fl_by
+            dx = am_fl_bx - am_fl_ax
+            tmp_x = am_fl_ax + (dx * am_fl_ay) / dy
+            tmp_y = 0
+        } else {
+        if (outside & AM_OC_BOTTOM) != 0 {
+            dy = am_fl_ay - am_fl_by
+            dx = am_fl_bx - am_fl_ax
+            tmp_x = am_fl_ax + (dx * (am_fl_ay - am_f_h)) / dy
+            tmp_y = am_f_h - 1
+        } else {
+        if (outside & AM_OC_RIGHT) != 0 {
+            dy = am_fl_by - am_fl_ay
+            dx = am_fl_bx - am_fl_ax
+            tmp_y = am_fl_ay + (dy * (am_f_w - 1 - am_fl_ax)) / dx
+            tmp_x = am_f_w - 1
+        } else {
+        if (outside & AM_OC_LEFT) != 0 {
+            dy = am_fl_by - am_fl_ay
+            dx = am_fl_bx - am_fl_ax
+            tmp_y = am_fl_ay + (dy * (0 - am_fl_ax)) / dx
+            tmp_x = 0
+        } else {
+            tmp_x = 0
+            tmp_y = 0
+        }}}}
+
+        if outside == outcode1 {
+            am_fl_ax = tmp_x
+            am_fl_ay = tmp_y
+            outcode1 = am_outcode(am_fl_ax, am_fl_ay)
+        } else {
+            am_fl_bx = tmp_x
+            am_fl_by = tmp_y
+            outcode2 = am_outcode(am_fl_bx, am_fl_by)
+        }
+
+        if (outcode1 & outcode2) != 0 {
+            return false   # trivially outside
+        }
+    }
+
+    return true
+}
+
+# Classic Bresenham. Draws am_fl_* into the frame buffer.
+function AM_drawFline(color: i32) -> void {
+    # For debugging only
+    if am_fl_ax < 0 or am_fl_ax >= am_f_w
+       or am_fl_ay < 0 or am_fl_ay >= am_f_h
+       or am_fl_bx < 0 or am_fl_bx >= am_f_w
+       or am_fl_by < 0 or am_fl_by >= am_f_h {
+        return
+    }
+
+    let dx: i32 = am_fl_bx - am_fl_ax
+    let mut ax: i32 = 2 * dx
+    let mut sx: i32 = 1
+    if dx < 0 {
+        ax = 2 * (0 - dx)
+        sx = -1
+    }
+
+    let dy: i32 = am_fl_by - am_fl_ay
+    let mut ay: i32 = 2 * dy
+    let mut sy: i32 = 1
+    if dy < 0 {
+        ay = 2 * (0 - dy)
+        sy = -1
+    }
+
+    let mut x: i32 = am_fl_ax
+    let mut y: i32 = am_fl_ay
+    let mut d: i32 = 0
+
+    if ax > ay {
+        d = ay - ax / 2
+        while true {
+            am_fb[y * am_f_w + x] = color as u8   # PUTDOT
+            if x == am_fl_bx {
+                return
+            }
+            if d >= 0 {
+                y = y + sy
+                d = d - ax
+            }
+            x = x + sx
+            d = d + ay
+        }
+    } else {
+        d = ax - ay / 2
+        while true {
+            am_fb[y * am_f_w + x] = color as u8   # PUTDOT
+            if y == am_fl_by {
+                return
+            }
+            if d >= 0 {
+                x = x + sx
+                d = d - ay
+            }
+            y = y + sy
+            d = d + ax
+        }
+    }
+}
+
+# Clip lines, draw visible parts of lines.
+function AM_drawMline(ml_ax: i32, ml_ay: i32, ml_bx: i32, ml_by: i32, color: i32) -> void {
+    if AM_clipMline(ml_ax, ml_ay, ml_bx, ml_by) {
+        AM_drawFline(color)   # draws it on frame buffer using fb coords
+    }
+}
+
+# Draws flat (floor/ceiling tile) aligned grid lines.
+function AM_drawGrid(color: i32) -> void {
+    let orgx: i32 = GEOM_bmaporgx()
+    let orgy: i32 = GEOM_bmaporgy()
+
+    # Figure out start of vertical gridlines
+    let mut start: i32 = am_m_x
+    if ((start - orgx) % AM_MAPBLOCKSIZE) != 0 {
+        start = start + (AM_MAPBLOCKSIZE - ((start - orgx) % AM_MAPBLOCKSIZE))
+    }
+    let mut fin: i32 = am_m_x + am_m_w
+
+    # draw vertical gridlines
+    let mut x: i32 = start
+    while x < fin {
+        AM_drawMline(x, am_m_y, x, am_m_y + am_m_h, color)
+        x = x + AM_MAPBLOCKSIZE
+    }
+
+    # Figure out start of horizontal gridlines
+    start = am_m_y
+    if ((start - orgy) % AM_MAPBLOCKSIZE) != 0 {
+        start = start + (AM_MAPBLOCKSIZE - ((start - orgy) % AM_MAPBLOCKSIZE))
+    }
+    fin = am_m_y + am_m_h
+
+    # draw horizontal gridlines
+    let mut y: i32 = start
+    while y < fin {
+        AM_drawMline(am_m_x, y, am_m_x + am_m_w, y, color)
+        y = y + AM_MAPBLOCKSIZE
+    }
+}
+
+# Determines visible lines, draws them.
+# This is LineDef based, not LineSeg based.
+function AM_drawWalls() -> void {
+    let n: i32 = GEOM_numlines()
+    let mut i: i32 = 0
+    while i < n {
+        let ax: i32 = GEOM_line_i_v1x(i)
+        let ay: i32 = GEOM_line_i_v1y(i)
+        let bx: i32 = GEOM_line_i_v2x(i)
+        let by: i32 = GEOM_line_i_v2y(i)
+        let flags: i32 = GEOM_line_i_flags(i)
+        let ld: ptr<void> = GEOM_line(i)
+        let back: ptr<void> = GEOM_line_backsector(ld)
+        let front: ptr<void> = GEOM_line_frontsector(ld)
+
+        if am_cheating != 0 or (flags & AM_ML_MAPPED) != 0 {
+            if (flags & AM_ML_DONTDRAW) != 0 and am_cheating == 0 {
+                # LINE_NEVERSEE: skip
+            } else {
+                if (back as i64) == 0 {
+                    AM_drawMline(ax, ay, bx, by, AM_WALLCOLORS + am_lightlev)
+                } else {
+                    if GEOM_line_i_special(i) == 39 {
+                        # teleporters
+                        AM_drawMline(ax, ay, bx, by, AM_WALLCOLORS + AM_WALLRANGE / 2)
+                    } else {
+                    if (flags & AM_ML_SECRET) != 0 {
+                        # secret door
+                        if am_cheating != 0 {
+                            AM_drawMline(ax, ay, bx, by, AM_SECRETWALLCOLORS + am_lightlev)
+                        } else {
+                            AM_drawMline(ax, ay, bx, by, AM_WALLCOLORS + am_lightlev)
+                        }
+                    } else {
+                    if GEOM_sector_floorheight(back) != GEOM_sector_floorheight(front) {
+                        # floor level change
+                        AM_drawMline(ax, ay, bx, by, AM_FDWALLCOLORS + am_lightlev)
+                    } else {
+                    if GEOM_sector_ceilingheight(back) != GEOM_sector_ceilingheight(front) {
+                        # ceiling level change
+                        AM_drawMline(ax, ay, bx, by, AM_CDWALLCOLORS + am_lightlev)
+                    } else {
+                    if am_cheating != 0 {
+                        AM_drawMline(ax, ay, bx, by, AM_TSWALLCOLORS + am_lightlev)
+                    }}}}}
+                }
+            }
+        } else {
+            if PLAYER_power(am_plr, AM_PW_ALLMAP) != 0 {
+                if (flags & AM_ML_DONTDRAW) == 0 {
+                    AM_drawMline(ax, ay, bx, by, AM_GRAYS + 3)
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+# Rotation in 2D. Used to rotate player arrow line character.
+# Results in am_rot_x / am_rot_y.
+function AM_rotate(x: i32, y: i32, a: u32) -> void {
+    let idx: i32 = (a >> 19) as i32   # a >> ANGLETOFINESHIFT
+    let fs: i32 = TABLES_finesine(idx)
+    let fc: i32 = TABLES_finecosine(idx)
+    am_rot_x = FixedMul(x, fc) - FixedMul(y, fs)
+    am_rot_y = FixedMul(x, fs) + FixedMul(y, fc)
+}
+
+# Reads one coordinate of the arrow tables:
+# which 0 = player_arrow, 1 = cheat_player_arrow, 2 = thintriangle_guy.
+function am_lineguy_val(which: i32, idx: i32) -> i32 {
+    if which == 0 {
+        return am_player_arrow[idx]
+    }
+    if which == 1 {
+        return am_cheat_player_arrow[idx]
+    }
+    return am_thintriangle_guy[idx]
+}
+
+function AM_drawLineCharacter(which: i32, lineguylines: i32, scale: i32,
+                              angle: u32, color: i32, x: i32, y: i32) -> void {
+    let mut i: i32 = 0
+    while i < lineguylines {
+        let mut lax: i32 = am_lineguy_val(which, i * 4)
+        let mut lay: i32 = am_lineguy_val(which, i * 4 + 1)
+
+        if scale != 0 {
+            lax = FixedMul(scale, lax)
+            lay = FixedMul(scale, lay)
+        }
+
+        if (angle as i64) != 0 {
+            AM_rotate(lax, lay, angle)
+            lax = am_rot_x
+            lay = am_rot_y
+        }
+
+        lax = lax + x
+        lay = lay + y
+
+        let mut lbx: i32 = am_lineguy_val(which, i * 4 + 2)
+        let mut lby: i32 = am_lineguy_val(which, i * 4 + 3)
+
+        if scale != 0 {
+            lbx = FixedMul(scale, lbx)
+            lby = FixedMul(scale, lby)
+        }
+
+        if (angle as i64) != 0 {
+            AM_rotate(lbx, lby, angle)
+            lbx = am_rot_x
+            lby = am_rot_y
+        }
+
+        lbx = lbx + x
+        lby = lby + y
+
+        AM_drawMline(lax, lay, lbx, lby, color)
+        i = i + 1
+    }
+}
+
+function AM_drawPlayers() -> void {
+    if STAT_netgame() == 0 {
+        if am_cheating != 0 {
+            AM_drawLineCharacter(1, 16, 0, MOBJ_angle(PLAYER_mo(am_plr)),
+                                 AM_WHITE, MOBJ_x(PLAYER_mo(am_plr)),
+                                 MOBJ_y(PLAYER_mo(am_plr)))
+        } else {
+            AM_drawLineCharacter(0, 7, 0, MOBJ_angle(PLAYER_mo(am_plr)),
+                                 AM_WHITE, MOBJ_x(PLAYER_mo(am_plr)),
+                                 MOBJ_y(PLAYER_mo(am_plr)))
+        }
+        return
+    }
+
+    let mut their_color: i32 = -1
+    let mut i: i32 = 0
+    while i < AM_MAXPLAYERS {
+        their_color = their_color + 1
+        let p: ptr<void> = PLAYER_at(i)
+
+        let mut skip: i32 = 0
+        if STAT_deathmatch() != 0 and STAT_singledemo() == 0 and (p as i64) != (am_plr as i64) {
+            skip = 1
+        }
+        if STAT_playeringame(i) == 0 {
+            skip = 1
+        }
+
+        if skip == 0 {
+            let mut color: i32 = 0
+            if PLAYER_power(p, AM_PW_INVISIBILITY) != 0 {
+                color = 246   # *close* to black
+            } else {
+                color = am_their_colors[their_color]
+            }
+
+            AM_drawLineCharacter(0, 7, 0, MOBJ_angle(PLAYER_mo(p)), color,
+                                 MOBJ_x(PLAYER_mo(p)), MOBJ_y(PLAYER_mo(p)))
+        }
+        i = i + 1
+    }
+}
+
+function AM_drawThings(colors: i32, colorrange: i32) -> void {
+    let n: i32 = GEOM_numsectors()
+    let mut i: i32 = 0
+    while i < n {
+        let mut t: ptr<void> = GEOM_sector_thinglist(GEOM_sector(i))
+        while (t as i64) != 0 {
+            # 16<<FRACBITS scale, thintriangle_guy
+            AM_drawLineCharacter(2, 3, 1048576, MOBJ_angle(t),
+                                 colors + am_lightlev,
+                                 MOBJ_x(t), MOBJ_y(t))
+            t = MOBJ_snext(t)
+        }
+        i = i + 1
+    }
+}
+
+function AM_drawMarks() -> void {
+    am_ensure_buffers()
+    let mut i: i32 = 0
+    while i < AM_NUMMARKPOINTS {
+        if am_markpoints_x[i] != -1 {
+            # w = 5, h = 6: "because something's wrong with the wad, i guess"
+            let w: i32 = 5
+            let h: i32 = 6
+            let fx: i32 = am_cxmtof(am_markpoints_x[i])
+            let fy: i32 = am_cymtof(am_markpoints_y[i])
+            if fx >= am_f_x and fx <= am_f_w - w and fy >= am_f_y and fy <= am_f_h - h {
+                V_DrawPatch(fx, fy, am_marknums[i] as ptr<void>)
+            }
+        }
+        i = i + 1
+    }
+}
+
+function AM_drawCrosshair(color: i32) -> void {
+    am_fb[(am_f_w * (am_f_h + 1)) / 2] = color as u8   # single point for now
+}
+
+@flow_api
+function AM_Drawer() -> void {
+    if automapactive == 0 {
+        return
+    }
+
+    # Fetch the buffer fresh every frame: V_UseBuffer/V_RestoreBuffer can
+    # swap I_VideoBuffer between frames.
+    am_fb = VIDEO_buffer()
+
+    AM_clearFB(AM_BACKGROUND)
+    if am_grid != 0 {
+        AM_drawGrid(AM_GRIDCOLORS)
+    }
+    AM_drawWalls()
+    AM_drawPlayers()
+    if am_cheating == 2 {
+        AM_drawThings(AM_THINGCOLORS, AM_THINGRANGE)
+    }
+    AM_drawCrosshair(AM_XHAIRCOLORS)
+
+    AM_drawMarks()
+
+    V_MarkRect(am_f_x, am_f_y, am_f_w, am_f_h)
+}

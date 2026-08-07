@@ -1,0 +1,1245 @@
+# Game-owned doomstat / g_game storage + gameshim_* accessors (was game_shim.c).
+#
+# Flow `let mut` is TU-private; expose via @flow_api.
+# dmain flags / savegamedir live in dmain.flow; mapthing starts in setup.flow.
+
+extern { function memset(dst: ptr<void>, c: i32, n: i64) -> ptr<void> }
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+extern { function strlen(s: string) -> i64 }
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function Z_Free(p: ptr<void>) -> void }
+extern { function M_StringCopy(dest: ptr<u8>, src: ptr<u8>, dest_size: i64) -> i32 }
+extern { function M_WriteFile(name: ptr<u8>, source: ptr<void>, length: i32) -> i32 }
+extern { function M_TempFile(s: ptr<u8>) -> ptr<u8> }
+extern { function M_CheckParmWithArgs(check: string, num_args: i32) -> i32 }
+extern { function fopen(path: string, mode: string) -> ptr<void> }
+extern { function fclose(f: ptr<void>) -> i32 }
+extern { function ftell(f: ptr<void>) -> i64 }
+# Avoid libc remove/rename name clash in the generated C TU.
+extern { function sysshim_remove(path: string) -> i32 }
+extern { function sysshim_rename(old_path: string, new_path: string) -> i32 }
+extern { function printf(fmt: string, a: i32, b: i32, s: string) -> i32 }
+extern { function snprintf(buf: string, n: i64, fmt: string, s: string) -> i32 }
+extern { function snprintf(buf: string, n: i64, fmt: string, a: i32) -> i32 }
+extern { function snprintf(buf: string, n: i64, fmt: string, a: i32, b: i32) -> i32 }
+extern { function snprintf(buf: string, n: i64, fmt: string, a: string, b: string) -> i32 }
+extern { function snprintf(buf: string, n: i64, fmt: string, a: i32, b: i32, c: f32) -> i32 }
+extern { function I_Error(msg: string) -> void }
+extern { function ctrlshim_var(id: i32) -> ptr<i32> }
+extern { function rndindex_addr() -> ptr<i32> }
+extern { function argvflow_argc() -> i32 }
+extern { function argvflow_argv() -> ptr<i64> }
+extern { function info_states_addr() -> ptr<void> }
+extern { function info_mobjinfo_addr() -> ptr<void> }
+extern { function hushim_player_name(i: i32) -> ptr<u8> }
+extern { function savegshim_save_stream() -> ptr<void> }
+extern { function savegshim_set_save_stream(p: ptr<void>) -> void }
+extern { function savegshim_set_savegame_error(v: i32) -> void }
+extern { function PLAYER_set_message(p: ptr<void>, msg: string) -> void }
+extern { function netshim_netcmds() -> ptr<void> }
+
+let mut demo_version_buf: array<u8, 16> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+function gameshim_demo_version_description(version: i32) -> string {
+    if version == 104 { return "v1.4" }
+    if version == 105 { return "v1.5" }
+    if version == 106 { return "v1.6/v1.666" }
+    if version == 107 { return "v1.7/v1.7a" }
+    if version == 108 { return "v1.8" }
+    if version == 109 { return "v1.9" }
+    if version >= 0 and version <= 4 {
+        return "v1.0/v1.1/v1.2"
+    }
+    snprintf((&demo_version_buf[0]) as string, 16, "%i.%i (unknown)",
+             version / 100, version % 100)
+    return (&demo_version_buf[0]) as string
+}
+
+@flow_api
+function gameshim_print_demo_version_mismatch(demoversion: i32, want: i32) -> void {
+    printf("Demo is from a different game version!\n(read %i, should be %i)\n\n*** You may need to upgrade your version of Doom to v1.9. ***\n    See: https://www.doomworld.com/classicdoom/info/patches.php\n    This appears to be %s.",
+           demoversion, want, gameshim_demo_version_description(demoversion))
+}
+
+const GAME_PLAYER_SIZEOF: i32 = 328
+const GAME_WBSTART_SIZEOF: i32 = 200
+const GAME_WBPLAYER_SIZEOF: i32 = 40
+const GAME_TICCMD_SIZEOF: i32 = 16
+const GAME_EVENT_SIZEOF: i32 = 20
+const GAME_WBSTART_OFF_EPSD: i32 = 0
+const GAME_WBSTART_OFF_DIDSECRET: i32 = 4
+const GAME_WBSTART_OFF_LAST: i32 = 8
+const GAME_WBSTART_OFF_NEXT: i32 = 12
+const GAME_WBSTART_OFF_MAXKILLS: i32 = 16
+const GAME_WBSTART_OFF_MAXITEMS: i32 = 20
+const GAME_WBSTART_OFF_MAXSECRET: i32 = 24
+const GAME_WBSTART_OFF_MAXFRAGS: i32 = 28
+const GAME_WBSTART_OFF_PARTIME: i32 = 32
+const GAME_WBSTART_OFF_PNUM: i32 = 36
+const GAME_WBSTART_OFF_PLYR: i32 = 40
+const GAME_WBPLAYER_OFF_IN: i32 = 0
+const GAME_WBPLAYER_OFF_SKILLS: i32 = 4
+const GAME_WBPLAYER_OFF_SITEMS: i32 = 8
+const GAME_WBPLAYER_OFF_SSECRET: i32 = 12
+const GAME_WBPLAYER_OFF_STIME: i32 = 16
+const GAME_WBPLAYER_OFF_FRAGS: i32 = 20
+const GAME_TICCMD_OFF_FORWARDMOVE: i32 = 0
+const GAME_TICCMD_OFF_SIDEMOVE: i32 = 1
+const GAME_TICCMD_OFF_ANGLETURN: i32 = 2
+const GAME_TICCMD_OFF_CHATCHAR: i32 = 4
+const GAME_TICCMD_OFF_BUTTONS: i32 = 5
+const GAME_TICCMD_OFF_CONSISTANCY: i32 = 6
+const GAME_EVENT_OFF_TYPE: i32 = 0
+const GAME_EVENT_OFF_DATA1: i32 = 4
+const GAME_EVENT_OFF_DATA2: i32 = 8
+const GAME_EVENT_OFF_DATA3: i32 = 12
+const GAME_EVENT_OFF_DATA4: i32 = 16
+const GAME_PLAYER_OFF_CMD: i32 = 12
+const GAME_PLAYER_OFF_FRAGS: i32 = 108
+const GAME_PLAYER_OFF_MESSAGE: i32 = 232
+const GAME_GM_INDETERMINED: i32 = 4
+
+let mut game_oldgamestate: i32 = 0
+let mut game_gameaction: i32 = 0
+let mut game_gamestate: i32 = 0
+let mut game_gameskill: i32 = 0
+let mut game_respawnmonsters: i32 = 0
+let mut game_gameepisode: i32 = 0
+let mut game_gamemap: i32 = 0
+let mut game_timelimit: i32 = 0
+let mut game_paused: i32 = 0
+let mut game_sendpause: i32 = 0
+let mut game_sendsave: i32 = 0
+let mut game_usergame: i32 = 0
+let mut game_timingdemo: i32 = 0
+let mut game_nodrawers: i32 = 0
+let mut game_starttime: i32 = 0
+let mut game_viewactive: i32 = 0
+let mut game_deathmatch: i32 = 0
+let mut game_netgame: i32 = 0
+let mut game_consoleplayer: i32 = 0
+let mut game_displayplayer: i32 = 0
+let mut game_levelstarttic: i32 = 0
+let mut game_demorecording: i32 = 0
+let mut game_longtics: i32 = 0
+let mut game_lowres_turn: i32 = 0
+let mut game_demoplayback: i32 = 0
+let mut game_netdemo: i32 = 0
+let mut game_singledemo: i32 = 0
+let mut game_testcontrols: i32 = 0
+let mut game_testcontrols_mousespeed: i32 = 0
+let mut game_mousex: i32 = 0
+let mut game_mousey: i32 = 0
+let mut game_bodyqueslot: i32 = 0
+let mut game_secretexit: i32 = 0
+let mut game_d_skill: i32 = 0
+let mut game_d_episode: i32 = 0
+let mut game_d_map: i32 = 0
+let mut game_savegameslot: i32 = 0
+let mut game_next_weapon: i32 = 0
+let mut game_turnheld: i32 = 0
+let mut game_joyxmove: i32 = 0
+let mut game_joyymove: i32 = 0
+let mut game_joystrafemove: i32 = 0
+let mut game_dclicktime: i32 = 0
+let mut game_dclickstate: i32 = 0
+let mut game_dclicks: i32 = 0
+let mut game_dclicktime2: i32 = 0
+let mut game_dclickstate2: i32 = 0
+let mut game_dclicks2: i32 = 0
+let mut game_lowres_carry: i32 = 0
+let mut game_gamemode: i32 = 4
+let mut game_gamemission: i32 = 0
+let mut game_gameversion: i32 = 8
+let mut game_modifiedgame: i32 = 0
+let mut game_setsizeneeded: i32 = 0
+let mut game_gamedescription: string = null as string
+let mut game_defdemoname: string = null as string
+let mut game_demobuffer: ptr<void> = null
+let mut game_demo_p: ptr<void> = null
+let mut game_demoend: ptr<void> = null
+let mut game_playeringame: array<i32, 4> = [
+    0, 0, 0, 0
+]
+let mut game_turbodetected: array<i32, 4> = [
+    0, 0, 0, 0
+]
+let mut game_angleturn: array<i32, 3> = [
+    640, 1280, 320
+]
+let mut game_bodyque: array<i64, 32> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+let mut game_gamekeydown: array<i32, 256> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+let mut game_mousearray: array<i32, 9> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+let mut game_joyarray: array<i32, 21> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0
+]
+let mut game_consistancy: array<u8, 512> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+let mut game_players: array<u8, 1312> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+let mut game_wminfo: array<u8, 200> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0
+]
+let mut game_savename: array<u8, 256> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+let mut game_savedescription: array<u8, 32> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+let mut game_pars: array<i32, 40> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 30, 75, 120, 90, 165, 180, 180, 30, 165, 0, 90, 90, 90, 120, 90, 360, 240, 30, 170, 0, 90, 45, 90, 150, 90, 90, 165, 30, 135
+]
+let mut game_cpars: array<i32, 32> = [
+    30, 90, 120, 120, 90, 150, 120, 120, 270, 90, 210, 150, 150, 150, 210, 150, 420, 150, 210, 150, 240, 150, 180, 150, 150, 300, 330, 420, 300, 180, 120, 30
+]
+let mut game_weapon_order: array<i32, 18> = [
+    0, 0, 7, 0, 1, 1, 2, 2, 8, 2, 3, 3, 4, 4, 5, 5, 6, 6
+]
+
+# Formerly game_data.c DEFINEs
+let mut game_forwardmove: array<i32, 2> = [25, 50]
+let mut game_sidemove: array<i32, 2> = [24, 40]
+let mut game_vanilla_savegame_limit: i32 = 1
+let mut game_vanilla_demo_limit: i32 = 1
+let mut game_totalkills: i32 = 0
+let mut game_totalitems: i32 = 0
+let mut game_totalsecret: i32 = 0
+let mut game_precache: i32 = 1
+let mut game_demoname: string = null as string
+let mut game_turbomessage: array<u8, 80> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+let mut game_errbuf: array<u8, 256> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+@flow_api
+function gameshim_error_timedemo(gametics: i32, realtics: i32) -> void {
+    let fps: f32 = ((gametics as f32) * 35.0) / (realtics as f32)
+    snprintf((&game_errbuf[0]) as string, 256,
+             "timed %i gametics in %i realtics (%f fps)",
+             gametics, realtics, fps)
+    I_Error((&game_errbuf[0]) as string)
+}
+
+const GAME_C_MOUSEBFIRE: i32 = 10
+const GAME_C_MOUSEBSTRAFE: i32 = 11
+const GAME_C_MOUSEBFORWARD: i32 = 12
+const GAME_C_JOYBFIRE: i32 = 13
+const GAME_C_JOYBSTRAFE: i32 = 14
+const GAME_C_JOYBUSE: i32 = 15
+const GAME_C_JOYBSPEED: i32 = 16
+const GAME_C_JOYBSTRAFELEFT: i32 = 18
+const GAME_C_JOYBSTRAFERIGHT: i32 = 19
+const GAME_C_MOUSEBSTRAFELEFT: i32 = 20
+const GAME_C_MOUSEBSTRAFERIGHT: i32 = 21
+const GAME_C_MOUSEBUSE: i32 = 22
+const GAME_C_MOUSEBBACKWARD: i32 = 23
+const GAME_C_DCLICK_USE: i32 = 24
+const GAME_C_JOYBPREVWEAPON: i32 = 66
+const GAME_C_JOYBNEXTWEAPON: i32 = 67
+const GAME_C_MOUSEBPREVWEAPON: i32 = 68
+const GAME_C_MOUSEBNEXTWEAPON: i32 = 69
+const GAME_S_SARG_RUN1: i32 = 477
+const GAME_S_SARG_PAIN2: i32 = 489
+const GAME_MT_BRUISERSHOT: i32 = 16
+const GAME_MT_HEADSHOT: i32 = 32
+const GAME_MT_TROOPSHOT: i32 = 31
+const GAME_SARG_FRACUNIT: i32 = 65536
+const GAME_INFO_STATE_SIZE: i32 = 40
+const GAME_INFO_STATE_OFF_TICS: i32 = 8
+const GAME_INFO_MOBJINFO_SIZE: i32 = 92
+const GAME_INFO_MOBJINFO_OFF_SPEED: i32 = 60
+
+function game_blob_i32(base: ptr<u8>, off: i32) -> i32 {
+    let p: ptr<i32> = ((base as i64) + (off as i64)) as ptr<i32>
+    return p[0]
+}
+function game_blob_set_i32(base: ptr<u8>, off: i32, v: i32) -> void {
+    let p: ptr<i32> = ((base as i64) + (off as i64)) as ptr<i32>
+    p[0] = v
+}
+function game_blob_i8(base: ptr<u8>, off: i32) -> i32 {
+    return (base[off] as i32)
+}
+function game_blob_set_i8(base: ptr<u8>, off: i32, v: i32) -> void {
+    base[off] = (v as u8)
+}
+function game_blob_i16(base: ptr<u8>, off: i32) -> i32 {
+    let p: ptr<i16> = ((base as i64) + (off as i64)) as ptr<i16>
+    return p[0] as i32
+}
+function game_blob_set_i16(base: ptr<u8>, off: i32, v: i32) -> void {
+    let p: ptr<i16> = ((base as i64) + (off as i64)) as ptr<i16>
+    p[0] = v as i16
+}
+function game_wminfo_plyr(i: i32) -> ptr<u8> {
+    return (((&game_wminfo[0]) as i64) + (GAME_WBSTART_OFF_PLYR as i64) + ((i * GAME_WBPLAYER_SIZEOF) as i64)) as ptr<u8>
+}
+
+@flow_api
+function gameshim_oldgamestate() -> i32 { return game_oldgamestate }
+@flow_api
+function gameshim_set_oldgamestate(v: i32) -> void { game_oldgamestate = v }
+@flow_api
+function gameshim_gameaction() -> i32 { return game_gameaction }
+@flow_api
+function gameshim_set_gameaction(v: i32) -> void { game_gameaction = v }
+@flow_api
+function gameshim_gamestate() -> i32 { return game_gamestate }
+@flow_api
+function gameshim_set_gamestate(v: i32) -> void { game_gamestate = v }
+@flow_api
+function gameshim_gameskill() -> i32 { return game_gameskill }
+@flow_api
+function gameshim_set_gameskill(v: i32) -> void { game_gameskill = v }
+@flow_api
+function gameshim_respawnmonsters() -> i32 { return game_respawnmonsters }
+@flow_api
+function gameshim_set_respawnmonsters(v: i32) -> void { game_respawnmonsters = v }
+@flow_api
+function gameshim_gameepisode() -> i32 { return game_gameepisode }
+@flow_api
+function gameshim_set_gameepisode(v: i32) -> void { game_gameepisode = v }
+@flow_api
+function gameshim_gamemap() -> i32 { return game_gamemap }
+@flow_api
+function gameshim_set_gamemap(v: i32) -> void { game_gamemap = v }
+@flow_api
+function gameshim_timelimit() -> i32 { return game_timelimit }
+@flow_api
+function gameshim_set_timelimit(v: i32) -> void { game_timelimit = v }
+@flow_api
+function gameshim_paused() -> i32 { return game_paused }
+@flow_api
+function gameshim_set_paused(v: i32) -> void { game_paused = v }
+@flow_api
+function gameshim_sendpause() -> i32 { return game_sendpause }
+@flow_api
+function gameshim_set_sendpause(v: i32) -> void { game_sendpause = v }
+@flow_api
+function gameshim_sendsave() -> i32 { return game_sendsave }
+@flow_api
+function gameshim_set_sendsave(v: i32) -> void { game_sendsave = v }
+@flow_api
+function gameshim_usergame() -> i32 { return game_usergame }
+@flow_api
+function gameshim_set_usergame(v: i32) -> void { game_usergame = v }
+@flow_api
+function gameshim_timingdemo() -> i32 { return game_timingdemo }
+@flow_api
+function gameshim_set_timingdemo(v: i32) -> void { game_timingdemo = v }
+@flow_api
+function gameshim_nodrawers() -> i32 { return game_nodrawers }
+@flow_api
+function gameshim_set_nodrawers(v: i32) -> void { game_nodrawers = v }
+@flow_api
+function gameshim_starttime() -> i32 { return game_starttime }
+@flow_api
+function gameshim_set_starttime(v: i32) -> void { game_starttime = v }
+@flow_api
+function gameshim_viewactive() -> i32 { return game_viewactive }
+@flow_api
+function gameshim_set_viewactive(v: i32) -> void { game_viewactive = v }
+@flow_api
+function gameshim_deathmatch() -> i32 { return game_deathmatch }
+@flow_api
+function gameshim_set_deathmatch(v: i32) -> void { game_deathmatch = v }
+@flow_api
+function gameshim_netgame() -> i32 { return game_netgame }
+@flow_api
+function gameshim_set_netgame(v: i32) -> void { game_netgame = v }
+@flow_api
+function gameshim_consoleplayer() -> i32 { return game_consoleplayer }
+@flow_api
+function gameshim_set_consoleplayer(v: i32) -> void { game_consoleplayer = v }
+@flow_api
+function gameshim_displayplayer() -> i32 { return game_displayplayer }
+@flow_api
+function gameshim_set_displayplayer(v: i32) -> void { game_displayplayer = v }
+@flow_api
+function gameshim_demorecording() -> i32 { return game_demorecording }
+@flow_api
+function gameshim_set_demorecording(v: i32) -> void { game_demorecording = v }
+@flow_api
+function gameshim_longtics() -> i32 { return game_longtics }
+@flow_api
+function gameshim_set_longtics(v: i32) -> void { game_longtics = v }
+@flow_api
+function gameshim_lowres_turn() -> i32 { return game_lowres_turn }
+@flow_api
+function gameshim_set_lowres_turn(v: i32) -> void { game_lowres_turn = v }
+@flow_api
+function gameshim_demoplayback() -> i32 { return game_demoplayback }
+@flow_api
+function gameshim_set_demoplayback(v: i32) -> void { game_demoplayback = v }
+@flow_api
+function gameshim_netdemo() -> i32 { return game_netdemo }
+@flow_api
+function gameshim_set_netdemo(v: i32) -> void { game_netdemo = v }
+@flow_api
+function gameshim_singledemo() -> i32 { return game_singledemo }
+@flow_api
+function gameshim_set_singledemo(v: i32) -> void { game_singledemo = v }
+@flow_api
+function gameshim_testcontrols() -> i32 { return game_testcontrols }
+@flow_api
+function gameshim_set_testcontrols(v: i32) -> void { game_testcontrols = v }
+@flow_api
+function gameshim_testcontrols_mousespeed() -> i32 { return game_testcontrols_mousespeed }
+@flow_api
+function gameshim_set_testcontrols_mousespeed(v: i32) -> void { game_testcontrols_mousespeed = v }
+@flow_api
+function gameshim_mousex() -> i32 { return game_mousex }
+@flow_api
+function gameshim_set_mousex(v: i32) -> void { game_mousex = v }
+@flow_api
+function gameshim_mousey() -> i32 { return game_mousey }
+@flow_api
+function gameshim_set_mousey(v: i32) -> void { game_mousey = v }
+@flow_api
+function gameshim_bodyqueslot() -> i32 { return game_bodyqueslot }
+@flow_api
+function gameshim_set_bodyqueslot(v: i32) -> void { game_bodyqueslot = v }
+@flow_api
+function gameshim_secretexit() -> i32 { return game_secretexit }
+@flow_api
+function gameshim_set_secretexit(v: i32) -> void { game_secretexit = v }
+@flow_api
+function gameshim_d_skill() -> i32 { return game_d_skill }
+@flow_api
+function gameshim_set_d_skill(v: i32) -> void { game_d_skill = v }
+@flow_api
+function gameshim_d_episode() -> i32 { return game_d_episode }
+@flow_api
+function gameshim_set_d_episode(v: i32) -> void { game_d_episode = v }
+@flow_api
+function gameshim_d_map() -> i32 { return game_d_map }
+@flow_api
+function gameshim_set_d_map(v: i32) -> void { game_d_map = v }
+@flow_api
+function gameshim_savegameslot() -> i32 { return game_savegameslot }
+@flow_api
+function gameshim_set_savegameslot(v: i32) -> void { game_savegameslot = v }
+@flow_api
+function gameshim_next_weapon() -> i32 { return game_next_weapon }
+@flow_api
+function gameshim_set_next_weapon(v: i32) -> void { game_next_weapon = v }
+@flow_api
+function gameshim_turnheld() -> i32 { return game_turnheld }
+@flow_api
+function gameshim_set_turnheld(v: i32) -> void { game_turnheld = v }
+@flow_api
+function gameshim_joyxmove() -> i32 { return game_joyxmove }
+@flow_api
+function gameshim_set_joyxmove(v: i32) -> void { game_joyxmove = v }
+@flow_api
+function gameshim_joyymove() -> i32 { return game_joyymove }
+@flow_api
+function gameshim_set_joyymove(v: i32) -> void { game_joyymove = v }
+@flow_api
+function gameshim_joystrafemove() -> i32 { return game_joystrafemove }
+@flow_api
+function gameshim_set_joystrafemove(v: i32) -> void { game_joystrafemove = v }
+@flow_api
+function gameshim_dclicktime() -> i32 { return game_dclicktime }
+@flow_api
+function gameshim_set_dclicktime(v: i32) -> void { game_dclicktime = v }
+@flow_api
+function gameshim_dclickstate() -> i32 { return game_dclickstate }
+@flow_api
+function gameshim_set_dclickstate(v: i32) -> void { game_dclickstate = v }
+@flow_api
+function gameshim_dclicks() -> i32 { return game_dclicks }
+@flow_api
+function gameshim_set_dclicks(v: i32) -> void { game_dclicks = v }
+@flow_api
+function gameshim_dclicktime2() -> i32 { return game_dclicktime2 }
+@flow_api
+function gameshim_set_dclicktime2(v: i32) -> void { game_dclicktime2 = v }
+@flow_api
+function gameshim_dclickstate2() -> i32 { return game_dclickstate2 }
+@flow_api
+function gameshim_set_dclickstate2(v: i32) -> void { game_dclickstate2 = v }
+@flow_api
+function gameshim_dclicks2() -> i32 { return game_dclicks2 }
+@flow_api
+function gameshim_set_dclicks2(v: i32) -> void { game_dclicks2 = v }
+@flow_api
+function gameshim_lowres_carry() -> i32 { return game_lowres_carry }
+@flow_api
+function gameshim_set_lowres_carry(v: i32) -> void { game_lowres_carry = v }
+@flow_api
+function gameshim_gamemode() -> i32 { return game_gamemode }
+@flow_api
+function gameshim_set_gamemode(v: i32) -> void { game_gamemode = v }
+@flow_api
+function gameshim_gamemission() -> i32 { return game_gamemission }
+@flow_api
+function gameshim_set_gamemission(v: i32) -> void { game_gamemission = v }
+@flow_api
+function gameshim_gameversion() -> i32 { return game_gameversion }
+@flow_api
+function gameshim_set_gameversion(v: i32) -> void { game_gameversion = v }
+@flow_api
+function gameshim_modifiedgame() -> i32 { return game_modifiedgame }
+@flow_api
+function gameshim_set_modifiedgame(v: i32) -> void { game_modifiedgame = v }
+@flow_api
+function gameshim_setsizeneeded() -> i32 { return game_setsizeneeded }
+@flow_api
+function gameshim_set_setsizeneeded(v: i32) -> void { game_setsizeneeded = v }
+
+@flow_api
+function gameshim_set_levelstarttic(v: i32) -> void { game_levelstarttic = v }
+
+@flow_api
+function gameshim_playeringame(i: i32) -> i32 { return game_playeringame[i] }
+@flow_api
+function gameshim_set_playeringame(i: i32, v: i32) -> void { game_playeringame[i] = v }
+
+@flow_api
+function gameshim_turbodetected(i: i32) -> i32 { return game_turbodetected[i] }
+@flow_api
+function gameshim_set_turbodetected(i: i32, v: i32) -> void { game_turbodetected[i] = v }
+
+@flow_api
+function gameshim_demobuffer() -> ptr<void> { return game_demobuffer }
+@flow_api
+function gameshim_set_demobuffer(p: ptr<void>) -> void { game_demobuffer = p }
+@flow_api
+function gameshim_demo_p() -> ptr<void> { return game_demo_p }
+@flow_api
+function gameshim_set_demo_p(p: ptr<void>) -> void { game_demo_p = p }
+@flow_api
+function gameshim_demoend() -> ptr<void> { return game_demoend }
+@flow_api
+function gameshim_set_demoend(p: ptr<void>) -> void { game_demoend = p }
+
+@flow_api
+function gameshim_defdemoname() -> string { return game_defdemoname }
+@flow_api
+function gameshim_set_defdemoname(p: string) -> void { game_defdemoname = p }
+
+@flow_api
+function gameshim_gamedescription() -> string { return game_gamedescription }
+@flow_api
+function gameshim_set_gamedescription(v: string) -> void { game_gamedescription = v }
+
+@flow_api
+function gameshim_savename() -> string { return (&game_savename[0]) as string }
+
+@flow_api
+function gameshim_savedescription() -> string { return (&game_savedescription[0]) as string }
+
+@flow_api
+function gameshim_gamemission_addr() -> ptr<i32> { return &game_gamemission }
+
+@flow_api
+function gameshim_angleturn(i: i32) -> i32 { return game_angleturn[i] }
+
+@flow_api
+function gameshim_consistancy(p: i32, t: i32) -> i32 {
+    return game_consistancy[p * 128 + t] as i32
+}
+@flow_api
+function gameshim_set_consistancy(p: i32, t: i32, v: i32) -> void {
+    game_consistancy[p * 128 + t] = v as u8
+}
+
+@flow_api
+function gameshim_pars(ep: i32, map: i32) -> i32 { return game_pars[ep * 10 + map] }
+@flow_api
+function gameshim_cpars(map: i32) -> i32 { return game_cpars[map] }
+
+@flow_api
+function gameshim_gamekeydown(k: i32) -> i32 {
+    if k < 0 or k >= 256 { return 0 }
+    return game_gamekeydown[k]
+}
+@flow_api
+function gameshim_set_gamekeydown(k: i32, v: i32) -> void {
+    if k < 0 or k >= 256 { return }
+    game_gamekeydown[k] = v
+}
+@flow_api
+function gameshim_clear_gamekeydown() -> void {
+    memset(&game_gamekeydown[0] as ptr<void>, 0, (256 * 4) as i64)
+}
+
+@flow_api
+function gameshim_mousebutton(i: i32) -> i32 { return game_mousearray[i + 1] }
+@flow_api
+function gameshim_set_mousebutton(i: i32, v: i32) -> void { game_mousearray[i + 1] = v }
+@flow_api
+function gameshim_clear_mousearray() -> void {
+    memset(&game_mousearray[0] as ptr<void>, 0, (9 * 4) as i64)
+}
+
+@flow_api
+function gameshim_joybutton(i: i32) -> i32 { return game_joyarray[i + 1] }
+@flow_api
+function gameshim_set_joybutton(i: i32, v: i32) -> void { game_joyarray[i + 1] = v }
+@flow_api
+function gameshim_clear_joyarray() -> void {
+    memset(&game_joyarray[0] as ptr<void>, 0, (21 * 4) as i64)
+}
+
+@flow_api
+function gameshim_weapon_order_len() -> i32 { return 9 }
+@flow_api
+function gameshim_weapon_order_weapon(i: i32) -> i32 { return game_weapon_order[i * 2] }
+@flow_api
+function gameshim_weapon_order_num(i: i32) -> i32 { return game_weapon_order[i * 2 + 1] }
+
+@flow_api
+function gameshim_player_at(i: i32) -> ptr<void> {
+    return (((&game_players[0]) as i64) + ((i * GAME_PLAYER_SIZEOF) as i64)) as ptr<void>
+}
+
+@flow_api
+function gameshim_copy_netcmd_to_player(i: i32) -> void {
+    let cmds: ptr<void> = netshim_netcmds()
+    let dst: ptr<void> = (((gameshim_player_at(i) as i64) + (GAME_PLAYER_OFF_CMD as i64)) as ptr<void>)
+    let src: ptr<void> = (((cmds as i64) + ((i * GAME_TICCMD_SIZEOF) as i64)) as ptr<void>)
+    memcpy(dst, src, GAME_TICCMD_SIZEOF as i64)
+}
+
+@flow_api
+function gameshim_wminfo() -> ptr<void> { return &game_wminfo[0] as ptr<void> }
+
+@flow_api
+function gameshim_wminfo_copy_player_frags(i: i32) -> void {
+    let dst: ptr<void> = ((game_wminfo_plyr(i) as i64) + (GAME_WBPLAYER_OFF_FRAGS as i64)) as ptr<void>
+    let src: ptr<void> = (((gameshim_player_at(i) as i64) + (GAME_PLAYER_OFF_FRAGS as i64)) as ptr<void>)
+    memcpy(dst, src, (4 * 4) as i64)
+}
+
+@flow_api
+function gameshim_wminfo_didsecret() -> i32 { return game_blob_i32(&game_wminfo[0], GAME_WBSTART_OFF_DIDSECRET) }
+@flow_api
+function gameshim_wminfo_set_didsecret(v: i32) -> void { game_blob_set_i32(&game_wminfo[0], GAME_WBSTART_OFF_DIDSECRET, v) }
+@flow_api
+function gameshim_wminfo_epsd() -> i32 { return game_blob_i32(&game_wminfo[0], GAME_WBSTART_OFF_EPSD) }
+@flow_api
+function gameshim_wminfo_set_epsd(v: i32) -> void { game_blob_set_i32(&game_wminfo[0], GAME_WBSTART_OFF_EPSD, v) }
+@flow_api
+function gameshim_wminfo_last() -> i32 { return game_blob_i32(&game_wminfo[0], GAME_WBSTART_OFF_LAST) }
+@flow_api
+function gameshim_wminfo_set_last(v: i32) -> void { game_blob_set_i32(&game_wminfo[0], GAME_WBSTART_OFF_LAST, v) }
+@flow_api
+function gameshim_wminfo_next() -> i32 { return game_blob_i32(&game_wminfo[0], GAME_WBSTART_OFF_NEXT) }
+@flow_api
+function gameshim_wminfo_set_next(v: i32) -> void { game_blob_set_i32(&game_wminfo[0], GAME_WBSTART_OFF_NEXT, v) }
+@flow_api
+function gameshim_wminfo_maxkills() -> i32 { return game_blob_i32(&game_wminfo[0], GAME_WBSTART_OFF_MAXKILLS) }
+@flow_api
+function gameshim_wminfo_set_maxkills(v: i32) -> void { game_blob_set_i32(&game_wminfo[0], GAME_WBSTART_OFF_MAXKILLS, v) }
+@flow_api
+function gameshim_wminfo_maxitems() -> i32 { return game_blob_i32(&game_wminfo[0], GAME_WBSTART_OFF_MAXITEMS) }
+@flow_api
+function gameshim_wminfo_set_maxitems(v: i32) -> void { game_blob_set_i32(&game_wminfo[0], GAME_WBSTART_OFF_MAXITEMS, v) }
+@flow_api
+function gameshim_wminfo_maxsecret() -> i32 { return game_blob_i32(&game_wminfo[0], GAME_WBSTART_OFF_MAXSECRET) }
+@flow_api
+function gameshim_wminfo_set_maxsecret(v: i32) -> void { game_blob_set_i32(&game_wminfo[0], GAME_WBSTART_OFF_MAXSECRET, v) }
+@flow_api
+function gameshim_wminfo_maxfrags() -> i32 { return game_blob_i32(&game_wminfo[0], GAME_WBSTART_OFF_MAXFRAGS) }
+@flow_api
+function gameshim_wminfo_set_maxfrags(v: i32) -> void { game_blob_set_i32(&game_wminfo[0], GAME_WBSTART_OFF_MAXFRAGS, v) }
+@flow_api
+function gameshim_wminfo_partime() -> i32 { return game_blob_i32(&game_wminfo[0], GAME_WBSTART_OFF_PARTIME) }
+@flow_api
+function gameshim_wminfo_set_partime(v: i32) -> void { game_blob_set_i32(&game_wminfo[0], GAME_WBSTART_OFF_PARTIME, v) }
+@flow_api
+function gameshim_wminfo_pnum() -> i32 { return game_blob_i32(&game_wminfo[0], GAME_WBSTART_OFF_PNUM) }
+@flow_api
+function gameshim_wminfo_set_pnum(v: i32) -> void { game_blob_set_i32(&game_wminfo[0], GAME_WBSTART_OFF_PNUM, v) }
+
+@flow_api
+function gameshim_wminfo_plyr_in(i: i32) -> i32 { return game_blob_i32(game_wminfo_plyr(i), GAME_WBPLAYER_OFF_IN) }
+@flow_api
+function gameshim_wminfo_set_plyr_in(i: i32, v: i32) -> void { game_blob_set_i32(game_wminfo_plyr(i), GAME_WBPLAYER_OFF_IN, v) }
+@flow_api
+function gameshim_wminfo_plyr_skills(i: i32) -> i32 { return game_blob_i32(game_wminfo_plyr(i), GAME_WBPLAYER_OFF_SKILLS) }
+@flow_api
+function gameshim_wminfo_set_plyr_skills(i: i32, v: i32) -> void { game_blob_set_i32(game_wminfo_plyr(i), GAME_WBPLAYER_OFF_SKILLS, v) }
+@flow_api
+function gameshim_wminfo_plyr_sitems(i: i32) -> i32 { return game_blob_i32(game_wminfo_plyr(i), GAME_WBPLAYER_OFF_SITEMS) }
+@flow_api
+function gameshim_wminfo_set_plyr_sitems(i: i32, v: i32) -> void { game_blob_set_i32(game_wminfo_plyr(i), GAME_WBPLAYER_OFF_SITEMS, v) }
+@flow_api
+function gameshim_wminfo_plyr_ssecret(i: i32) -> i32 { return game_blob_i32(game_wminfo_plyr(i), GAME_WBPLAYER_OFF_SSECRET) }
+@flow_api
+function gameshim_wminfo_set_plyr_ssecret(i: i32, v: i32) -> void { game_blob_set_i32(game_wminfo_plyr(i), GAME_WBPLAYER_OFF_SSECRET, v) }
+@flow_api
+function gameshim_wminfo_plyr_stime(i: i32) -> i32 { return game_blob_i32(game_wminfo_plyr(i), GAME_WBPLAYER_OFF_STIME) }
+@flow_api
+function gameshim_wminfo_set_plyr_stime(i: i32, v: i32) -> void { game_blob_set_i32(game_wminfo_plyr(i), GAME_WBPLAYER_OFF_STIME, v) }
+@flow_api
+function gameshim_wminfo_plyr_frag(i: i32, fi: i32) -> i32 {
+    return game_blob_i32(game_wminfo_plyr(i), GAME_WBPLAYER_OFF_FRAGS + fi * 4)
+}
+
+@flow_api
+function gameshim_cmd_clear(cmd: ptr<void>) -> void { memset(cmd, 0, GAME_TICCMD_SIZEOF as i64) }
+@flow_api
+function gameshim_cmd_forwardmove(cmd: ptr<void>) -> i32 {
+    let p: ptr<i8> = ((cmd as i64) + (GAME_TICCMD_OFF_FORWARDMOVE as i64)) as ptr<i8>
+    return p[0] as i32
+}
+@flow_api
+function gameshim_cmd_set_forwardmove(cmd: ptr<void>, v: i32) -> void {
+    let b: ptr<u8> = cmd as ptr<u8>
+    b[GAME_TICCMD_OFF_FORWARDMOVE] = v as u8
+}
+@flow_api
+function gameshim_cmd_add_forwardmove(cmd: ptr<void>, v: i32) -> void {
+    gameshim_cmd_set_forwardmove(cmd, gameshim_cmd_forwardmove(cmd) + v)
+}
+@flow_api
+function gameshim_cmd_sidemove(cmd: ptr<void>) -> i32 {
+    let p: ptr<i8> = ((cmd as i64) + (GAME_TICCMD_OFF_SIDEMOVE as i64)) as ptr<i8>
+    return p[0] as i32
+}
+@flow_api
+function gameshim_cmd_set_sidemove(cmd: ptr<void>, v: i32) -> void {
+    let b: ptr<u8> = cmd as ptr<u8>
+    b[GAME_TICCMD_OFF_SIDEMOVE] = v as u8
+}
+@flow_api
+function gameshim_cmd_add_sidemove(cmd: ptr<void>, v: i32) -> void {
+    gameshim_cmd_set_sidemove(cmd, gameshim_cmd_sidemove(cmd) + v)
+}
+@flow_api
+function gameshim_cmd_angleturn(cmd: ptr<void>) -> i32 {
+    return game_blob_i16(cmd as ptr<u8>, GAME_TICCMD_OFF_ANGLETURN)
+}
+@flow_api
+function gameshim_cmd_set_angleturn(cmd: ptr<void>, v: i32) -> void {
+    game_blob_set_i16(cmd as ptr<u8>, GAME_TICCMD_OFF_ANGLETURN, v)
+}
+@flow_api
+function gameshim_cmd_add_angleturn(cmd: ptr<void>, v: i32) -> void {
+    gameshim_cmd_set_angleturn(cmd, gameshim_cmd_angleturn(cmd) + v)
+}
+@flow_api
+function gameshim_cmd_buttons(cmd: ptr<void>) -> i32 {
+    let b: ptr<u8> = cmd as ptr<u8>
+    return b[GAME_TICCMD_OFF_BUTTONS] as i32
+}
+@flow_api
+function gameshim_cmd_set_buttons(cmd: ptr<void>, v: i32) -> void {
+    let b: ptr<u8> = cmd as ptr<u8>
+    b[GAME_TICCMD_OFF_BUTTONS] = v as u8
+}
+@flow_api
+function gameshim_cmd_or_buttons(cmd: ptr<void>, v: i32) -> void {
+    gameshim_cmd_set_buttons(cmd, gameshim_cmd_buttons(cmd) | v)
+}
+@flow_api
+function gameshim_cmd_chatchar(cmd: ptr<void>) -> i32 {
+    let b: ptr<u8> = cmd as ptr<u8>
+    return b[GAME_TICCMD_OFF_CHATCHAR] as i32
+}
+@flow_api
+function gameshim_cmd_set_chatchar(cmd: ptr<void>, v: i32) -> void {
+    let b: ptr<u8> = cmd as ptr<u8>
+    b[GAME_TICCMD_OFF_CHATCHAR] = v as u8
+}
+@flow_api
+function gameshim_cmd_set_consistancy(cmd: ptr<void>, v: i32) -> void {
+    let b: ptr<u8> = cmd as ptr<u8>
+    b[GAME_TICCMD_OFF_CONSISTANCY] = v as u8
+}
+@flow_api
+function gameshim_cmd_consistancy(cmd: ptr<void>) -> i32 {
+    let b: ptr<u8> = cmd as ptr<u8>
+    return b[GAME_TICCMD_OFF_CONSISTANCY] as i32
+}
+@flow_api
+function gameshim_cmd_checksum(cmd: ptr<void>) -> i32 {
+    let mut sum: i32 = 0
+    let mut i: i32 = 0
+    let n: i32 = GAME_TICCMD_SIZEOF / 4 - 1
+    while i < n {
+        sum = sum + game_blob_i32(cmd as ptr<u8>, i * 4)
+        i = i + 1
+    }
+    return sum
+}
+
+@flow_api
+function gameshim_ev_type(ev: ptr<void>) -> i32 { return game_blob_i32(ev as ptr<u8>, GAME_EVENT_OFF_TYPE) }
+@flow_api
+function gameshim_ev_data1(ev: ptr<void>) -> i32 { return game_blob_i32(ev as ptr<u8>, GAME_EVENT_OFF_DATA1) }
+@flow_api
+function gameshim_ev_data2(ev: ptr<void>) -> i32 { return game_blob_i32(ev as ptr<u8>, GAME_EVENT_OFF_DATA2) }
+@flow_api
+function gameshim_ev_data3(ev: ptr<void>) -> i32 { return game_blob_i32(ev as ptr<u8>, GAME_EVENT_OFF_DATA3) }
+@flow_api
+function gameshim_ev_data4(ev: ptr<void>) -> i32 { return game_blob_i32(ev as ptr<u8>, GAME_EVENT_OFF_DATA4) }
+
+@flow_api
+function gameshim_bodyque(i: i32) -> ptr<void> { return game_bodyque[i] as ptr<void> }
+@flow_api
+function gameshim_set_bodyque(i: i32, m: ptr<void>) -> void { game_bodyque[i] = m as i64 }
+
+@flow_api
+function gameshim_demo_read_u8() -> i32 {
+    let p: ptr<u8> = game_demo_p as ptr<u8>
+    let v: i32 = p[0] as i32
+    game_demo_p = ((p as i64) + 1) as ptr<void>
+    return v
+}
+@flow_api
+function gameshim_demo_peek_u8() -> i32 {
+    let p: ptr<u8> = game_demo_p as ptr<u8>
+    return p[0] as i32
+}
+@flow_api
+function gameshim_demo_write_u8(v: i32) -> void {
+    let p: ptr<u8> = game_demo_p as ptr<u8>
+    p[0] = v as u8
+    game_demo_p = ((p as i64) + 1) as ptr<void>
+}
+@flow_api
+function gameshim_demo_bytes_left() -> i32 {
+    return ((game_demoend as i64) - (game_demo_p as i64)) as i32
+}
+@flow_api
+function gameshim_demo_mark() -> ptr<void> { return game_demo_p }
+@flow_api
+function gameshim_demo_rewind_to(p: ptr<void>) -> void { game_demo_p = p }
+
+@flow_api
+function gameshim_increase_demo_buffer() -> void {
+    let current_length: i32 = ((game_demoend as i64) - (game_demobuffer as i64)) as i32
+    let new_length: i32 = current_length * 2
+    let new_demobuffer: ptr<void> = Z_Malloc(new_length, 1, null)
+    let new_demop: ptr<void> = ((new_demobuffer as i64) + ((game_demo_p as i64) - (game_demobuffer as i64))) as ptr<void>
+    memcpy(new_demobuffer, game_demobuffer, current_length as i64)
+    Z_Free(game_demobuffer)
+    game_demobuffer = new_demobuffer
+    game_demo_p = new_demop
+    game_demoend = ((game_demobuffer as i64) + (new_length as i64)) as ptr<void>
+}
+
+@flow_api
+function gameshim_copy_savename(name: string) -> void {
+    M_StringCopy(&game_savename[0], name as ptr<u8>, 256)
+}
+@flow_api
+function gameshim_copy_savedescription(description: string) -> void {
+    M_StringCopy(&game_savedescription[0], description as ptr<u8>, 32)
+}
+@flow_api
+function gameshim_clear_savedescription() -> void {
+    M_StringCopy(&game_savedescription[0], ("") as ptr<u8>, 32)
+}
+@flow_api
+function gameshim_set_savedescription_netgame() -> void {
+    M_StringCopy(&game_savedescription[0], ("NET GAME") as ptr<u8>, 32)
+}
+@flow_api
+function gameshim_savedescription_empty() -> i32 {
+    if game_savedescription[0] == (0 as u8) { return 1 }
+    return 0
+}
+
+@flow_api
+function gameshim_gg_saved() -> string { return "game saved." }
+@flow_api
+function gameshim_testcontrols_msg() -> string { return "Press escape to quit." }
+@flow_api
+function gameshim_screenshot_msg() -> string { return "screen shot" }
+
+# ---- formerly game_data.c DEFINEs / helpers ----------------------------
+
+@flow_api
+function gameshim_forwardmove(i: i32) -> i32 { return game_forwardmove[i] }
+@flow_api
+function gameshim_set_forwardmove(i: i32, v: i32) -> void { game_forwardmove[i] = v }
+@flow_api
+function gameshim_sidemove(i: i32) -> i32 { return game_sidemove[i] }
+@flow_api
+function gameshim_set_sidemove(i: i32, v: i32) -> void { game_sidemove[i] = v }
+
+@flow_api
+function gameshim_vanilla_savegame_limit() -> i32 { return game_vanilla_savegame_limit }
+@flow_api
+function gameshim_vanilla_demo_limit() -> i32 { return game_vanilla_demo_limit }
+@flow_api
+function gameshim_vanilla_savegame_limit_addr() -> ptr<void> {
+    return &game_vanilla_savegame_limit as ptr<void>
+}
+@flow_api
+function gameshim_vanilla_demo_limit_addr() -> ptr<void> {
+    return &game_vanilla_demo_limit as ptr<void>
+}
+
+@flow_api
+function gameshim_totalkills() -> i32 { return game_totalkills }
+@flow_api
+function gameshim_totalitems() -> i32 { return game_totalitems }
+@flow_api
+function gameshim_totalsecret() -> i32 { return game_totalsecret }
+@flow_api
+function gameshim_inc_totalkills() -> void { game_totalkills = game_totalkills + 1 }
+@flow_api
+function gameshim_inc_totalitems() -> void { game_totalitems = game_totalitems + 1 }
+@flow_api
+function gameshim_inc_totalsecret() -> void { game_totalsecret = game_totalsecret + 1 }
+@flow_api
+function gameshim_clear_totals() -> void {
+    game_totalkills = 0
+    game_totalitems = 0
+    game_totalsecret = 0
+}
+
+@flow_api
+function gameshim_set_precache(v: i32) -> void { game_precache = v }
+@flow_api
+function gameshim_precache() -> i32 { return game_precache }
+
+@flow_api
+function gameshim_rndindex() -> i32 { return rndindex_addr()[0] }
+
+@flow_api
+function gameshim_dclick_use() -> i32 { return ctrlshim_var(GAME_C_DCLICK_USE)[0] }
+@flow_api
+function gameshim_mousebfire() -> i32 { return ctrlshim_var(GAME_C_MOUSEBFIRE)[0] }
+@flow_api
+function gameshim_mousebstrafe() -> i32 { return ctrlshim_var(GAME_C_MOUSEBSTRAFE)[0] }
+@flow_api
+function gameshim_mousebforward() -> i32 { return ctrlshim_var(GAME_C_MOUSEBFORWARD)[0] }
+@flow_api
+function gameshim_mousebbackward() -> i32 { return ctrlshim_var(GAME_C_MOUSEBBACKWARD)[0] }
+@flow_api
+function gameshim_mousebstrafeleft() -> i32 { return ctrlshim_var(GAME_C_MOUSEBSTRAFELEFT)[0] }
+@flow_api
+function gameshim_mousebstraferight() -> i32 { return ctrlshim_var(GAME_C_MOUSEBSTRAFERIGHT)[0] }
+@flow_api
+function gameshim_mousebuse() -> i32 { return ctrlshim_var(GAME_C_MOUSEBUSE)[0] }
+@flow_api
+function gameshim_mousebprevweapon() -> i32 { return ctrlshim_var(GAME_C_MOUSEBPREVWEAPON)[0] }
+@flow_api
+function gameshim_mousebnextweapon() -> i32 { return ctrlshim_var(GAME_C_MOUSEBNEXTWEAPON)[0] }
+@flow_api
+function gameshim_joybfire() -> i32 { return ctrlshim_var(GAME_C_JOYBFIRE)[0] }
+@flow_api
+function gameshim_joybstrafe() -> i32 { return ctrlshim_var(GAME_C_JOYBSTRAFE)[0] }
+@flow_api
+function gameshim_joybuse() -> i32 { return ctrlshim_var(GAME_C_JOYBUSE)[0] }
+@flow_api
+function gameshim_joybspeed() -> i32 { return ctrlshim_var(GAME_C_JOYBSPEED)[0] }
+@flow_api
+function gameshim_joybstrafeleft() -> i32 { return ctrlshim_var(GAME_C_JOYBSTRAFELEFT)[0] }
+@flow_api
+function gameshim_joybstraferight() -> i32 { return ctrlshim_var(GAME_C_JOYBSTRAFERIGHT)[0] }
+@flow_api
+function gameshim_joybprevweapon() -> i32 { return ctrlshim_var(GAME_C_JOYBPREVWEAPON)[0] }
+@flow_api
+function gameshim_joybnextweapon() -> i32 { return ctrlshim_var(GAME_C_JOYBNEXTWEAPON)[0] }
+
+@flow_api
+function gameshim_iabs(v: i32) -> i32 {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+@flow_api
+function gameshim_demoname() -> string { return game_demoname }
+
+@flow_api
+function gameshim_alloc_demoname(name: string) -> void {
+    let demoname_size: i64 = strlen(name) + 5
+    game_demoname = Z_Malloc(demoname_size as i32, 1, null) as string
+    snprintf(game_demoname, demoname_size, "%s.lmp", name)
+}
+
+@flow_api
+function gameshim_set_turbo_message(i: i32) -> void {
+    snprintf((&game_turbomessage[0]) as string, 80, "%s is turbo!",
+             hushim_player_name(i) as string)
+    PLAYER_set_message(gameshim_player_at(gameshim_consoleplayer()),
+                       (&game_turbomessage[0]) as string)
+}
+
+@flow_api
+function gameshim_write_demo_file() -> void {
+    let buf: ptr<void> = gameshim_demobuffer()
+    let p: ptr<void> = gameshim_demo_p()
+    let len: i32 = ((p as i64) - (buf as i64)) as i32
+    M_WriteFile(gameshim_demoname() as ptr<u8>, buf, len)
+}
+
+@flow_api
+function gameshim_fopen_savename_rb() -> i32 {
+    savegshim_set_save_stream(fopen(gameshim_savename(), "rb"))
+    if (savegshim_save_stream() as i64) != 0 { return 1 }
+    return 0
+}
+
+@flow_api
+function gameshim_fopen_save_wb(path: string) -> i32 {
+    savegshim_set_save_stream(fopen(path, "wb"))
+    if (savegshim_save_stream() as i64) != 0 { return 1 }
+    return 0
+}
+
+@flow_api
+function gameshim_fclose_save_stream() -> void {
+    fclose(savegshim_save_stream())
+}
+
+@flow_api
+function gameshim_ftell_save_stream() -> i64 {
+    return ftell(savegshim_save_stream())
+}
+
+@flow_api
+function gameshim_remove_rename_save(savegame_file: string, temp_file: string) -> void {
+    sysshim_remove(savegame_file)
+    sysshim_rename(temp_file, savegame_file)
+}
+
+@flow_api
+function gameshim_temp_recovery_path() -> string {
+    return M_TempFile("recovery.dsg" as ptr<u8>) as string
+}
+
+@flow_api
+function gameshim_clear_savegame_error() -> void {
+    savegshim_set_savegame_error(0)
+}
+
+function game_atoi(s: string) -> i32 {
+    let p: ptr<u8> = s as ptr<u8>
+    let mut i: i32 = 0
+    while p[i] as i32 == 32 or (p[i] as i32 >= 9 and p[i] as i32 <= 13) {
+        i = i + 1
+    }
+    let mut sign: i32 = 1
+    if p[i] as i32 == 45 {
+        sign = 0 - 1
+        i = i + 1
+    } elif p[i] as i32 == 43 {
+        i = i + 1
+    }
+    let mut v: i32 = 0
+    let mut c: i32 = p[i] as i32
+    while c >= 48 and c <= 57 {
+        v = v * 10 + (c - 48)
+        i = i + 1
+        c = p[i] as i32
+    }
+    return v * sign
+}
+
+@flow_api
+function gameshim_maxdemo_kib() -> i32 {
+    let i: i32 = M_CheckParmWithArgs("-maxdemo", 1)
+    if i != 0 {
+        let words: ptr<i64> = argvflow_argv()
+        return game_atoi(words[i + 1] as ptr<u8> as string)
+    }
+    return 0
+}
+
+function game_state_tics_ptr(i: i32) -> ptr<i32> {
+    return ((info_states_addr() as i64)
+            + (i as i64) * (GAME_INFO_STATE_SIZE as i64)
+            + (GAME_INFO_STATE_OFF_TICS as i64)) as ptr<i32>
+}
+
+function game_mobjinfo_speed_ptr(typ: i32) -> ptr<i32> {
+    return ((info_mobjinfo_addr() as i64)
+            + (typ as i64) * (GAME_INFO_MOBJINFO_SIZE as i64)
+            + (GAME_INFO_MOBJINFO_OFF_SPEED as i64)) as ptr<i32>
+}
+
+@flow_api
+function gameshim_halve_sarg_tics() -> void {
+    let mut i: i32 = GAME_S_SARG_RUN1
+    while i <= GAME_S_SARG_PAIN2 {
+        let p: ptr<i32> = game_state_tics_ptr(i)
+        p[0] = p[0] >> 1
+        i = i + 1
+    }
+    game_mobjinfo_speed_ptr(GAME_MT_BRUISERSHOT)[0] = 20 * GAME_SARG_FRACUNIT
+    game_mobjinfo_speed_ptr(GAME_MT_HEADSHOT)[0] = 20 * GAME_SARG_FRACUNIT
+    game_mobjinfo_speed_ptr(GAME_MT_TROOPSHOT)[0] = 20 * GAME_SARG_FRACUNIT
+}
+
+@flow_api
+function gameshim_restore_sarg_tics() -> void {
+    let mut i: i32 = GAME_S_SARG_RUN1
+    while i <= GAME_S_SARG_PAIN2 {
+        let p: ptr<i32> = game_state_tics_ptr(i)
+        p[0] = p[0] << 1
+        i = i + 1
+    }
+    game_mobjinfo_speed_ptr(GAME_MT_BRUISERSHOT)[0] = 15 * GAME_SARG_FRACUNIT
+    game_mobjinfo_speed_ptr(GAME_MT_HEADSHOT)[0] = 10 * GAME_SARG_FRACUNIT
+    game_mobjinfo_speed_ptr(GAME_MT_TROOPSHOT)[0] = 10 * GAME_SARG_FRACUNIT
+}
+
+@flow_api
+function gameshim_error_consistency(got: i32, want: i32) -> void {
+    snprintf((&game_errbuf[0]) as string, 256, "consistency failure (%i should be %i)", got, want)
+    I_Error((&game_errbuf[0]) as string)
+}
+
+@flow_api
+function gameshim_error_dm_spots(selections: i32) -> void {
+    snprintf((&game_errbuf[0]) as string, 256, "Only %i deathmatch spots, 4 required", selections)
+    I_Error((&game_errbuf[0]) as string)
+}
+
+@flow_api
+function gameshim_error_checkspot_angle(an: i32) -> void {
+    snprintf((&game_errbuf[0]) as string, 256, "G_CheckSpot: unexpected angle %d\n", an)
+    I_Error((&game_errbuf[0]) as string)
+}
+
+@flow_api
+function gameshim_error_doom12_version() -> void {
+    I_Error("Doom 1.2 does not have a version code!")
+}
+
+@flow_api
+function gameshim_error_bad_savegame() -> void {
+    I_Error("Bad savegame")
+}
+
+@flow_api
+function gameshim_error_save_overrun() -> void {
+    I_Error("Savegame buffer overrun")
+}
+
+@flow_api
+function gameshim_error_save_open(temp_file: string, recovery_file: string) -> void {
+    snprintf((&game_errbuf[0]) as string, 256,
+             "Failed to open either '%s' or '%s' to write savegame.",
+             temp_file, recovery_file)
+    I_Error((&game_errbuf[0]) as string)
+}
+
+@flow_api
+function gameshim_error_save_recovery(temp_file: string, recovery_file: string) -> void {
+    snprintf((&game_errbuf[0]) as string, 256,
+             "Failed to open savegame file '%s' for writing.\nBut your game has been saved to '%s' for recovery.",
+             temp_file, recovery_file)
+    I_Error((&game_errbuf[0]) as string)
+}
+
+@flow_api
+function gameshim_error_demo_recorded() -> void {
+    snprintf((&game_errbuf[0]) as string, 256, "Demo %s recorded", gameshim_demoname())
+    I_Error((&game_errbuf[0]) as string)
+}
+

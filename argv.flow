@@ -1,0 +1,232 @@
+# Command-line argument handling, ported from m_argv.c to Flow.
+#
+# myargc/myargv are owned here. doom.flow sets them through argvflow_set_args;
+# other modules read via argvflow_* / argv_at. Response files replace the
+# pair wholesale when LoadResponseFile runs.
+#
+# Note on LoadResponseFile: doomgeneric shipped the body compiled out
+# behind #if ORIGCODE. This port restores the chocolate-doom logic
+# (fopen/fread are fine per PORTING.md), so @file response files work.
+# With no @argument present, M_FindResponseFile only scans first
+# characters and returns, same as the fast path in C.
+
+extern { function fopen(path: string, mode: string) -> ptr<void> }
+extern { function fclose(f: ptr<void>) -> i32 }
+extern { function fread(dest: ptr<void>, size: i64, n: i64, f: ptr<void>) -> i64 }
+extern { function malloc(n: i64) -> ptr<void> }
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+extern { function printf(fmt: string, s: string) -> i32 }
+extern { function exit(code: i32) -> void }
+
+extern { function I_Error(msg: string) -> void }
+# m_misc.c; long M_FileLength(FILE *) on LP64.
+extern { function M_FileLength(f: ptr<void>) -> i64 }
+
+# MAXARGVS from m_argv.c.
+const MAXARGVS: i32 = 100
+
+let mut myargc: i32 = 0
+let mut myargv: ptr<i64> = null
+
+@flow_api
+function argvflow_argc() -> i32 {
+    return myargc
+}
+
+@flow_api
+function argvflow_argv() -> ptr<i64> {
+    return myargv
+}
+
+@flow_api
+function argvflow_set_args(argc: i32, argv: ptr<i64>) -> void {
+    myargc = argc
+    myargv = argv
+}
+
+function argv_at(i: i32) -> ptr<u8> {
+    let words: ptr<i64> = argvflow_argv()
+    return words[i] as ptr<u8>
+}
+
+function to_lower(c: i32) -> i32 {
+    if c >= 65 and c <= 90 {
+        return c + 32
+    }
+    return c
+}
+
+# strcasecmp(a, b) == 0, ASCII case folding.
+function str_iequal(a: ptr<u8>, b: ptr<u8>) -> bool {
+    let mut j: i32 = 0
+    let mut ca: i32 = to_lower(a[0] as i32)
+    let mut cb: i32 = to_lower(b[0] as i32)
+    while ca == cb {
+        if ca == 0 {
+            return true
+        }
+        j = j + 1
+        ca = to_lower(a[j] as i32)
+        cb = to_lower(b[j] as i32)
+    }
+    return false
+}
+
+# isspace() in the C locale: space, \t, \n, \v, \f, \r.
+function is_space(c: i32) -> bool {
+    if c == 32 {
+        return true
+    }
+    return c >= 9 and c <= 13
+}
+
+@flow_api
+function M_CheckParmWithArgs(check: string, num_args: i32) -> i32 {
+    let cp: ptr<u8> = check as ptr<u8>
+    let mut i: i32 = 1
+    while i < argvflow_argc() - num_args {
+        if str_iequal(cp, argv_at(i)) {
+            return i
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+@flow_api
+function M_CheckParm(check: string) -> i32 {
+    return M_CheckParmWithArgs(check, 0)
+}
+
+# boolean in doomtype.h is an enum, i.e. a C int.
+@flow_api
+function M_ParmExists(check: string) -> i32 {
+    if M_CheckParm(check) != 0 {
+        return 1
+    }
+    return 0
+}
+
+function load_response_file(argv_index: i32) -> void {
+    let arg: ptr<u8> = argv_at(argv_index)
+    # Skip the leading '@'.
+    let response_filename: ptr<u8> = ((arg as i64) + 1) as ptr<u8>
+
+    let fh: ptr<void> = fopen(response_filename as string, "rb")
+    if (fh as i64) == 0 {
+        printf("\nNo such response file!%s", "")
+        exit(1)
+    }
+    printf("Found response file %s!\n", response_filename as string)
+
+    let size: i32 = M_FileLength(fh) as i32
+
+    # One extra byte in case an argument ends exactly at EOF and needs
+    # its terminating '\0'.
+    let file: ptr<u8> = malloc((size + 1) as i64) as ptr<u8>
+
+    let mut i: i32 = 0
+    while i < size {
+        let dest: ptr<void> = ((file as i64) + i as i64) as ptr<void>
+        let k: i32 = fread(dest, 1, (size - i) as i64, fh) as i32
+        if k < 0 {
+            I_Error("Failed to read full contents of response file")
+        }
+        i = i + k
+    }
+    fclose(fh)
+
+    # calloc instead of malloc+memset(0): same zeroed argv array.
+    let newargv: ptr<i64> = calloc(MAXARGVS as i64, 8) as ptr<i64>
+    let mut newargc: i32 = 0
+
+    let oldargv: ptr<i64> = argvflow_argv()
+    let oldargc: i32 = argvflow_argc()
+
+    # Arguments before the response file.
+    i = 0
+    while i < argv_index {
+        newargv[i] = oldargv[i]
+        newargc = newargc + 1
+        i = i + 1
+    }
+
+    let infile: ptr<u8> = file
+    let mut k: i32 = 0
+    let mut done: bool = false
+    while !done {
+        # Skip past space characters to the next argument.
+        while k < size and is_space(infile[k] as i32) {
+            k = k + 1
+        }
+        if k >= size {
+            done = true
+        } else {
+            if infile[k] as i32 == 34 {
+                # '"': quoted argument, may contain spaces.
+                k = k + 1
+                newargv[newargc] = (infile as i64) + k as i64
+                newargc = newargc + 1
+                while k < size and infile[k] as i32 != 34 and infile[k] as i32 != 10 {
+                    k = k + 1
+                }
+                if k >= size or infile[k] as i32 == 10 {
+                    I_Error("Quotes unclosed in response file")
+                }
+                infile[k] = 0 as u8
+                k = k + 1
+            } else {
+                # Plain argument, runs to the next space.
+                newargv[newargc] = (infile as i64) + k as i64
+                newargc = newargc + 1
+                while k < size and !is_space(infile[k] as i32) {
+                    k = k + 1
+                }
+                infile[k] = 0 as u8
+                k = k + 1
+            }
+        }
+    }
+
+    # Arguments after the response file.
+    i = argv_index + 1
+    while i < oldargc {
+        newargv[newargc] = oldargv[i]
+        newargc = newargc + 1
+        i = i + 1
+    }
+
+    argvflow_set_args(newargc, newargv)
+}
+
+@flow_api
+function M_FindResponseFile() -> void {
+    let mut i: i32 = 1
+    while i < argvflow_argc() {
+        let a: ptr<u8> = argv_at(i)
+        # '@' == 64
+        if a[0] as i32 == 64 {
+            load_response_file(i)
+        }
+        i = i + 1
+    }
+}
+
+@flow_api
+function M_GetExecutableName() -> ptr<u8> {
+    # strrchr(myargv[0], DIR_SEPARATOR); DIR_SEPARATOR is '/' (47) on
+    # non-Windows (doomtype.h).
+    let a0: ptr<u8> = argv_at(0)
+    let mut i: i32 = 0
+    let mut sep: i32 = 0 - 1
+    while a0[i] as i32 != 0 {
+        if a0[i] as i32 == 47 {
+            sep = i
+        }
+        i = i + 1
+    }
+    if sep < 0 {
+        return a0
+    }
+    return ((a0 as i64) + (sep + 1) as i64) as ptr<u8>
+}

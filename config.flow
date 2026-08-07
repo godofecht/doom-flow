@@ -1,0 +1,731 @@
+# Configuration file interface, ported from m_config.c to Flow.
+#
+# configdir and Default/collection state live here. Doom/extra default
+# name+kind tables live in this module (@flow_api configdata_*).
+# This module exports the M_* config API with @flow_api.
+#
+# ORIGCODE is #undef in config.h, so LoadDefaultCollection /
+# SaveDefaultCollection are empty stubs here (same as the C build).
+# SetVariable / bind / get APIs remain fully active.
+#
+# Reserved Flow names: field `type` -> `kind`; avoid `handle`.
+
+extern { function malloc(n: i64) -> ptr<void> }
+extern { function strcmp(a: string, b: string) -> i32 }
+extern { function strlen(s: string) -> i64 }
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+extern { function printf(fmt: string, s: string) -> i32 }
+extern { function I_Error(msg: string) -> void }
+
+extern { function M_CheckParmWithArgs(check: string, num_args: i32) -> i32 }
+extern { function M_MakeDirectory(path: ptr<u8>) -> void }
+
+extern { function argvflow_argv() -> ptr<i64> }
+
+# ---- libc/format helpers (formerly config_shim.c) ---------------------
+
+function string_join2(a: string, b: string) -> string {
+    let la: i64 = strlen(a)
+    let lb: i64 = strlen(b)
+    let result: ptr<u8> = malloc(la + lb + 1) as ptr<u8>
+    memcpy(result as ptr<void>, a as ptr<void>, la)
+    memcpy(((result as i64) + la) as ptr<void>, b as ptr<void>, lb)
+    result[la + lb] = 0 as u8
+    return result as string
+}
+
+function configshim_savegame_dir(configdir_arg: string) -> string {
+    return string_join2(configdir_arg, "/.savegame/")
+}
+
+function configshim_strdup(s: string) -> string {
+    let l: i64 = strlen(s)
+    let result: ptr<u8> = malloc(l + 1) as ptr<u8>
+    memcpy(result as ptr<void>, s as ptr<void>, l + 1)
+    return result as string
+}
+
+function configshim_error_unknown(name: string) -> void {
+    I_Error(string_join2(string_join2("Unknown configuration variable: '", name), "'"))
+}
+
+function parse_hex_digits(s: ptr<u8>) -> i32 {
+    let mut i: i32 = 0
+    let mut v: i32 = 0
+    let mut c: i32 = s[i] as i32
+    while (c >= 48 and c <= 57) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70) {
+        let mut digit: i32 = 0
+        if c >= 48 and c <= 57 {
+            digit = c - 48
+        } elif c >= 97 and c <= 102 {
+            digit = c - 97 + 10
+        } else {
+            digit = c - 65 + 10
+        }
+        v = v * 16 + digit
+        i = i + 1
+        c = s[i] as i32
+    }
+    return v
+}
+
+# Mirrors sscanf(strparm, "%i", &parm): optional sign, octal on a leading
+# '0' followed by an octal digit, decimal otherwise.
+function parse_dec_or_octal(s: ptr<u8>) -> i32 {
+    let mut i: i32 = 0
+    let mut sign: i32 = 1
+    if s[0] as i32 == 45 {
+        sign = 0 - 1
+        i = 1
+    } elif s[0] as i32 == 43 {
+        i = 1
+    }
+
+    let mut base: i32 = 10
+    if s[i] as i32 == 48 and s[i + 1] as i32 >= 48 and s[i + 1] as i32 <= 55 {
+        base = 8
+        i = i + 1
+    }
+
+    let mut v: i32 = 0
+    let mut c: i32 = s[i] as i32
+    while c >= 48 and c < 48 + base {
+        v = v * base + (c - 48)
+        i = i + 1
+        c = s[i] as i32
+    }
+    return v * sign
+}
+
+function configshim_parse_int(strparm: string) -> i32 {
+    let sp: ptr<u8> = strparm as ptr<u8>
+    if sp[0] as i32 == 48 and sp[1] as i32 == 120 {
+        return parse_hex_digits(((sp as i64) + 2) as ptr<u8>)
+    }
+    return parse_dec_or_octal(sp)
+}
+
+function configshim_atof(s: string) -> f32 {
+    let p: ptr<u8> = s as ptr<u8>
+    let mut i: i32 = 0
+    let mut sign: f32 = 1.0
+    if p[0] as i32 == 45 {
+        sign = 0.0 - 1.0
+        i = 1
+    } elif p[0] as i32 == 43 {
+        i = 1
+    }
+
+    let mut v: f32 = 0.0
+    let mut c: i32 = p[i] as i32
+    while c >= 48 and c <= 57 {
+        v = v * 10.0 + ((c - 48) as f32)
+        i = i + 1
+        c = p[i] as i32
+    }
+
+    if c == 46 {
+        i = i + 1
+        let mut frac: f32 = 0.1
+        c = p[i] as i32
+        while c >= 48 and c <= 57 {
+            v = v + ((c - 48) as f32) * frac
+            frac = frac * 0.1
+            i = i + 1
+            c = p[i] as i32
+        }
+    }
+
+    return v * sign
+}
+
+function configshim_load_f32(p: ptr<void>) -> f32 {
+    return (p as ptr<f32>)[0]
+}
+
+function configshim_store_f32(p: ptr<void>, v: f32) -> void {
+    (p as ptr<f32>)[0] = v
+}
+
+function configshim_load_str(p: ptr<void>) -> string {
+    let words: ptr<i64> = p as ptr<i64>
+    return words[0] as ptr<u8> as string
+}
+
+function configshim_store_str(p: ptr<void>, v: string) -> void {
+    let words: ptr<i64> = p as ptr<i64>
+    words[0] = v as ptr<u8> as i64
+}
+
+# ---- default_type_t (m_config.c) --------------------------------------
+
+const CONFIG_DEFAULT_INT: i32 = 0
+const CONFIG_DEFAULT_INT_HEX: i32 = 1
+const CONFIG_DEFAULT_STRING: i32 = 2
+const CONFIG_DEFAULT_FLOAT: i32 = 3
+const CONFIG_DEFAULT_KEY: i32 = 4
+
+# doomkeys.h: KEY_RSHIFT (used when ORIGCODE save path is restored)
+const CONFIG_KEY_RSHIFT: i32 = 128 + 54
+
+# sizeof(Default) on LP64: 8+8+4+4+4+4 = 32
+const CONFIG_DEFAULT_SIZE: i32 = 32
+
+struct Default {
+    name: string,
+    location: ptr<void>,
+    kind: i32,
+    untranslated: i32,
+    original_translated: i32,
+    bound: i32
+}
+
+# Collection metadata (filename + counts). Entries live in heap arrays.
+# Filenames are ptr<u8>: module-static `string` is unsupported.
+let mut doom_defaults_ptr: ptr<Default> = null
+let mut doom_numdefaults: i32 = 0
+let mut doom_filename: ptr<u8> = null
+
+let mut extra_defaults_ptr: ptr<Default> = null
+let mut extra_numdefaults: i32 = 0
+let mut extra_filename: ptr<u8> = null
+
+let mut default_main_config: ptr<u8> = null
+let mut default_extra_config: ptr<u8> = null
+let mut config_tables_ready: i32 = 0
+let mut configdir_storage: ptr<u8> = null
+
+# Mapping from DOS keyboard scan code to internal key code (doomkeys.h).
+let mut scantokey: array<i32, 128> = [
+    0, 27, 49, 50, 51, 52, 53, 54,
+    55, 56, 57, 48, 45, 61, 127, 9,
+    113, 119, 101, 114, 116, 121, 117, 105,
+    111, 112, 91, 93, 13, 157, 97, 115,
+    100, 102, 103, 104, 106, 107, 108, 59,
+    39, 96, 182, 92, 122, 120, 99, 118,
+    98, 110, 109, 44, 46, 47, 182, 42,
+    184, 32, 186, 187, 188, 189, 190, 191,
+    192, 193, 194, 195, 196, 255, 198, 199,
+    173, 201, 45, 172, 53, 174, 43, 207,
+    175, 209, 210, 211, 0, 0, 0, 215,
+    216, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 217, 0
+]
+
+# ---- name/kind tables (was config_data.c) ------------------------------
+
+let mut config_doom_names: array<string, 76> = [
+    "mouse_sensitivity",
+    "sfx_volume",
+    "music_volume",
+    "show_talk",
+    "voice_volume",
+    "show_messages",
+    "key_right",
+    "key_left",
+    "key_up",
+    "key_down",
+    "key_strafeleft",
+    "key_straferight",
+    "key_useHealth",
+    "key_jump",
+    "key_flyup",
+    "key_flydown",
+    "key_flycenter",
+    "key_lookup",
+    "key_lookdown",
+    "key_lookcenter",
+    "key_invquery",
+    "key_mission",
+    "key_invPop",
+    "key_invKey",
+    "key_invHome",
+    "key_invEnd",
+    "key_invleft",
+    "key_invright",
+    "key_invLeft",
+    "key_invRight",
+    "key_useartifact",
+    "key_invUse",
+    "key_invDrop",
+    "key_lookUp",
+    "key_lookDown",
+    "key_fire",
+    "key_use",
+    "key_strafe",
+    "key_speed",
+    "use_mouse",
+    "mouseb_fire",
+    "mouseb_strafe",
+    "mouseb_forward",
+    "mouseb_jump",
+    "use_joystick",
+    "joyb_fire",
+    "joyb_strafe",
+    "joyb_use",
+    "joyb_speed",
+    "joyb_jump",
+    "screenblocks",
+    "screensize",
+    "detaillevel",
+    "snd_channels",
+    "snd_musicdevice",
+    "snd_sfxdevice",
+    "snd_sbport",
+    "snd_sbirq",
+    "snd_sbdma",
+    "snd_mport",
+    "usegamma",
+    "savedir",
+    "messageson",
+    "back_flat",
+    "nickname",
+    "chatmacro0",
+    "chatmacro1",
+    "chatmacro2",
+    "chatmacro3",
+    "chatmacro4",
+    "chatmacro5",
+    "chatmacro6",
+    "chatmacro7",
+    "chatmacro8",
+    "chatmacro9",
+    "comport"
+]
+
+let mut config_doom_kinds: array<i32, 76> = [
+    0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0
+]
+
+let mut config_extra_names: array<string, 125> = [
+    "graphical_startup",
+    "autoadjust_video_settings",
+    "fullscreen",
+    "aspect_ratio_correct",
+    "startup_delay",
+    "screen_width",
+    "screen_height",
+    "screen_bpp",
+    "grabmouse",
+    "novert",
+    "mouse_acceleration",
+    "mouse_threshold",
+    "snd_samplerate",
+    "snd_cachesize",
+    "snd_maxslicetime_ms",
+    "snd_musiccmd",
+    "opl_io_port",
+    "show_endoom",
+    "png_screenshots",
+    "vanilla_savegame_limit",
+    "vanilla_demo_limit",
+    "vanilla_keyboard_mapping",
+    "video_driver",
+    "window_position",
+    "player_name",
+    "joystick_index",
+    "joystick_x_axis",
+    "joystick_x_invert",
+    "joystick_y_axis",
+    "joystick_y_invert",
+    "joystick_strafe_axis",
+    "joystick_strafe_invert",
+    "joystick_physical_button0",
+    "joystick_physical_button1",
+    "joystick_physical_button2",
+    "joystick_physical_button3",
+    "joystick_physical_button4",
+    "joystick_physical_button5",
+    "joystick_physical_button6",
+    "joystick_physical_button7",
+    "joystick_physical_button8",
+    "joystick_physical_button9",
+    "joyb_strafeleft",
+    "joyb_straferight",
+    "joyb_menu_activate",
+    "joyb_prevweapon",
+    "joyb_nextweapon",
+    "mouseb_strafeleft",
+    "mouseb_straferight",
+    "mouseb_use",
+    "mouseb_backward",
+    "mouseb_prevweapon",
+    "mouseb_nextweapon",
+    "dclick_use",
+    "use_libsamplerate",
+    "libsamplerate_scale",
+    "timidity_cfg_path",
+    "gus_patch_path",
+    "gus_ram_kb",
+    "key_pause",
+    "key_menu_activate",
+    "key_menu_up",
+    "key_menu_down",
+    "key_menu_left",
+    "key_menu_right",
+    "key_menu_back",
+    "key_menu_forward",
+    "key_menu_confirm",
+    "key_menu_abort",
+    "key_menu_help",
+    "key_menu_save",
+    "key_menu_load",
+    "key_menu_volume",
+    "key_menu_detail",
+    "key_menu_qsave",
+    "key_menu_endgame",
+    "key_menu_messages",
+    "key_menu_qload",
+    "key_menu_quit",
+    "key_menu_gamma",
+    "key_spy",
+    "key_menu_incscreen",
+    "key_menu_decscreen",
+    "key_menu_screenshot",
+    "key_map_toggle",
+    "key_map_north",
+    "key_map_south",
+    "key_map_east",
+    "key_map_west",
+    "key_map_zoomin",
+    "key_map_zoomout",
+    "key_map_maxzoom",
+    "key_map_follow",
+    "key_map_grid",
+    "key_map_mark",
+    "key_map_clearmark",
+    "key_weapon1",
+    "key_weapon2",
+    "key_weapon3",
+    "key_weapon4",
+    "key_weapon5",
+    "key_weapon6",
+    "key_weapon7",
+    "key_weapon8",
+    "key_prevweapon",
+    "key_nextweapon",
+    "key_arti_all",
+    "key_arti_health",
+    "key_arti_poisonbag",
+    "key_arti_blastradius",
+    "key_arti_teleport",
+    "key_arti_teleportother",
+    "key_arti_egg",
+    "key_arti_invulnerability",
+    "key_message_refresh",
+    "key_demo_quit",
+    "key_multi_msg",
+    "key_multi_msgplayer1",
+    "key_multi_msgplayer2",
+    "key_multi_msgplayer3",
+    "key_multi_msgplayer4",
+    "key_multi_msgplayer5",
+    "key_multi_msgplayer6",
+    "key_multi_msgplayer7",
+    "key_multi_msgplayer8"
+]
+
+let mut config_extra_kinds: array<i32, 125> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 2,
+    1, 0, 0, 0, 0, 0, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 3, 2, 2, 0, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4
+]
+
+@flow_api
+function configdata_doom_count() -> i32 { return 76 }
+@flow_api
+function configdata_extra_count() -> i32 { return 125 }
+@flow_api
+function configdata_doom_name(i: i32) -> string { return config_doom_names[i] }
+@flow_api
+function configdata_extra_name(i: i32) -> string { return config_extra_names[i] }
+@flow_api
+function configdata_doom_kind(i: i32) -> i32 { return config_doom_kinds[i] }
+@flow_api
+function configdata_extra_kind(i: i32) -> i32 { return config_extra_kinds[i] }
+
+function ensure_config_tables() -> void {
+    if config_tables_ready != 0 {
+        return
+    }
+
+    doom_numdefaults = configdata_doom_count()
+    extra_numdefaults = configdata_extra_count()
+
+    doom_defaults_ptr = malloc((doom_numdefaults as i64) * (CONFIG_DEFAULT_SIZE as i64)) as ptr<Default>
+    extra_defaults_ptr = malloc((extra_numdefaults as i64) * (CONFIG_DEFAULT_SIZE as i64)) as ptr<Default>
+
+    for i in 0 to doom_numdefaults {
+        doom_defaults_ptr[i] = Default {
+            name: configdata_doom_name(i),
+            location: null,
+            kind: configdata_doom_kind(i),
+            untranslated: 0,
+            original_translated: 0,
+            bound: 0
+        }
+    }
+
+    for i in 0 to extra_numdefaults {
+        extra_defaults_ptr[i] = Default {
+            name: configdata_extra_name(i),
+            location: null,
+            kind: configdata_extra_kind(i),
+            untranslated: 0,
+            original_translated: 0,
+            bound: 0
+        }
+    }
+
+    config_tables_ready = 1
+}
+
+function search_collection(defaults: ptr<Default>, numdefaults: i32, name: string) -> ptr<Default> {
+    for i in 0 to numdefaults {
+        if strcmp(name, defaults[i].name) == 0 {
+            return ((defaults as i64) + (i as i64) * (CONFIG_DEFAULT_SIZE as i64)) as ptr<Default>
+        }
+    }
+    return null
+}
+
+function get_default_for_name(name: string) -> ptr<Default> {
+    ensure_config_tables()
+
+    let mut result: ptr<Default> = search_collection(doom_defaults_ptr, doom_numdefaults, name)
+    if (result as i64) == 0 {
+        result = search_collection(extra_defaults_ptr, extra_numdefaults, name)
+    }
+
+    if (result as i64) == 0 {
+        configshim_error_unknown(name)
+    }
+    return result
+}
+
+# ORIGCODE off: no-op (matches doomgeneric m_config.c).
+function save_default_collection(filename: ptr<u8>, defaults: ptr<Default>, numdefaults: i32) -> void {
+    # Keep parameters live so empty stubs stay ABI-shaped.
+    if (filename as i64) == 0 and (defaults as i64) == 0 and numdefaults == 0 {
+        return
+    }
+}
+
+# ORIGCODE off: no-op (matches doomgeneric m_config.c).
+function load_default_collection(filename: ptr<u8>, defaults: ptr<Default>, numdefaults: i32) -> void {
+    if (filename as i64) == 0 and (defaults as i64) == 0 and numdefaults == 0 {
+        return
+    }
+}
+
+function parse_int_parameter(strparm: string) -> i32 {
+    return configshim_parse_int(strparm)
+}
+
+function set_variable(def: ptr<Default>, value: string) -> void {
+    let kind: i32 = def[0].kind
+
+    if kind == CONFIG_DEFAULT_STRING {
+        configshim_store_str(def[0].location, configshim_strdup(value))
+    } elif kind == CONFIG_DEFAULT_INT or kind == CONFIG_DEFAULT_INT_HEX {
+        let loc: ptr<i32> = def[0].location as ptr<i32>
+        loc[0] = parse_int_parameter(value)
+    } elif kind == CONFIG_DEFAULT_KEY {
+        let mut intparm: i32 = parse_int_parameter(value)
+        def[0].untranslated = intparm
+        if intparm >= 0 and intparm < 128 {
+            intparm = scantokey[intparm]
+        } else {
+            intparm = 0
+        }
+        def[0].original_translated = intparm
+        let loc: ptr<i32> = def[0].location as ptr<i32>
+        loc[0] = intparm
+    } elif kind == CONFIG_DEFAULT_FLOAT {
+        configshim_store_f32(def[0].location, configshim_atof(value))
+    }
+}
+
+function get_default_config_dir() -> string {
+    let result: ptr<u8> = malloc(2) as ptr<u8>
+    result[0] = 46 as u8
+    result[1] = 0 as u8
+    return result as string
+}
+
+@flow_api
+function configflow_get_configdir() -> string {
+    if (configdir_storage as i64) == 0 {
+        return ""
+    }
+    return configdir_storage as string
+}
+
+@flow_api
+function configflow_set_configdir(dir: string) -> void {
+    configdir_storage = dir as ptr<u8>
+}
+
+@flow_api
+function M_SetConfigFilenames(main_config: string, extra_config: string) -> void {
+    default_main_config = main_config as ptr<u8>
+    default_extra_config = extra_config as ptr<u8>
+}
+
+@flow_api
+function M_SaveDefaults() -> void {
+    ensure_config_tables()
+    save_default_collection(doom_filename, doom_defaults_ptr, doom_numdefaults)
+    save_default_collection(extra_filename, extra_defaults_ptr, extra_numdefaults)
+}
+
+@flow_api
+function M_SaveDefaultsAlternate(main: string, extra: string) -> void {
+    ensure_config_tables()
+    let orig_main: ptr<u8> = doom_filename
+    let orig_extra: ptr<u8> = extra_filename
+
+    doom_filename = main as ptr<u8>
+    extra_filename = extra as ptr<u8>
+
+    M_SaveDefaults()
+
+    doom_filename = orig_main
+    extra_filename = orig_extra
+}
+
+@flow_api
+function M_LoadDefaults() -> void {
+    ensure_config_tables()
+
+    let mut i: i32 = M_CheckParmWithArgs("-config", 1)
+    if i != 0 {
+        let words: ptr<i64> = argvflow_argv()
+        doom_filename = words[i + 1] as ptr<u8>
+        printf("	default file: %s\n", doom_filename as string)
+    } else {
+        doom_filename = string_join2(configflow_get_configdir(), default_main_config as string) as ptr<u8>
+    }
+
+    printf("saving config in %s\n", doom_filename as string)
+
+    i = M_CheckParmWithArgs("-extraconfig", 1)
+    if i != 0 {
+        let words2: ptr<i64> = argvflow_argv()
+        extra_filename = words2[i + 1] as ptr<u8>
+        printf("        extra configuration file: %s\n", extra_filename as string)
+    } else {
+        extra_filename = string_join2(configflow_get_configdir(), default_extra_config as string) as ptr<u8>
+    }
+
+    load_default_collection(doom_filename, doom_defaults_ptr, doom_numdefaults)
+    load_default_collection(extra_filename, extra_defaults_ptr, extra_numdefaults)
+}
+
+@flow_api
+function M_BindVariable(name: string, location: ptr<void>) -> void {
+    let variable: ptr<Default> = get_default_for_name(name)
+    variable[0].location = location
+    variable[0].bound = 1
+}
+
+@flow_api
+function M_SetVariable(name: string, value: string) -> i32 {
+    let variable: ptr<Default> = get_default_for_name(name)
+
+    if (variable as i64) == 0 or variable[0].bound == 0 {
+        return 0
+    }
+
+    set_variable(variable, value)
+    return 1
+}
+
+@flow_api
+function M_GetIntVariable(name: string) -> i32 {
+    let variable: ptr<Default> = get_default_for_name(name)
+
+    if (variable as i64) == 0 or variable[0].bound == 0 {
+        return 0
+    }
+    if variable[0].kind != CONFIG_DEFAULT_INT and variable[0].kind != CONFIG_DEFAULT_INT_HEX {
+        return 0
+    }
+
+    let loc: ptr<i32> = variable[0].location as ptr<i32>
+    return loc[0]
+}
+
+@flow_api
+function M_GetStrVariable(name: string) -> string {
+    let variable: ptr<Default> = get_default_for_name(name)
+
+    if (variable as i64) == 0 or variable[0].bound == 0 {
+        return null as string
+    }
+    if variable[0].kind != CONFIG_DEFAULT_STRING {
+        return null as string
+    }
+
+    return configshim_load_str(variable[0].location)
+}
+
+@flow_api
+function M_GetFloatVariable(name: string) -> f32 {
+    let variable: ptr<Default> = get_default_for_name(name)
+
+    if (variable as i64) == 0 or variable[0].bound == 0 {
+        return 0.0
+    }
+    if variable[0].kind != CONFIG_DEFAULT_FLOAT {
+        return 0.0
+    }
+
+    return configshim_load_f32(variable[0].location)
+}
+
+@flow_api
+function M_SetConfigDir(dir: string) -> void {
+    if (dir as ptr<u8> as i64) != 0 {
+        configflow_set_configdir(dir)
+    } else {
+        configflow_set_configdir(get_default_config_dir())
+    }
+
+    let cfg: string = configflow_get_configdir()
+    if strcmp(cfg, "") != 0 {
+        printf("Using %s for configuration and saves\n", cfg)
+    }
+
+    M_MakeDirectory(cfg as ptr<u8>)
+}
+
+@flow_api
+function M_GetSaveGameDir(iwadname: string) -> string {
+    # iwadname is unused in the non-ORIGCODE branch (same as C).
+    let _iwad_unused: i64 = iwadname as ptr<u8> as i64
+
+    let cfg: string = configflow_get_configdir()
+
+    if strcmp(cfg, "") == 0 {
+        return configshim_strdup("")
+    }
+
+    # Non-ORIGCODE branch from m_config.c
+    let savegamedir: string = configshim_savegame_dir(cfg)
+    M_MakeDirectory(savegamedir as ptr<u8>)
+    printf("Using %s for savegames\n", savegamedir)
+    return savegamedir
+}

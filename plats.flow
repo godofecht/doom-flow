@@ -1,0 +1,453 @@
+# Platform (elevator) movers, ported from p_plats.c to Flow.
+#
+# plat_t layout is kept identical to p_spec.h (LP64 offsetof):
+#
+#   thinker_t thinker;     0
+#   sector_t* sector;     24
+#   fixed_t   speed;      32
+#   fixed_t   low;        36
+#   fixed_t   high;       40
+#   int       wait;       44
+#   int       count;      48
+#   plat_e    status;     52
+#   plat_e    oldstatus;  56
+#   boolean   crush;      60
+#   int       tag;        64
+#   plattype_e type;      68
+#                  SIZEOF 72
+#
+# activeplats[MAXPLATS] is Flow-owned in spec.flow (specshim_*).
+# Sector / line / side / leveltime go through GEOM_* / STAT_*.
+
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function P_Random() -> i32 }
+extern { function P_AddThinker(thinker: ptr<void>) -> void }
+extern { function P_RemoveThinker(thinker: ptr<void>) -> void }
+extern { function P_FindSectorFromLineTag(line: ptr<void>, start: i32) -> i32 }
+extern { function P_FindLowestFloorSurrounding(sec: ptr<void>) -> i32 }
+extern { function P_FindHighestFloorSurrounding(sec: ptr<void>) -> i32 }
+extern { function P_FindNextHighestFloor(sec: ptr<void>, current: i32) -> i32 }
+extern { function T_MovePlane(sector: ptr<void>, speed: i32, dest: i32, crush: i32, floorOrCeiling: i32, direction: i32) -> i32 }
+extern { function S_StartSound(origin: ptr<void>, sound_id: i32) -> void }
+extern { function I_Error(msg: string) -> void }
+
+extern { function specshim_activeplats() -> ptr<i64> }
+
+extern { function GEOM_sector(i: i32) -> ptr<void> }
+extern { function GEOM_sector_floorheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_set_floorpic(s: ptr<void>, pic: i32) -> void }
+extern { function GEOM_sector_floorpic(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_set_special(s: ptr<void>, v: i32) -> void }
+extern { function GEOM_sector_specialdata(s: ptr<void>) -> ptr<void> }
+extern { function GEOM_sector_set_specialdata(s: ptr<void>, v: ptr<void>) -> void }
+extern { function GEOM_sector_soundorg(s: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_sidenum(line: ptr<void>, side: i32) -> i32 }
+extern { function GEOM_line_tag(ld: ptr<void>) -> i32 }
+extern { function GEOM_side_i_sector(i: i32) -> ptr<void> }
+extern { function THINKER_set_plat_raise(th: ptr<void>) -> void }
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+# Constants from p_spec.h / z_zone.h / m_fixed.h / i_timer.h / sounds.h.
+const PLAT_WAIT: i32 = 3
+const PLAT_SPEED: i32 = 65536
+const PLAT_MAXPLATS: i32 = 30
+const PLAT_PU_LEVSPEC: i32 = 6
+const PLAT_FRACUNIT: i32 = 65536
+const PLAT_TICRATE: i32 = 35
+const PLAT_SIZEOF: i32 = 72
+
+# plat_e
+const PLAT_UP: i32 = 0
+const PLAT_DOWN: i32 = 1
+const PLAT_WAITING: i32 = 2
+const PLAT_IN_STASIS: i32 = 3
+
+# plattype_e
+const PLAT_PERPETUAL_RAISE: i32 = 0
+const PLAT_DOWN_WAIT_UP_STAY: i32 = 1
+const PLAT_RAISE_AND_CHANGE: i32 = 2
+const PLAT_RAISE_TO_NEAREST_AND_CHANGE: i32 = 3
+const PLAT_BLAZE_DWUS: i32 = 4
+
+# result_e
+const PLAT_RES_CRUSHED: i32 = 1
+const PLAT_RES_PASTDEST: i32 = 2
+
+# sfxenum_t
+const PLAT_SFX_PSTART: i32 = 18
+const PLAT_SFX_PSTOP: i32 = 19
+const PLAT_SFX_STNMOV: i32 = 22
+
+# ---- thinker.function -------------------------------------------------
+
+function plat_set_acv_null(obj: i64) -> void {
+    let p: ptr<i64> = (obj + 16) as ptr<i64>
+    p[0] = 0
+}
+
+# ---- plat_t field access ----------------------------------------------
+
+function plat_sector(p: i64) -> ptr<void> {
+    let q: ptr<i64> = (p + 24) as ptr<i64>
+    return q[0] as ptr<void>
+}
+
+function plat_set_sector(p: i64, s: ptr<void>) -> void {
+    let q: ptr<i64> = (p + 24) as ptr<i64>
+    q[0] = s as i64
+}
+
+function plat_speed(p: i64) -> i32 {
+    let q: ptr<i32> = (p + 32) as ptr<i32>
+    return q[0]
+}
+
+function plat_set_speed(p: i64, v: i32) -> void {
+    let q: ptr<i32> = (p + 32) as ptr<i32>
+    q[0] = v
+}
+
+function plat_low(p: i64) -> i32 {
+    let q: ptr<i32> = (p + 36) as ptr<i32>
+    return q[0]
+}
+
+function plat_set_low(p: i64, v: i32) -> void {
+    let q: ptr<i32> = (p + 36) as ptr<i32>
+    q[0] = v
+}
+
+function plat_high(p: i64) -> i32 {
+    let q: ptr<i32> = (p + 40) as ptr<i32>
+    return q[0]
+}
+
+function plat_set_high(p: i64, v: i32) -> void {
+    let q: ptr<i32> = (p + 40) as ptr<i32>
+    q[0] = v
+}
+
+function plat_wait(p: i64) -> i32 {
+    let q: ptr<i32> = (p + 44) as ptr<i32>
+    return q[0]
+}
+
+function plat_set_wait(p: i64, v: i32) -> void {
+    let q: ptr<i32> = (p + 44) as ptr<i32>
+    q[0] = v
+}
+
+@flow_api
+function PLAT_set_wait(obj: ptr<void>, v: i32) -> void {
+    plat_set_wait(obj as i64, v)
+}
+
+function plat_count(p: i64) -> i32 {
+    let q: ptr<i32> = (p + 48) as ptr<i32>
+    return q[0]
+}
+
+function plat_set_count(p: i64, v: i32) -> void {
+    let q: ptr<i32> = (p + 48) as ptr<i32>
+    q[0] = v
+}
+
+function plat_status(p: i64) -> i32 {
+    let q: ptr<i32> = (p + 52) as ptr<i32>
+    return q[0]
+}
+
+function plat_set_status(p: i64, v: i32) -> void {
+    let q: ptr<i32> = (p + 52) as ptr<i32>
+    q[0] = v
+}
+
+function plat_oldstatus(p: i64) -> i32 {
+    let q: ptr<i32> = (p + 56) as ptr<i32>
+    return q[0]
+}
+
+function plat_set_oldstatus(p: i64, v: i32) -> void {
+    let q: ptr<i32> = (p + 56) as ptr<i32>
+    q[0] = v
+}
+
+function plat_crush(p: i64) -> i32 {
+    let q: ptr<i32> = (p + 60) as ptr<i32>
+    return q[0]
+}
+
+function plat_set_crush(p: i64, v: i32) -> void {
+    let q: ptr<i32> = (p + 60) as ptr<i32>
+    q[0] = v
+}
+
+function plat_tag(p: i64) -> i32 {
+    let q: ptr<i32> = (p + 64) as ptr<i32>
+    return q[0]
+}
+
+function plat_set_tag(p: i64, v: i32) -> void {
+    let q: ptr<i32> = (p + 64) as ptr<i32>
+    q[0] = v
+}
+
+function plat_type(p: i64) -> i32 {
+    let q: ptr<i32> = (p + 68) as ptr<i32>
+    return q[0]
+}
+
+function plat_set_type(p: i64, v: i32) -> void {
+    let q: ptr<i32> = (p + 68) as ptr<i32>
+    q[0] = v
+}
+
+# ---- active list / thinker --------------------------------------------
+
+@flow_api
+function T_PlatRaise(plat: ptr<void>) -> void {
+    let p: i64 = plat as i64
+    let status: i32 = plat_status(p)
+    let sec: ptr<void> = plat_sector(p)
+    let org: ptr<void> = GEOM_sector_soundorg(sec)
+
+    if status == PLAT_UP {
+        let res: i32 = T_MovePlane(sec, plat_speed(p), plat_high(p), plat_crush(p), 0, 1)
+        let ty: i32 = plat_type(p)
+
+        if ty == PLAT_RAISE_AND_CHANGE or ty == PLAT_RAISE_TO_NEAREST_AND_CHANGE {
+            if (STAT_leveltime() & 7) == 0 {
+                S_StartSound(org, PLAT_SFX_STNMOV)
+            }
+        }
+
+        if res == PLAT_RES_CRUSHED and plat_crush(p) == 0 {
+            plat_set_count(p, plat_wait(p))
+            plat_set_status(p, PLAT_DOWN)
+            S_StartSound(org, PLAT_SFX_PSTART)
+        } else {
+            if res == PLAT_RES_PASTDEST {
+                plat_set_count(p, plat_wait(p))
+                plat_set_status(p, PLAT_WAITING)
+                S_StartSound(org, PLAT_SFX_PSTOP)
+
+                if ty == PLAT_BLAZE_DWUS or ty == PLAT_DOWN_WAIT_UP_STAY {
+                    P_RemoveActivePlat(plat)
+                } else {
+                    if ty == PLAT_RAISE_AND_CHANGE or ty == PLAT_RAISE_TO_NEAREST_AND_CHANGE {
+                        P_RemoveActivePlat(plat)
+                    }
+                }
+            }
+        }
+    } else {
+        if status == PLAT_DOWN {
+            let res2: i32 = T_MovePlane(sec, plat_speed(p), plat_low(p), 0, 0, 0 - 1)
+            if res2 == PLAT_RES_PASTDEST {
+                plat_set_count(p, plat_wait(p))
+                plat_set_status(p, PLAT_WAITING)
+                S_StartSound(org, PLAT_SFX_PSTOP)
+            }
+        } else {
+            if status == PLAT_WAITING {
+                let c: i32 = plat_count(p) - 1
+                plat_set_count(p, c)
+                if c == 0 {
+                    if GEOM_sector_floorheight(sec) == plat_low(p) {
+                        plat_set_status(p, PLAT_UP)
+                    } else {
+                        plat_set_status(p, PLAT_DOWN)
+                    }
+                    S_StartSound(org, PLAT_SFX_PSTART)
+                }
+                # fall through into in_stasis (vanilla has no break)
+            }
+            # PLAT_IN_STASIS: break
+        }
+    }
+}
+
+@flow_api
+function EV_DoPlat(line: ptr<void>, plattype: i32, amount: i32) -> i32 {
+    let mut secnum: i32 = 0 - 1
+    let mut rtn: i32 = 0
+
+    if plattype == PLAT_PERPETUAL_RAISE {
+        P_ActivateInStasis(GEOM_line_tag(line))
+    }
+
+    let mut looping: bool = true
+    while looping {
+        secnum = P_FindSectorFromLineTag(line, secnum)
+        if secnum < 0 {
+            looping = false
+        } else {
+            let sec: ptr<void> = GEOM_sector(secnum)
+            if (GEOM_sector_specialdata(sec) as i64) == 0 {
+                rtn = 1
+                let plat: ptr<void> = Z_Malloc(PLAT_SIZEOF, PLAT_PU_LEVSPEC, 0 as ptr<void>)
+                P_AddThinker(plat)
+
+                let p: i64 = plat as i64
+                plat_set_type(p, plattype)
+                plat_set_sector(p, sec)
+                GEOM_sector_set_specialdata(sec, plat)
+                THINKER_set_plat_raise(plat)
+                plat_set_crush(p, 0)
+                plat_set_tag(p, GEOM_line_tag(line))
+
+                if plattype == PLAT_RAISE_TO_NEAREST_AND_CHANGE {
+                    plat_set_speed(p, PLAT_SPEED / 2)
+                    let side_sec: ptr<void> = GEOM_side_i_sector(GEOM_line_sidenum(line, 0))
+                    GEOM_sector_set_floorpic(sec, GEOM_sector_floorpic(side_sec))
+                    plat_set_high(p, P_FindNextHighestFloor(sec, GEOM_sector_floorheight(sec)))
+                    plat_set_wait(p, 0)
+                    plat_set_status(p, PLAT_UP)
+                    GEOM_sector_set_special(sec, 0)
+                    S_StartSound(GEOM_sector_soundorg(sec), PLAT_SFX_STNMOV)
+                } else {
+                    if plattype == PLAT_RAISE_AND_CHANGE {
+                        plat_set_speed(p, PLAT_SPEED / 2)
+                        let side_sec2: ptr<void> = GEOM_side_i_sector(GEOM_line_sidenum(line, 0))
+                        GEOM_sector_set_floorpic(sec, GEOM_sector_floorpic(side_sec2))
+                        plat_set_high(p, GEOM_sector_floorheight(sec) + amount * PLAT_FRACUNIT)
+                        plat_set_wait(p, 0)
+                        plat_set_status(p, PLAT_UP)
+                        S_StartSound(GEOM_sector_soundorg(sec), PLAT_SFX_STNMOV)
+                    } else {
+                        if plattype == PLAT_DOWN_WAIT_UP_STAY {
+                            plat_set_speed(p, PLAT_SPEED * 4)
+                            plat_set_low(p, P_FindLowestFloorSurrounding(sec))
+                            if plat_low(p) > GEOM_sector_floorheight(sec) {
+                                plat_set_low(p, GEOM_sector_floorheight(sec))
+                            }
+                            plat_set_high(p, GEOM_sector_floorheight(sec))
+                            plat_set_wait(p, PLAT_TICRATE * PLAT_WAIT)
+                            plat_set_status(p, PLAT_DOWN)
+                            S_StartSound(GEOM_sector_soundorg(sec), PLAT_SFX_PSTART)
+                        } else {
+                            if plattype == PLAT_BLAZE_DWUS {
+                                plat_set_speed(p, PLAT_SPEED * 8)
+                                plat_set_low(p, P_FindLowestFloorSurrounding(sec))
+                                if plat_low(p) > GEOM_sector_floorheight(sec) {
+                                    plat_set_low(p, GEOM_sector_floorheight(sec))
+                                }
+                                plat_set_high(p, GEOM_sector_floorheight(sec))
+                                plat_set_wait(p, PLAT_TICRATE * PLAT_WAIT)
+                                plat_set_status(p, PLAT_DOWN)
+                                S_StartSound(GEOM_sector_soundorg(sec), PLAT_SFX_PSTART)
+                            } else {
+                                if plattype == PLAT_PERPETUAL_RAISE {
+                                    plat_set_speed(p, PLAT_SPEED)
+                                    plat_set_low(p, P_FindLowestFloorSurrounding(sec))
+                                    if plat_low(p) > GEOM_sector_floorheight(sec) {
+                                        plat_set_low(p, GEOM_sector_floorheight(sec))
+                                    }
+                                    plat_set_high(p, P_FindHighestFloorSurrounding(sec))
+                                    if plat_high(p) < GEOM_sector_floorheight(sec) {
+                                        plat_set_high(p, GEOM_sector_floorheight(sec))
+                                    }
+                                    plat_set_wait(p, PLAT_TICRATE * PLAT_WAIT)
+                                    plat_set_status(p, P_Random() & 1)
+                                    S_StartSound(GEOM_sector_soundorg(sec), PLAT_SFX_PSTART)
+                                }
+                            }
+                        }
+                    }
+                }
+                P_AddActivePlat(plat)
+            }
+        }
+    }
+    return rtn
+}
+
+@flow_api
+function P_ActivateInStasis(tag: i32) -> void {
+    let plats: ptr<i64> = specshim_activeplats()
+    let mut i: i32 = 0
+    while i < PLAT_MAXPLATS {
+        let ap: i64 = plats[i]
+        if ap != 0 {
+            if plat_tag(ap) == tag and plat_status(ap) == PLAT_IN_STASIS {
+                plat_set_status(ap, plat_oldstatus(ap))
+                THINKER_set_plat_raise(ap as ptr<void>)
+            }
+        }
+        i = i + 1
+    }
+}
+
+@flow_api
+function EV_StopPlat(line: ptr<void>) -> void {
+    let ltag: i32 = GEOM_line_tag(line)
+    let plats: ptr<i64> = specshim_activeplats()
+    let mut j: i32 = 0
+    while j < PLAT_MAXPLATS {
+        let ap: i64 = plats[j]
+        if ap != 0 {
+            if plat_status(ap) != PLAT_IN_STASIS and plat_tag(ap) == ltag {
+                plat_set_oldstatus(ap, plat_status(ap))
+                plat_set_status(ap, PLAT_IN_STASIS)
+                plat_set_acv_null(ap)
+            }
+        }
+        j = j + 1
+    }
+}
+
+@flow_api
+function P_AddActivePlat(plat: ptr<void>) -> void {
+    let plats: ptr<i64> = specshim_activeplats()
+    let mut i: i32 = 0
+    let mut found: bool = false
+    while i < PLAT_MAXPLATS and !found {
+        if plats[i] == 0 {
+            plats[i] = plat as i64
+            found = true
+        }
+        i = i + 1
+    }
+    if !found {
+        I_Error("P_AddActivePlat: no more plats!")
+    }
+}
+
+@flow_api
+function P_RemoveActivePlat(plat: ptr<void>) -> void {
+    let plats: ptr<i64> = specshim_activeplats()
+    let mut i: i32 = 0
+    let mut found: bool = false
+    while i < PLAT_MAXPLATS and !found {
+        if (plat as i64) == plats[i] {
+            let ap: i64 = plats[i]
+            GEOM_sector_set_specialdata(plat_sector(ap), 0 as ptr<void>)
+            P_RemoveThinker(ap as ptr<void>)
+            plats[i] = 0
+            found = true
+        }
+        i = i + 1
+    }
+    if !found {
+        I_Error("P_RemoveActivePlat: can't find plat!")
+    }
+}

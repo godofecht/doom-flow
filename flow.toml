@@ -1,0 +1,40 @@
+# doom-flow — build with Flow's package native linker only:
+#
+#   cd /path/to/doom-flow
+#   ~/flow/flow build-native
+#   DOOMFLOW_ARGS="-timedemo demo1" ./build/doom
+#
+# Assumes the Flow checkout lives next to this repo as ../flow
+# (override by editing [native].sources if yours is elsewhere).
+
+[package]
+name = "doom"
+version = "0.1.0"
+description = "Doom engine ported to Flow"
+entry = "doom.flow"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+
+[dev-dependencies]
+
+[native]
+sources = [
+    "../flow/runtime/flow_rt_support.c",
+    "../flow/runtime/gfx_macos.m",
+]
+frameworks = [
+    "Cocoa",
+    "CoreGraphics",
+    "QuartzCore",
+    "CoreFoundation",
+]
+libs = ["m"]
+cflags = [
+    "-O2",
+    "-fno-omit-frame-pointer",
+    "-DNORMALUNIX",
+    "-DSNDSERV",
+    "-D_DEFAULT_SOURCE",
+]
+ldflags = []

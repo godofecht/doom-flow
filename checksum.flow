@@ -1,0 +1,103 @@
+# WAD directory checksum, ported from w_checksum.c to Flow.
+#
+# Walks lumpinfo[] (owned by wad.flow) and folds each lump's name /
+# owning-file index / position / size into a SHA-1 digest. lumpinfo_t
+# layout matches wad.flow:
+#
+#   offset  size  field
+#   0       8     name
+#   8       8     wad_file *
+#   16      4     position
+#   20      4     size
+#   24      8     cache
+#   32      8     next
+#                 stride 40
+
+extern { function realloc(p: ptr<void>, n: i64) -> ptr<void> }
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+extern { function free(p: ptr<void>) -> void }
+extern { function M_StringCopy(dest: ptr<u8>, src: ptr<u8>, dest_size: i64) -> i32 }
+
+extern { function SHA1_Init(hd: ptr<u8>) -> void }
+extern { function SHA1_UpdateInt32(context: ptr<u8>, val: u32) -> void }
+extern { function SHA1_UpdateString(context: ptr<u8>, str: ptr<u8>) -> void }
+extern { function SHA1_Final(digest: ptr<u8>, hd: ptr<u8>) -> void }
+
+# C-side accessors into wad.flow's lump directory.
+extern { function wadflow_lumpinfo() -> ptr<u8> }
+extern { function wadflow_numlumps() -> u32 }
+
+# Prefixed: LUMP_STRIDE is also defined in wad.flow (one Flow TU).
+const CS_LUMP_STRIDE: i32 = 40
+const SHA1_CTX_SIZE: i32 = 92
+
+let mut open_wadfiles: ptr<i64> = null
+let mut num_open_wadfiles: i32 = 0
+
+# Scratch name buffer (char buf[9] in ChecksumAddLump).
+let mut cs_namebuf: ptr<u8> = null
+
+function cs_lump_name(base: ptr<u8>, i: i32) -> ptr<u8> {
+    return ((base as i64) + (i * CS_LUMP_STRIDE) as i64) as ptr<u8>
+}
+
+function cs_lump_wadfile(base: ptr<u8>, i: i32) -> i64 {
+    let words: ptr<i64> = base as ptr<i64>
+    return words[i * 5 + 1]
+}
+
+function cs_lump_position(base: ptr<u8>, i: i32) -> i32 {
+    let ints: ptr<i32> = base as ptr<i32>
+    return ints[i * 10 + 4]
+}
+
+function cs_lump_size(base: ptr<u8>, i: i32) -> i32 {
+    let ints: ptr<i32> = base as ptr<i32>
+    return ints[i * 10 + 5]
+}
+
+function GetFileNumber(wad_handle: i64) -> i32 {
+    for i in 0 to num_open_wadfiles {
+        if open_wadfiles[i] == wad_handle {
+            return i
+        }
+    }
+
+    # Not found: grow the list and append.
+    open_wadfiles = realloc(
+        open_wadfiles as ptr<void>,
+        (8 * (num_open_wadfiles + 1)) as i64
+    ) as ptr<i64>
+    open_wadfiles[num_open_wadfiles] = wad_handle
+    let result: i32 = num_open_wadfiles
+    num_open_wadfiles = num_open_wadfiles + 1
+    return result
+}
+
+function ChecksumAddLump(sha1_context: ptr<u8>, base: ptr<u8>, i: i32) -> void {
+    if (cs_namebuf as i64) == 0 {
+        cs_namebuf = calloc(9, 1) as ptr<u8>
+    }
+    M_StringCopy(cs_namebuf, cs_lump_name(base, i), 9)
+    SHA1_UpdateString(sha1_context, cs_namebuf)
+    SHA1_UpdateInt32(sha1_context, GetFileNumber(cs_lump_wadfile(base, i)) as u32)
+    SHA1_UpdateInt32(sha1_context, cs_lump_position(base, i) as u32)
+    SHA1_UpdateInt32(sha1_context, cs_lump_size(base, i) as u32)
+}
+
+@flow_api
+function W_Checksum(digest: ptr<u8>) -> void {
+    let hd: ptr<u8> = calloc(SHA1_CTX_SIZE as i64, 1) as ptr<u8>
+    SHA1_Init(hd)
+
+    num_open_wadfiles = 0
+
+    let base: ptr<u8> = wadflow_lumpinfo()
+    let n: i32 = wadflow_numlumps() as i32
+    for i in 0 to n {
+        ChecksumAddLump(hd, base, i)
+    }
+
+    SHA1_Final(digest, hd)
+    free(hd as ptr<void>)
+}

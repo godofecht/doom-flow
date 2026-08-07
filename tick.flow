@@ -1,0 +1,274 @@
+# Thinker list and level ticker, ported from p_tick.c to Flow.
+#
+# thinkercap and leveltime are Flow-owned let mut state with @flow_api
+# accessors. thinker_t link/function fields use explicit LP64 offsets;
+# acp1 dispatch goes through sysshim_call_acp1 (platform_stub.c).
+#
+# Measured LP64 layout (clang -I doomgeneric -DNORMALUNIX):
+#   thinker_t: sizeof 24
+#     prev       @ 0
+#     next       @ 8
+#     function   @ 16  (actionf_t, 8 bytes)
+
+# ---- engine C ---------------------------------------------------------
+
+extern { function Z_Free(p: ptr<void>) -> void }
+extern { function P_PlayerThink(player: ptr<void>) -> void }
+extern { function P_UpdateSpecials() -> void }
+extern { function P_RespawnSpecials() -> void }
+extern { function sysshim_call_acp1(fn: ptr<void>, arg: ptr<void>) -> void }
+
+extern { function P_MobjThinker(mobj: ptr<void>) -> void }
+extern { function T_MoveFloor(floor: ptr<void>) -> void }
+extern { function T_VerticalDoor(door: ptr<void>) -> void }
+extern { function T_MoveCeiling(ceiling: ptr<void>) -> void }
+extern { function T_PlatRaise(plat: ptr<void>) -> void }
+extern { function T_LightFlash(flash: ptr<void>) -> void }
+extern { function T_StrobeFlash(flash: ptr<void>) -> void }
+extern { function T_Glow(g: ptr<void>) -> void }
+
+extern { function STAT_paused() -> i32 }
+extern { function STAT_menuactive() -> i32 }
+extern { function STAT_demoplayback() -> i32 }
+extern { function PLAYER_viewz(p: ptr<void>) -> i32 }
+extern { function PLAYER_at(i: i32) -> ptr<void> }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_playeringame(i: i32) -> i32 }
+
+# ---- constants --------------------------------------------------------
+
+const TICK_MAXPLAYERS: i32 = 4
+const TICK_SIZEOF_THINKER: i32 = 24
+const TICK_THINKER_FN: i32 = 16
+
+# ---- globals (was tick_shim.c / p_tick.c) ------------------------------
+
+let mut leveltime: i32 = 0
+let mut thinkercap: array<i64, 3> = [0, 0, 0]
+
+@flow_api
+function tick_bool(cond: i32) -> i32 {
+    if cond != 0 {
+        return 1
+    }
+    return 0
+}
+
+@flow_api
+function STAT_leveltime() -> i32 { return leveltime }
+
+@flow_api
+function STAT_set_leveltime(v: i32) -> void { leveltime = v }
+
+# ---- shared thinker_t accessors (THINKER_*) ---------------------------
+
+@flow_api
+function THINKER_cap() -> ptr<void> {
+    return &thinkercap as ptr<void>
+}
+
+@flow_api
+function THINKER_next(th: ptr<void>) -> ptr<void> {
+    let p: ptr<i64> = ((th as i64) + 8) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+@flow_api
+function THINKER_prev(th: ptr<void>) -> ptr<void> {
+    let p: ptr<i64> = (th as i64) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+@flow_api
+function THINKER_set_next(th: ptr<void>, n: ptr<void>) -> void {
+    let p: ptr<i64> = ((th as i64) + 8) as ptr<i64>
+    p[0] = n as i64
+}
+
+@flow_api
+function THINKER_set_prev(th: ptr<void>, p: ptr<void>) -> void {
+    let q: ptr<i64> = (th as i64) as ptr<i64>
+    q[0] = p as i64
+}
+
+@flow_api
+function THINKER_acp1(th: ptr<void>) -> ptr<void> {
+    let p: ptr<i64> = ((th as i64) + TICK_THINKER_FN as i64) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+@flow_api
+function THINKER_set_acp1(th: ptr<void>, fn: ptr<void>) -> void {
+    let p: ptr<i64> = ((th as i64) + TICK_THINKER_FN as i64) as ptr<i64>
+    p[0] = fn as i64
+}
+
+@flow_api
+function THINKER_is_mobj(th: ptr<void>) -> i32 {
+    return tick_bool((THINKER_acp1(th) as i64) == (P_MobjThinker as i64))
+}
+
+@flow_api
+function THINKER_is_null(th: ptr<void>) -> i32 {
+    return tick_bool((THINKER_acp1(th) as i64) == 0)
+}
+
+@flow_api
+function THINKER_is_removed(th: ptr<void>) -> i32 {
+    let p: ptr<i64> = ((th as i64) + TICK_THINKER_FN as i64) as ptr<i64>
+    if p[0] == (0 - 1) as i64 {
+        return 1
+    }
+    return 0
+}
+
+@flow_api
+function THINKER_mark_removed(th: ptr<void>) -> void {
+    let p: ptr<i64> = ((th as i64) + TICK_THINKER_FN as i64) as ptr<i64>
+    p[0] = 0 - 1
+}
+
+@flow_api
+function THINKER_set_mobj(th: ptr<void>) -> void {
+    THINKER_set_acp1(th, P_MobjThinker as ptr<void>)
+}
+
+@flow_api
+function THINKER_set_move_floor(th: ptr<void>) -> void {
+    THINKER_set_acp1(th, T_MoveFloor as ptr<void>)
+}
+
+@flow_api
+function THINKER_set_vertical_door(th: ptr<void>) -> void {
+    THINKER_set_acp1(th, T_VerticalDoor as ptr<void>)
+}
+
+@flow_api
+function THINKER_set_move_ceiling(th: ptr<void>) -> void {
+    THINKER_set_acp1(th, T_MoveCeiling as ptr<void>)
+}
+
+@flow_api
+function THINKER_set_plat_raise(th: ptr<void>) -> void {
+    THINKER_set_acp1(th, T_PlatRaise as ptr<void>)
+}
+
+@flow_api
+function THINKER_is_vertical_door(th: ptr<void>) -> i32 {
+    return tick_bool((THINKER_acp1(th) as i64) == (T_VerticalDoor as i64))
+}
+
+@flow_api
+function THINKER_is_plat_raise(th: ptr<void>) -> i32 {
+    return tick_bool((THINKER_acp1(th) as i64) == (T_PlatRaise as i64))
+}
+
+@flow_api
+function THINKER_is_move_ceiling(th: ptr<void>) -> i32 {
+    return tick_bool((THINKER_acp1(th) as i64) == (T_MoveCeiling as i64))
+}
+
+@flow_api
+function THINKER_is_move_floor(th: ptr<void>) -> i32 {
+    return tick_bool((THINKER_acp1(th) as i64) == (T_MoveFloor as i64))
+}
+
+@flow_api
+function THINKER_is_light_flash(th: ptr<void>) -> i32 {
+    return tick_bool((THINKER_acp1(th) as i64) == (T_LightFlash as i64))
+}
+
+@flow_api
+function THINKER_is_strobe_flash(th: ptr<void>) -> i32 {
+    return tick_bool((THINKER_acp1(th) as i64) == (T_StrobeFlash as i64))
+}
+
+@flow_api
+function THINKER_is_glow(th: ptr<void>) -> i32 {
+    return tick_bool((THINKER_acp1(th) as i64) == (T_Glow as i64))
+}
+
+@flow_api
+function THINKER_set_light_flash(th: ptr<void>) -> void {
+    THINKER_set_acp1(th, T_LightFlash as ptr<void>)
+}
+
+@flow_api
+function THINKER_set_strobe_flash(th: ptr<void>) -> void {
+    THINKER_set_acp1(th, T_StrobeFlash as ptr<void>)
+}
+
+@flow_api
+function THINKER_set_glow(th: ptr<void>) -> void {
+    THINKER_set_acp1(th, T_Glow as ptr<void>)
+}
+
+# ---- thinkers ---------------------------------------------------------
+
+@flow_api
+function P_InitThinkers() -> void {
+    let cap: ptr<void> = THINKER_cap()
+    THINKER_set_prev(cap, cap)
+    THINKER_set_next(cap, cap)
+}
+
+@flow_api
+function P_AddThinker(thinker: ptr<void>) -> void {
+    let cap: ptr<void> = THINKER_cap()
+    let prev: ptr<void> = THINKER_prev(cap)
+    THINKER_set_next(prev, thinker)
+    THINKER_set_next(thinker, cap)
+    THINKER_set_prev(thinker, prev)
+    THINKER_set_prev(cap, thinker)
+}
+
+@flow_api
+function P_RemoveThinker(thinker: ptr<void>) -> void {
+    THINKER_mark_removed(thinker)
+}
+
+@flow_api
+function P_AllocateThinker(thinker: ptr<void>) -> void {
+}
+
+function P_RunThinkers() -> void {
+    let cap: ptr<void> = THINKER_cap()
+    let mut currentthinker: ptr<void> = THINKER_next(cap)
+
+    while (currentthinker as i64) != (cap as i64) {
+        if THINKER_is_removed(currentthinker) != 0 {
+            let next: ptr<void> = THINKER_next(currentthinker)
+            let prev: ptr<void> = THINKER_prev(currentthinker)
+            THINKER_set_prev(next, prev)
+            THINKER_set_next(prev, next)
+            Z_Free(currentthinker)
+        } else {
+            sysshim_call_acp1(THINKER_acp1(currentthinker), currentthinker)
+        }
+        currentthinker = THINKER_next(currentthinker)
+    }
+}
+
+@flow_api
+function P_Ticker() -> void {
+    if STAT_paused() != 0 {
+        return
+    }
+
+    if STAT_netgame() == 0 and STAT_menuactive() != 0 and STAT_demoplayback() == 0 and PLAYER_viewz(PLAYER_at(STAT_consoleplayer())) != 1 {
+        return
+    }
+
+    for i in 0 to TICK_MAXPLAYERS {
+        if STAT_playeringame(i) != 0 {
+            P_PlayerThink(PLAYER_at(i))
+        }
+    }
+
+    P_RunThinkers()
+    P_UpdateSpecials()
+    P_RespawnSpecials()
+
+    leveltime = leveltime + 1
+}

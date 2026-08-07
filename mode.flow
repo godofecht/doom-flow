@@ -1,0 +1,158 @@
+# Game mode/mission/version validation, ported from d_mode.c.
+#
+# Enum values from d_mode.h:
+#   GameMission_t: doom=0 doom2=1 pack_tnt=2 pack_plut=3 pack_chex=4
+#                  pack_hacx=5 heretic=6 hexen=7 strife=8 none=9
+#   GameMode_t:    shareware=0 registered=1 commercial=2 retail=3
+#                  indetermined=4
+#   GameVersion_t: exe_doom_1_2=0 exe_doom_1_666=1 exe_doom_1_7=2
+#                  exe_doom_1_8=3 exe_doom_1_9=4 exe_hacx=5 exe_ultimate=6
+#                  exe_final=7 exe_final2=8 exe_chex=9 exe_heretic_1_3=10
+#                  exe_hexen_1_1=11 exe_strife_1_2=12 exe_strife_1_31=13
+
+# valid_modes[] flattened: mission, mode, max episode, max map.
+let mut valid_modes_tab: array<i32, 52> = [
+    4, 0, 1, 5,
+    0, 0, 1, 9,
+    0, 1, 3, 9,
+    0, 3, 4, 9,
+    1, 2, 1, 32,
+    2, 2, 1, 32,
+    3, 2, 1, 32,
+    5, 2, 1, 32,
+    6, 0, 1, 9,
+    6, 1, 3, 9,
+    6, 3, 5, 9,
+    7, 2, 1, 60,
+    8, 2, 1, 34
+]
+
+function valid_mode_row(i: i32, f: i32) -> i32 {
+    return valid_modes_tab[i * 4 + f]
+}
+
+const VALID_MODES_TOTAL: i32 = 13
+
+@flow_api
+function D_ValidGameMode(mission: i32, mode: i32) -> i32 {
+    let mut i: i32 = 0
+    while i < VALID_MODES_TOTAL {
+        if valid_mode_row(i, 1) == mode and valid_mode_row(i, 0) == mission {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+@flow_api
+function D_ValidEpisodeMap(mission: i32, mode: i32, episode: i32, map: i32) -> i32 {
+    # Hacks for Heretic secret episodes, as in the original.
+    if mission == 6 {
+        if mode == 3 and episode == 6 {
+            if map >= 1 and map <= 3 {
+                return 1
+            }
+            return 0
+        }
+        if mode == 1 and episode == 4 {
+            if map == 1 {
+                return 1
+            }
+            return 0
+        }
+    }
+
+    let mut i: i32 = 0
+    while i < VALID_MODES_TOTAL {
+        if mission == valid_mode_row(i, 0) and mode == valid_mode_row(i, 1) {
+            if episode >= 1 and episode <= valid_mode_row(i, 2) and map >= 1 and map <= valid_mode_row(i, 3) {
+                return 1
+            }
+            return 0
+        }
+        i = i + 1
+    }
+
+    return 0
+}
+
+@flow_api
+function D_GetNumEpisodes(mission: i32, mode: i32) -> i32 {
+    let mut episode: i32 = 1
+    while D_ValidEpisodeMap(mission, mode, episode, 1) != 0 {
+        episode = episode + 1
+    }
+    return episode - 1
+}
+
+# valid_versions[] flattened: mission, version.
+let mut valid_versions_tab: array<i32, 20> = [
+    0, 4,
+    0, 5,
+    0, 6,
+    0, 7,
+    0, 8,
+    0, 9,
+    6, 10,
+    7, 11,
+    8, 12,
+    8, 13
+]
+
+@flow_api
+function D_ValidGameVersion(mission: i32, version: i32) -> i32 {
+    let mut m: i32 = mission
+    # All Doom variants can use the Doom versions.
+    if m == 1 or m == 3 or m == 2 or m == 5 or m == 4 {
+        m = 0
+    }
+    let mut i: i32 = 0
+    while i < 10 {
+        if valid_versions_tab[i * 2] == m and valid_versions_tab[i * 2 + 1] == version {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+@flow_api
+function D_IsEpisodeMap(mission: i32) -> i32 {
+    if mission == 0 or mission == 6 or mission == 4 {
+        return 1
+    }
+    return 0
+}
+
+@flow_api
+function D_GameMissionString(mission: i32) -> string {
+    if mission == 0 {
+        return "doom"
+    }
+    if mission == 1 {
+        return "doom2"
+    }
+    if mission == 2 {
+        return "tnt"
+    }
+    if mission == 3 {
+        return "plutonia"
+    }
+    if mission == 5 {
+        return "hacx"
+    }
+    if mission == 4 {
+        return "chex"
+    }
+    if mission == 6 {
+        return "heretic"
+    }
+    if mission == 7 {
+        return "hexen"
+    }
+    if mission == 8 {
+        return "strife"
+    }
+    return "none"
+}

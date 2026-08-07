@@ -1,0 +1,862 @@
+# Texture / flat / sprite-lump / colormap data, ported from r_data.c.
+#
+# Shared globals (firstflat/lastflat/numflats, first/last/numspritelumps,
+# colormaps, textureheight, spritewidth/offset/topoffset, flattranslation,
+# texturetranslation, …) are Flow-owned below. Module-private texture_t
+# tables stay here.
+#
+# texture_t LP64 layout (verified offsetof):
+#   name[8] 0, width 8, height 10, index 12, next 16,
+#   patchcount 24, patches[] 28.
+#   sizeof(texture_t with 1 patch) = 40
+# texpatch_t: originx 0, originy 2, patch 4; sizeof 8.
+# maptexture_t / mappatch_t are PACKEDATTR from the WAD.
+
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+extern { function memset(dst: ptr<void>, c: i32, n: i64) -> ptr<void> }
+extern { function printf(fmt: string) -> i32 }
+extern { function printf(fmt: string, s: string) -> i32 }
+
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function Z_Free(p: ptr<void>) -> void }
+extern { function Z_ChangeTag2(p: ptr<void>, tag: i32, file: string, line: i32) -> void }
+
+extern { function W_CacheLumpName(name: string, tag: i32) -> ptr<void> }
+extern { function W_CacheLumpNum(lumpnum: i32, tag: i32) -> ptr<void> }
+extern { function W_ReleaseLumpName(name: string) -> void }
+extern { function W_CheckNumForName(name: string) -> i32 }
+extern { function W_GetNumForName(name: string) -> i32 }
+extern { function W_LumpLength(lump: u32) -> i32 }
+extern { function W_LumpNameHash(s: ptr<u8>) -> u32 }
+
+extern { function M_StringCopy(dest: ptr<u8>, src: ptr<u8>, dest_size: i64) -> i32 }
+extern { function I_Error(msg: string) -> void }
+extern { function I_ConsoleStdout() -> i32 }
+
+# ---- engine struct accessors (things_shim / setup) --------------------
+
+extern { function GEOM_sector(secnum: i32) -> ptr<void> }
+extern { function GEOM_sector_floorpic(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_ceilingpic(s: ptr<void>) -> i32 }
+extern { function thingshim_numsprites() -> i32 }
+extern { function thingshim_sprite_numframes(i: i32) -> i32 }
+extern { function thingshim_sprite_frame_lump(sprite: i32, frame: i32, rot: i32) -> i32 }
+
+# ---- constants (RDATA_ prefix; sources in comments) -------------------
+
+# z_zone.h
+const RDATA_PU_STATIC: i32 = 1
+const RDATA_PU_CACHE: i32 = 8
+
+# m_fixed.h
+const RDATA_FRACBITS: i32 = 16
+
+# texture_t / texpatch_t sizes (LP64)
+const RDATA_SIZEOF_TEXTURE: i32 = 40
+const RDATA_SIZEOF_TEXPATCH: i32 = 8
+const RDATA_TEX_NAME: i32 = 0
+const RDATA_TEX_WIDTH: i32 = 8
+const RDATA_TEX_HEIGHT: i32 = 10
+const RDATA_TEX_INDEX: i32 = 12
+const RDATA_TEX_NEXT: i32 = 16
+const RDATA_TEX_PATCHCOUNT: i32 = 24
+const RDATA_TEX_PATCHES: i32 = 28
+const RDATA_TP_ORIGINX: i32 = 0
+const RDATA_TP_ORIGINY: i32 = 2
+const RDATA_TP_PATCH: i32 = 4
+
+# maptexture_t / mappatch_t (PACKEDATTR)
+const RDATA_MT_WIDTH: i32 = 12
+const RDATA_MT_HEIGHT: i32 = 14
+const RDATA_MT_PATCHCOUNT: i32 = 20
+const RDATA_MT_PATCHES: i32 = 22
+const RDATA_SIZEOF_MAPPATCH: i32 = 10
+const RDATA_MP_ORIGINX: i32 = 0
+const RDATA_MP_ORIGINY: i32 = 2
+const RDATA_MP_PATCH: i32 = 4
+
+# patch_t
+const RDATA_PATCH_WIDTH: i32 = 0
+const RDATA_PATCH_LEFTOFFSET: i32 = 4
+const RDATA_PATCH_TOPOFFSET: i32 = 6
+const RDATA_PATCH_COLUMNOFS: i32 = 8
+
+# ---- module-private texture tables ------------------------------------
+
+let mut rdata_numtextures: i32 = 0
+let mut rdata_textures: ptr<i64> = null
+let mut rdata_textures_hashtable: ptr<i64> = null
+let mut rdata_texturewidthmask: ptr<i32> = null
+let mut rdata_texturecompositesize: ptr<i32> = null
+let mut rdata_texturecolumnlump: ptr<i64> = null
+let mut rdata_texturecolumnofs: ptr<i64> = null
+let mut rdata_texturecomposite: ptr<i64> = null
+
+let mut rdata_flatmemory: i32 = 0
+let mut rdata_texturememory: i32 = 0
+let mut rdata_spritememory: i32 = 0
+
+# Scratch 9-byte name buffers (null-terminated copies of 8-char names).
+let mut rdata_namebuf: array<u8, 9> = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+# Shared r_data / r_state globals.
+let mut rdata_firstflat: i32 = 0
+let mut rdata_lastflat: i32 = 0
+let mut rdata_numflats: i32 = 0
+let mut rdata_firstpatch: i32 = 0
+let mut rdata_lastpatch: i32 = 0
+let mut rdata_numpatches: i32 = 0
+let mut rdata_firstspritelump: i32 = 0
+let mut rdata_lastspritelump: i32 = 0
+let mut rdata_numspritelumps: i32 = 0
+let mut rdata_colormaps: ptr<void> = null
+let mut rdata_textureheight: ptr<void> = null
+let mut rdata_spritewidth: ptr<void> = null
+let mut rdata_spriteoffset: ptr<void> = null
+let mut rdata_spritetopoffset: ptr<void> = null
+let mut rdata_flattranslation: ptr<void> = null
+let mut rdata_texturetranslation: ptr<void> = null
+
+extern { function STAT_demoplayback() -> i32 }
+extern { function GEOM_numsectors() -> i32 }
+extern { function GEOM_numsides() -> i32 }
+extern { function SKY_skytexture() -> i32 }
+extern { function THINKER_cap() -> ptr<void> }
+extern { function THINKER_next(th: ptr<void>) -> ptr<void> }
+extern { function THINKER_is_mobj(th: ptr<void>) -> i32 }
+extern { function MOBJ_sprite(m: ptr<void>) -> i32 }
+extern { function GEOM_side_i_bottomtexture(i: i32) -> i32 }
+extern { function GEOM_side_i_midtexture(i: i32) -> i32 }
+extern { function GEOM_side_i_toptexture(i: i32) -> i32 }
+
+# Shared r_data / r_state table accessors.
+
+@flow_api
+function RDATA_colormaps() -> ptr<void> {
+    return rdata_colormaps
+}
+
+@flow_api
+function RDATA_firstflat() -> i32 {
+    return rdata_firstflat
+}
+
+@flow_api
+function RDATA_lastflat() -> i32 {
+    return rdata_lastflat
+}
+
+@flow_api
+function RDATA_numflats() -> i32 {
+    return rdata_numflats
+}
+
+@flow_api
+function RDATA_firstspritelump() -> i32 {
+    return rdata_firstspritelump
+}
+
+@flow_api
+function RDATA_lastspritelump() -> i32 {
+    return rdata_lastspritelump
+}
+
+@flow_api
+function RDATA_numspritelumps() -> i32 {
+    return rdata_numspritelumps
+}
+
+@flow_api
+function RDATA_texturetranslation(tex: i32) -> i32 {
+    let t: ptr<i32> = rdata_texturetranslation as ptr<i32>
+    return t[tex]
+}
+
+@flow_api
+function RDATA_set_texturetranslation(i: i32, pic: i32) -> void {
+    let t: ptr<i32> = rdata_texturetranslation as ptr<i32>
+    t[i] = pic
+}
+
+@flow_api
+function RDATA_flattranslation(pic: i32) -> i32 {
+    let t: ptr<i32> = rdata_flattranslation as ptr<i32>
+    return t[pic]
+}
+
+@flow_api
+function RDATA_set_flattranslation(i: i32, pic: i32) -> void {
+    let t: ptr<i32> = rdata_flattranslation as ptr<i32>
+    t[i] = pic
+}
+
+@flow_api
+function RDATA_textureheight(tex: i32) -> i32 {
+    let t: ptr<i32> = rdata_textureheight as ptr<i32>
+    return t[tex]
+}
+
+@flow_api
+function RDATA_spritewidth(lump: i32) -> i32 {
+    let t: ptr<i32> = rdata_spritewidth as ptr<i32>
+    return t[lump]
+}
+
+@flow_api
+function RDATA_spriteoffset(lump: i32) -> i32 {
+    let t: ptr<i32> = rdata_spriteoffset as ptr<i32>
+    return t[lump]
+}
+
+@flow_api
+function RDATA_spritetopoffset(lump: i32) -> i32 {
+    let t: ptr<i32> = rdata_spritetopoffset as ptr<i32>
+    return t[lump]
+}
+
+# ---- SHORT() / LONG() on little-endian --------------------------------
+
+function rdata_short_at(p: ptr<u8>, off: i32) -> i32 {
+    let mut v: i32 = (p[off] as i32) | ((p[off + 1] as i32) << 8)
+    if v >= 32768 {
+        v = v - 65536
+    }
+    return v
+}
+
+function rdata_long_at(p: ptr<u8>, off: i32) -> i32 {
+    return (p[off] as i32)
+        | ((p[off + 1] as i32) << 8)
+        | ((p[off + 2] as i32) << 16)
+        | ((p[off + 3] as i32) << 24)
+}
+
+function rdata_write_i16(p: ptr<u8>, off: i32, v: i32) -> void {
+    p[off] = (v & 255) as u8
+    p[off + 1] = ((v >> 8) & 255) as u8
+}
+
+function rdata_write_i32(p: ptr<u8>, off: i32, v: i32) -> void {
+    p[off] = (v & 255) as u8
+    p[off + 1] = ((v >> 8) & 255) as u8
+    p[off + 2] = ((v >> 16) & 255) as u8
+    p[off + 3] = ((v >> 24) & 255) as u8
+}
+
+# ---- texture_t field accessors ----------------------------------------
+
+function rdata_tex(i: i32) -> ptr<u8> {
+    return rdata_textures[i] as ptr<u8>
+}
+
+function rdata_tex_name_ptr(tex: ptr<u8>) -> ptr<u8> {
+    return tex
+}
+
+function rdata_tex_width(tex: ptr<u8>) -> i32 {
+    return rdata_short_at(tex, RDATA_TEX_WIDTH)
+}
+
+function rdata_tex_height(tex: ptr<u8>) -> i32 {
+    return rdata_short_at(tex, RDATA_TEX_HEIGHT)
+}
+
+function rdata_tex_patchcount(tex: ptr<u8>) -> i32 {
+    return rdata_short_at(tex, RDATA_TEX_PATCHCOUNT)
+}
+
+function rdata_tex_set_index(tex: ptr<u8>, v: i32) -> void {
+    rdata_write_i32(tex, RDATA_TEX_INDEX, v)
+}
+
+function rdata_tex_index(tex: ptr<u8>) -> i32 {
+    return rdata_long_at(tex, RDATA_TEX_INDEX)
+}
+
+function rdata_tex_next(tex: ptr<u8>) -> ptr<u8> {
+    let words: ptr<i64> = tex as ptr<i64>
+    return words[2] as ptr<u8>
+}
+
+function rdata_tex_set_next(tex: ptr<u8>, n: ptr<u8>) -> void {
+    let words: ptr<i64> = tex as ptr<i64>
+    words[2] = n as i64
+}
+
+function rdata_tex_patch_ptr(tex: ptr<u8>, j: i32) -> ptr<u8> {
+    return ((tex as i64) + (RDATA_TEX_PATCHES + j * RDATA_SIZEOF_TEXPATCH) as i64) as ptr<u8>
+}
+
+function rdata_tp_originx(tp: ptr<u8>) -> i32 {
+    return rdata_short_at(tp, RDATA_TP_ORIGINX)
+}
+
+function rdata_tp_originy(tp: ptr<u8>) -> i32 {
+    return rdata_short_at(tp, RDATA_TP_ORIGINY)
+}
+
+function rdata_tp_patch(tp: ptr<u8>) -> i32 {
+    return rdata_long_at(tp, RDATA_TP_PATCH)
+}
+
+function rdata_copy_name8(dst: ptr<u8>, src: ptr<u8>) -> void {
+    for i in 0 to 8 {
+        dst[i] = src[i]
+    }
+    dst[8] = 0 as u8
+}
+
+function rdata_tolower(c: i32) -> i32 {
+    if c >= 65 and c <= 90 {
+        return c + 32
+    }
+    return c
+}
+
+# strncasecmp(a, b, 8) == 0
+function rdata_name_ieq8(a: ptr<u8>, b: ptr<u8>) -> bool {
+    for i in 0 to 8 {
+        let ca: i32 = rdata_tolower(a[i] as i32)
+        let cb: i32 = rdata_tolower(b[i] as i32)
+        if ca != cb {
+            return false
+        }
+        if ca == 0 {
+            return true
+        }
+    }
+    return true
+}
+
+function rdata_collump(texnum: i32) -> ptr<i16> {
+    return rdata_texturecolumnlump[texnum] as ptr<i16>
+}
+
+function rdata_colofs(texnum: i32) -> ptr<u16> {
+    return rdata_texturecolumnofs[texnum] as ptr<u16>
+}
+
+# ---- R_DrawColumnInCache ----------------------------------------------
+
+function rdata_draw_column_in_cache(
+    patch: ptr<u8>, cache: ptr<u8>, originy: i32, cacheheight: i32
+) -> void {
+    let mut col: ptr<u8> = patch
+    while col[0] as i32 != 255 {
+        let source: ptr<u8> = ((col as i64) + 3) as ptr<u8>
+        let mut count: i32 = col[1] as i32
+        let mut position: i32 = originy + (col[0] as i32)
+
+        if position < 0 {
+            count = count + position
+            position = 0
+        }
+
+        if position + count > cacheheight {
+            count = cacheheight - position
+        }
+
+        if count > 0 {
+            memcpy(
+                ((cache as i64) + (position as i64)) as ptr<void>,
+                source as ptr<void>,
+                count as i64)
+        }
+
+        col = ((col as i64) + ((col[1] as i32) + 4) as i64) as ptr<u8>
+    }
+}
+
+# ---- R_GenerateComposite ----------------------------------------------
+
+function rdata_generate_composite(texnum: i32) -> void {
+    let texture: ptr<u8> = rdata_tex(texnum)
+    let user: ptr<void> = ((rdata_texturecomposite as i64) + (texnum as i64) * 8) as ptr<void>
+    let block: ptr<u8> = Z_Malloc(
+        rdata_texturecompositesize[texnum], RDATA_PU_STATIC, user) as ptr<u8>
+
+    let collump: ptr<i16> = rdata_collump(texnum)
+    let colofs: ptr<u16> = rdata_colofs(texnum)
+    let tw: i32 = rdata_tex_width(texture)
+    let th: i32 = rdata_tex_height(texture)
+    let pc: i32 = rdata_tex_patchcount(texture)
+
+    for i in 0 to pc {
+        let tp: ptr<u8> = rdata_tex_patch_ptr(texture, i)
+        let realpatch: ptr<u8> = W_CacheLumpNum(rdata_tp_patch(tp), RDATA_PU_CACHE) as ptr<u8>
+        let x1: i32 = rdata_tp_originx(tp)
+        let mut x2: i32 = x1 + rdata_short_at(realpatch, RDATA_PATCH_WIDTH)
+        let mut x: i32 = 0
+
+        if x1 < 0 {
+            x = 0
+        } else {
+            x = x1
+        }
+
+        if x2 > tw {
+            x2 = tw
+        }
+
+        while x < x2 {
+            if (collump[x] as i32) >= 0 {
+                x = x + 1
+            } else {
+                let col_off: i32 = rdata_long_at(
+                    realpatch, RDATA_PATCH_COLUMNOFS + (x - x1) * 4)
+                let patchcol: ptr<u8> = ((realpatch as i64) + (col_off as i64)) as ptr<u8>
+                rdata_draw_column_in_cache(
+                    patchcol,
+                    ((block as i64) + (colofs[x] as i64)) as ptr<u8>,
+                    rdata_tp_originy(tp),
+                    th)
+                x = x + 1
+            }
+        }
+    }
+
+    Z_ChangeTag2(block as ptr<void>, RDATA_PU_CACHE, "rdata.flow", 0)
+}
+
+# ---- R_GenerateLookup -------------------------------------------------
+
+function rdata_generate_lookup(texnum: i32) -> void {
+    let texture: ptr<u8> = rdata_tex(texnum)
+    rdata_texturecomposite[texnum] = 0
+    rdata_texturecompositesize[texnum] = 0
+
+    let collump: ptr<i16> = rdata_collump(texnum)
+    let colofs: ptr<u16> = rdata_colofs(texnum)
+    let tw: i32 = rdata_tex_width(texture)
+    let th: i32 = rdata_tex_height(texture)
+    let pc: i32 = rdata_tex_patchcount(texture)
+
+    let patchcount: ptr<u8> = Z_Malloc(tw, RDATA_PU_STATIC, null) as ptr<u8>
+    memset(patchcount as ptr<void>, 0, tw as i64)
+
+    for i in 0 to pc {
+        let tp: ptr<u8> = rdata_tex_patch_ptr(texture, i)
+        let realpatch: ptr<u8> = W_CacheLumpNum(rdata_tp_patch(tp), RDATA_PU_CACHE) as ptr<u8>
+        let x1: i32 = rdata_tp_originx(tp)
+        let mut x2: i32 = x1 + rdata_short_at(realpatch, RDATA_PATCH_WIDTH)
+        let mut x: i32 = 0
+
+        if x1 < 0 {
+            x = 0
+        } else {
+            x = x1
+        }
+
+        if x2 > tw {
+            x2 = tw
+        }
+
+        while x < x2 {
+            patchcount[x] = (patchcount[x] as i32 + 1) as u8
+            collump[x] = rdata_tp_patch(tp) as i16
+            colofs[x] = (rdata_long_at(
+                realpatch, RDATA_PATCH_COLUMNOFS + (x - x1) * 4) + 3) as u16
+            x = x + 1
+        }
+    }
+
+    for x in 0 to tw {
+        if patchcount[x] as i32 == 0 {
+            # Vanilla returns without Z_Free(patchcount) — keep that leak.
+            rdata_copy_name8(rdata_namebuf as ptr<u8>, rdata_tex_name_ptr(texture))
+            printf("R_GenerateLookup: column without a patch (%s)\n",
+                rdata_namebuf as string)
+            return
+        }
+
+        if patchcount[x] as i32 > 1 {
+            collump[x] = (0 - 1) as i16
+            colofs[x] = rdata_texturecompositesize[texnum] as u16
+
+            if rdata_texturecompositesize[texnum] > 65536 - th {
+                I_Error("R_GenerateLookup: texture is >64k")
+            }
+
+            rdata_texturecompositesize[texnum] =
+                rdata_texturecompositesize[texnum] + th
+        }
+    }
+
+    Z_Free(patchcount as ptr<void>)
+}
+
+# ---- R_GetColumn ------------------------------------------------------
+
+@flow_api
+function R_GetColumn(tex: i32, col_in: i32) -> ptr<u8> {
+    let mut col: i32 = col_in & rdata_texturewidthmask[tex]
+    let lump: i32 = rdata_collump(tex)[col] as i32
+    let ofs: i32 = rdata_colofs(tex)[col] as i32
+
+    if lump > 0 {
+        return ((W_CacheLumpNum(lump, RDATA_PU_CACHE) as i64) + (ofs as i64)) as ptr<u8>
+    }
+
+    if rdata_texturecomposite[tex] == 0 {
+        rdata_generate_composite(tex)
+    }
+
+    return ((rdata_texturecomposite[tex] as i64) + (ofs as i64)) as ptr<u8>
+}
+
+# ---- GenerateTextureHashTable -----------------------------------------
+
+function rdata_generate_texture_hash_table() -> void {
+    rdata_textures_hashtable = Z_Malloc(
+        rdata_numtextures * 8, RDATA_PU_STATIC, null) as ptr<i64>
+    memset(rdata_textures_hashtable as ptr<void>, 0, (rdata_numtextures * 8) as i64)
+
+    for i in 0 to rdata_numtextures {
+        let tex: ptr<u8> = rdata_tex(i)
+        rdata_tex_set_index(tex, i)
+
+        # Append at end of chain so earlier array entries win (vanilla).
+        let key: i32 = (W_LumpNameHash(rdata_tex_name_ptr(tex)) % (rdata_numtextures as u32)) as i32
+        let mut rover: ptr<i64> = ((rdata_textures_hashtable as i64) + (key as i64) * 8) as ptr<i64>
+
+        while rover[0] != 0 {
+            rover = ((rover[0] + (RDATA_TEX_NEXT as i64)) as ptr<i64>)
+        }
+
+        rdata_tex_set_next(tex, null)
+        rover[0] = tex as i64
+    }
+}
+
+# ---- R_InitTextures ---------------------------------------------------
+
+function rdata_init_textures() -> void {
+    # FEATURE_DEHACKED off: DEH_String is identity.
+    let names: ptr<u8> = W_CacheLumpName("PNAMES", RDATA_PU_STATIC) as ptr<u8>
+    let nummappatches: i32 = rdata_long_at(names, 0)
+    let name_p: ptr<u8> = ((names as i64) + 4) as ptr<u8>
+    let patchlookup: ptr<i32> = Z_Malloc(
+        nummappatches * 4, RDATA_PU_STATIC, null) as ptr<i32>
+
+    rdata_namebuf[8] = 0 as u8
+    for i in 0 to nummappatches {
+        M_StringCopy(
+            rdata_namebuf as ptr<u8>,
+            ((name_p as i64) + (i * 8) as i64) as ptr<u8>,
+            9)
+        patchlookup[i] = W_CheckNumForName(rdata_namebuf as string)
+    }
+    W_ReleaseLumpName("PNAMES")
+
+    let mut maptex: ptr<u8> = W_CacheLumpName("TEXTURE1", RDATA_PU_STATIC) as ptr<u8>
+    let numtextures1: i32 = rdata_long_at(maptex, 0)
+    let mut maxoff: i32 = W_LumpLength(W_GetNumForName("TEXTURE1") as u32)
+    let mut directory: ptr<u8> = ((maptex as i64) + 4) as ptr<u8>
+
+    let mut maptex2: ptr<u8> = null
+    let mut numtextures2: i32 = 0
+    let mut maxoff2: i32 = 0
+
+    if W_CheckNumForName("TEXTURE2") != 0 - 1 {
+        maptex2 = W_CacheLumpName("TEXTURE2", RDATA_PU_STATIC) as ptr<u8>
+        numtextures2 = rdata_long_at(maptex2, 0)
+        maxoff2 = W_LumpLength(W_GetNumForName("TEXTURE2") as u32)
+    }
+
+    rdata_numtextures = numtextures1 + numtextures2
+
+    rdata_textures = Z_Malloc(rdata_numtextures * 8, RDATA_PU_STATIC, null) as ptr<i64>
+    rdata_texturecolumnlump = Z_Malloc(rdata_numtextures * 8, RDATA_PU_STATIC, null) as ptr<i64>
+    rdata_texturecolumnofs = Z_Malloc(rdata_numtextures * 8, RDATA_PU_STATIC, null) as ptr<i64>
+    rdata_texturecomposite = Z_Malloc(rdata_numtextures * 8, RDATA_PU_STATIC, null) as ptr<i64>
+    rdata_texturecompositesize = Z_Malloc(rdata_numtextures * 4, RDATA_PU_STATIC, null) as ptr<i32>
+    rdata_texturewidthmask = Z_Malloc(rdata_numtextures * 4, RDATA_PU_STATIC, null) as ptr<i32>
+    rdata_textureheight = Z_Malloc(rdata_numtextures * 4, RDATA_PU_STATIC, null)
+
+    let temp1: i32 = W_GetNumForName("S_START")
+    let temp2: i32 = W_GetNumForName("S_END") - 1
+    let temp3: i32 = ((temp2 - temp1 + 63) / 64) + ((rdata_numtextures + 63) / 64)
+
+    # Classic vanilla "filling box" uses backspace. I_ConsoleStdout is always
+    # 0 in this port (system.flow), so the branch never runs; omit \b which
+    # Flow string literals reject.
+    if I_ConsoleStdout() != 0 {
+        printf("[")
+        for i in 0 to temp3 + 9 {
+            printf(" ")
+        }
+        printf("]")
+    }
+
+    let height_tbl: ptr<i32> = rdata_textureheight as ptr<i32>
+
+    for i in 0 to rdata_numtextures {
+        if (i & 63) == 0 {
+            printf(".")
+        }
+
+        if i == numtextures1 {
+            maptex = maptex2
+            maxoff = maxoff2
+            directory = ((maptex as i64) + 4) as ptr<u8>
+        }
+
+        let offset: i32 = rdata_long_at(directory, 0)
+        directory = ((directory as i64) + 4) as ptr<u8>
+
+        if offset > maxoff {
+            I_Error("R_InitTextures: bad texture directory")
+        }
+
+        let mtexture: ptr<u8> = ((maptex as i64) + (offset as i64)) as ptr<u8>
+        let mpatchcount: i32 = rdata_short_at(mtexture, RDATA_MT_PATCHCOUNT)
+        let tex: ptr<u8> = Z_Malloc(
+            RDATA_SIZEOF_TEXTURE + RDATA_SIZEOF_TEXPATCH * (mpatchcount - 1),
+            RDATA_PU_STATIC, null) as ptr<u8>
+        rdata_textures[i] = tex as i64
+
+        rdata_write_i16(tex, RDATA_TEX_WIDTH, rdata_short_at(mtexture, RDATA_MT_WIDTH))
+        rdata_write_i16(tex, RDATA_TEX_HEIGHT, rdata_short_at(mtexture, RDATA_MT_HEIGHT))
+        rdata_write_i16(tex, RDATA_TEX_PATCHCOUNT, mpatchcount)
+        memcpy(tex as ptr<void>, mtexture as ptr<void>, 8)
+
+        let mut mpatch: ptr<u8> = ((mtexture as i64) + (RDATA_MT_PATCHES as i64)) as ptr<u8>
+        for j in 0 to mpatchcount {
+            let tp: ptr<u8> = rdata_tex_patch_ptr(tex, j)
+            rdata_write_i16(tp, RDATA_TP_ORIGINX, rdata_short_at(mpatch, RDATA_MP_ORIGINX))
+            rdata_write_i16(tp, RDATA_TP_ORIGINY, rdata_short_at(mpatch, RDATA_MP_ORIGINY))
+            let pidx: i32 = rdata_short_at(mpatch, RDATA_MP_PATCH)
+            let lump: i32 = patchlookup[pidx]
+            rdata_write_i32(tp, RDATA_TP_PATCH, lump)
+            if lump == 0 - 1 {
+                rdata_copy_name8(rdata_namebuf as ptr<u8>, rdata_tex_name_ptr(tex))
+                I_Error("R_InitTextures: Missing patch in texture")
+            }
+            mpatch = ((mpatch as i64) + (RDATA_SIZEOF_MAPPATCH as i64)) as ptr<u8>
+        }
+
+        let tw: i32 = rdata_tex_width(tex)
+        rdata_texturecolumnlump[i] = Z_Malloc(tw * 2, RDATA_PU_STATIC, null) as i64
+        rdata_texturecolumnofs[i] = Z_Malloc(tw * 2, RDATA_PU_STATIC, null) as i64
+
+        let mut jmask: i32 = 1
+        while jmask * 2 <= tw {
+            jmask = jmask << 1
+        }
+        rdata_texturewidthmask[i] = jmask - 1
+        height_tbl[i] = rdata_tex_height(tex) << RDATA_FRACBITS
+    }
+
+    Z_Free(patchlookup as ptr<void>)
+    W_ReleaseLumpName("TEXTURE1")
+    if (maptex2 as i64) != 0 {
+        W_ReleaseLumpName("TEXTURE2")
+    }
+
+    for i in 0 to rdata_numtextures {
+        rdata_generate_lookup(i)
+    }
+
+    let ttrans: ptr<i32> = Z_Malloc(
+        (rdata_numtextures + 1) * 4, RDATA_PU_STATIC, null) as ptr<i32>
+    rdata_texturetranslation = ttrans as ptr<void>
+    for i in 0 to rdata_numtextures {
+        ttrans[i] = i
+    }
+
+    rdata_generate_texture_hash_table()
+}
+
+# ---- R_InitFlats ------------------------------------------------------
+
+function rdata_init_flats() -> void {
+    rdata_firstflat = W_GetNumForName("F_START") + 1
+    rdata_lastflat = W_GetNumForName("F_END") - 1
+    rdata_numflats = RDATA_lastflat() - RDATA_firstflat() + 1
+
+    let n: i32 = RDATA_numflats()
+    let ft: ptr<i32> = Z_Malloc((n + 1) * 4, RDATA_PU_STATIC, null) as ptr<i32>
+    rdata_flattranslation = ft as ptr<void>
+    for i in 0 to n {
+        ft[i] = i
+    }
+}
+
+# ---- R_InitSpriteLumps ------------------------------------------------
+
+function rdata_init_sprite_lumps() -> void {
+    rdata_firstspritelump = W_GetNumForName("S_START") + 1
+    rdata_lastspritelump = W_GetNumForName("S_END") - 1
+    let n: i32 = RDATA_lastspritelump() - RDATA_firstspritelump() + 1
+    rdata_numspritelumps = n
+
+    rdata_spritewidth = Z_Malloc(n * 4, RDATA_PU_STATIC, null)
+    rdata_spriteoffset = Z_Malloc(n * 4, RDATA_PU_STATIC, null)
+    rdata_spritetopoffset = Z_Malloc(n * 4, RDATA_PU_STATIC, null)
+
+    let sw: ptr<i32> = rdata_spritewidth as ptr<i32>
+    let so: ptr<i32> = rdata_spriteoffset as ptr<i32>
+    let st: ptr<i32> = rdata_spritetopoffset as ptr<i32>
+    let first: i32 = RDATA_firstspritelump()
+
+    for i in 0 to n {
+        if (i & 63) == 0 {
+            printf(".")
+        }
+        let patch: ptr<u8> = W_CacheLumpNum(first + i, RDATA_PU_CACHE) as ptr<u8>
+        sw[i] = rdata_short_at(patch, RDATA_PATCH_WIDTH) << RDATA_FRACBITS
+        so[i] = rdata_short_at(patch, RDATA_PATCH_LEFTOFFSET) << RDATA_FRACBITS
+        st[i] = rdata_short_at(patch, RDATA_PATCH_TOPOFFSET) << RDATA_FRACBITS
+    }
+}
+
+# ---- R_InitColormaps --------------------------------------------------
+
+function rdata_init_colormaps() -> void {
+    let lump: i32 = W_GetNumForName("COLORMAP")
+    rdata_colormaps = W_CacheLumpNum(lump, RDATA_PU_STATIC)
+}
+
+# ---- R_InitData -------------------------------------------------------
+
+@flow_api
+function R_InitData() -> void {
+    rdata_init_textures()
+    printf(".")
+    rdata_init_flats()
+    printf(".")
+    rdata_init_sprite_lumps()
+    printf(".")
+    rdata_init_colormaps()
+}
+
+# ---- R_FlatNumForName -------------------------------------------------
+
+@flow_api
+function R_FlatNumForName(name: string) -> i32 {
+    let i: i32 = W_CheckNumForName(name)
+    if i == 0 - 1 {
+        rdata_namebuf[8] = 0 as u8
+        memcpy(rdata_namebuf as ptr<void>, name as ptr<void>, 8)
+        I_Error("R_FlatNumForName: flat not found")
+    }
+    return i - RDATA_firstflat()
+}
+
+# ---- R_CheckTextureNumForName -----------------------------------------
+
+@flow_api
+function R_CheckTextureNumForName(name: string) -> i32 {
+    let np: ptr<u8> = name as ptr<u8>
+    if np[0] as i32 == 45 {
+        # '-' NoTexture marker
+        return 0
+    }
+
+    let key: i32 = (W_LumpNameHash(np) % (rdata_numtextures as u32)) as i32
+    let mut texture: ptr<u8> = rdata_textures_hashtable[key] as ptr<u8>
+
+    while (texture as i64) != 0 {
+        if rdata_name_ieq8(rdata_tex_name_ptr(texture), np) {
+            return rdata_tex_index(texture)
+        }
+        texture = rdata_tex_next(texture)
+    }
+
+    return 0 - 1
+}
+
+# ---- R_TextureNumForName ----------------------------------------------
+
+@flow_api
+function R_TextureNumForName(name: string) -> i32 {
+    let i: i32 = R_CheckTextureNumForName(name)
+    if i == 0 - 1 {
+        I_Error("R_TextureNumForName: texture not found")
+    }
+    return i
+}
+
+# ---- R_PrecacheLevel --------------------------------------------------
+
+@flow_api
+function R_PrecacheLevel() -> void {
+    if STAT_demoplayback() != 0 {
+        return
+    }
+
+    let numflats: i32 = RDATA_numflats()
+    let flatpresent: ptr<u8> = Z_Malloc(numflats, RDATA_PU_STATIC, null) as ptr<u8>
+    memset(flatpresent as ptr<void>, 0, numflats as i64)
+
+    let nsec: i32 = GEOM_numsectors()
+    for i in 0 to nsec {
+        flatpresent[GEOM_sector_floorpic(GEOM_sector(i))] = 1 as u8
+        flatpresent[GEOM_sector_ceilingpic(GEOM_sector(i))] = 1 as u8
+    }
+
+    rdata_flatmemory = 0
+    let firstflat: i32 = RDATA_firstflat()
+    for i in 0 to numflats {
+        if flatpresent[i] as i32 != 0 {
+            let lump: i32 = firstflat + i
+            rdata_flatmemory = rdata_flatmemory + W_LumpLength(lump as u32)
+            W_CacheLumpNum(lump, RDATA_PU_CACHE)
+        }
+    }
+    Z_Free(flatpresent as ptr<void>)
+
+    let texturepresent: ptr<u8> = Z_Malloc(rdata_numtextures, RDATA_PU_STATIC, null) as ptr<u8>
+    memset(texturepresent as ptr<void>, 0, rdata_numtextures as i64)
+
+    let nsides: i32 = GEOM_numsides()
+    for i in 0 to nsides {
+        texturepresent[GEOM_side_i_toptexture(i)] = 1 as u8
+        texturepresent[GEOM_side_i_midtexture(i)] = 1 as u8
+        texturepresent[GEOM_side_i_bottomtexture(i)] = 1 as u8
+    }
+    texturepresent[SKY_skytexture()] = 1 as u8
+
+    rdata_texturememory = 0
+    for i in 0 to rdata_numtextures {
+        if texturepresent[i] as i32 != 0 {
+            let texture: ptr<u8> = rdata_tex(i)
+            let pc: i32 = rdata_tex_patchcount(texture)
+            for j in 0 to pc {
+                let lump: i32 = rdata_tp_patch(rdata_tex_patch_ptr(texture, j))
+                rdata_texturememory = rdata_texturememory + W_LumpLength(lump as u32)
+                W_CacheLumpNum(lump, RDATA_PU_CACHE)
+            }
+        }
+    }
+    Z_Free(texturepresent as ptr<void>)
+
+    let numsprites: i32 = thingshim_numsprites()
+    let spritepresent: ptr<u8> = Z_Malloc(numsprites, RDATA_PU_STATIC, null) as ptr<u8>
+    memset(spritepresent as ptr<void>, 0, numsprites as i64)
+
+    let cap: ptr<void> = THINKER_cap()
+    let mut th: ptr<void> = THINKER_next(cap)
+    while (th as i64) != (cap as i64) {
+        if THINKER_is_mobj(th) != 0 {
+            spritepresent[MOBJ_sprite(th)] = 1 as u8
+        }
+        th = THINKER_next(th)
+    }
+
+    rdata_spritememory = 0
+    let firstspr: i32 = RDATA_firstspritelump()
+    for i in 0 to numsprites {
+        if spritepresent[i] as i32 != 0 {
+            let nframes: i32 = thingshim_sprite_numframes(i)
+            for j in 0 to nframes {
+                for k in 0 to 8 {
+                    let lump: i32 = firstspr + thingshim_sprite_frame_lump(i, j, k)
+                    rdata_spritememory = rdata_spritememory + W_LumpLength(lump as u32)
+                    W_CacheLumpNum(lump, RDATA_PU_CACHE)
+                }
+            }
+        }
+    }
+    Z_Free(spritepresent as ptr<void>)
+}

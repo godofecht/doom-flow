@@ -1,0 +1,745 @@
+# Weapon sprite animation / attacks, ported from p_pspr.c to Flow.
+#
+# bulletslope and swingx/swingy are private module state (bulletslope has
+# a psprshim_bulletslope_addr @flow_api export for maputl.flow's blockmap-
+# overrun poke). player_t / mobj_t / state_t stay C-owned; pspdef_t field
+# access is LP64 offsetof arithmetic (psp_i32/psp_ptr helpers below).
+# weaponinfo table lives in items.flow (it_weaponinfo_tab); readers here
+# go through WEAPONINFO_*. State actions dispatch via STATE_call_acp2.
+#
+# DecreaseAmmo quirk preserved: ammo index >= NUMAMMO overflows into
+# maxammo[] (Dehacked compatibility).
+#
+# pspdef_t (sizeof 24, LP64, verified with offsetof): state 0 (ptr),
+# tics 8, sx 12, sy 16 — PSPDEF_OFF_* constants below mirror this.
+
+# ---- externs: fixed-point / engine ------------------------------------
+
+extern { function FixedMul(a: i32, b: i32) -> i32 }
+extern { function P_Random() -> i32 }
+extern { function S_StartSound(origin: ptr<void>, sound_id: i32) -> void }
+extern { function P_SetMobjState(mobj: ptr<void>, state: i32) -> i32 }
+extern { function P_NoiseAlert(target: ptr<void>, emitter: ptr<void>) -> void }
+extern { function P_AimLineAttack(t1: ptr<void>, angle: u32, distance: i32) -> i32 }
+extern { function P_LineAttack(t1: ptr<void>, angle: u32, distance: i32, slope: i32, damage: i32) -> void }
+extern { function P_SpawnPlayerMissile(source: ptr<void>, typ: i32) -> void }
+extern { function P_SpawnMobj(x: i32, y: i32, z: i32, typ: i32) -> ptr<void> }
+extern { function P_DamageMobj(target: ptr<void>, inflictor: ptr<void>, source: ptr<void>, damage: i32) -> void }
+extern { function R_PointToAngle2(x1: i32, y1: i32, x2: i32, y2: i32) -> u32 }
+extern { function TABLES_finesine(idx: i32) -> i32 }
+extern { function TABLES_finecosine(idx: i32) -> i32 }
+extern { function TABLES_finetangent(idx: i32) -> i32 }
+
+# ---- items.flow -------------------------------------------------------
+
+const PSPR_DEH_BFG_CELLS: i32 = 40
+
+extern { function MAP_linetarget() -> ptr<void> }
+extern { function STATE_at(i: i32) -> ptr<void> }
+extern { function STATE_index(st: ptr<void>) -> i32 }
+extern { function STATE_tics(st: ptr<void>) -> i32 }
+extern { function STATE_misc1(st: ptr<void>) -> i32 }
+extern { function STATE_misc2(st: ptr<void>) -> i32 }
+extern { function STATE_nextstate(st: ptr<void>) -> i32 }
+extern { function STATE_action(st: ptr<void>) -> ptr<void> }
+extern { function STATE_call_acp2(st: ptr<void>, arg1: ptr<void>, arg2: ptr<void>) -> void }
+
+extern { function psprshim_weapon_ammo(w: i32) -> i32 }
+extern { function psprshim_weapon_upstate(w: i32) -> i32 }
+extern { function psprshim_weapon_downstate(w: i32) -> i32 }
+extern { function psprshim_weapon_readystate(w: i32) -> i32 }
+extern { function psprshim_weapon_atkstate(w: i32) -> i32 }
+extern { function psprshim_weapon_flashstate(w: i32) -> i32 }
+
+# Shared weaponinfo[w] field accessors. Table lives in items.flow.
+
+@flow_api
+function WEAPONINFO_ammo(w: i32) -> i32 { return psprshim_weapon_ammo(w) }
+@flow_api
+function WEAPONINFO_upstate(w: i32) -> i32 { return psprshim_weapon_upstate(w) }
+@flow_api
+function WEAPONINFO_downstate(w: i32) -> i32 { return psprshim_weapon_downstate(w) }
+@flow_api
+function WEAPONINFO_readystate(w: i32) -> i32 { return psprshim_weapon_readystate(w) }
+@flow_api
+function WEAPONINFO_atkstate(w: i32) -> i32 { return psprshim_weapon_atkstate(w) }
+@flow_api
+function WEAPONINFO_flashstate(w: i32) -> i32 { return psprshim_weapon_flashstate(w) }
+
+# Shared pspdef_t field accessors (LP64 offsetof). Slot pointer is
+# PLAYER_psp(player, pos).
+
+const PSPDEF_OFF_STATE: i32 = 0
+const PSPDEF_OFF_TICS: i32 = 8
+const PSPDEF_OFF_SX: i32 = 12
+const PSPDEF_OFF_SY: i32 = 16
+
+function psp_i32(base: i64, off: i32) -> i32 {
+    let p: ptr<i32> = (base + off as i64) as ptr<i32>
+    return p[0]
+}
+
+function psp_set_i32(base: i64, off: i32, v: i32) -> void {
+    let p: ptr<i32> = (base + off as i64) as ptr<i32>
+    p[0] = v
+}
+
+function psp_ptr(base: i64, off: i32) -> ptr<void> {
+    let p: ptr<i64> = (base + off as i64) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+function psp_set_ptr(base: i64, off: i32, v: ptr<void>) -> void {
+    let p: ptr<i64> = (base + off as i64) as ptr<i64>
+    p[0] = v as i64
+}
+
+@flow_api
+function PSP_state(psp: ptr<void>) -> ptr<void> { return psp_ptr(psp as i64, PSPDEF_OFF_STATE) }
+@flow_api
+function PSP_set_state(psp: ptr<void>, st: ptr<void>) -> void { psp_set_ptr(psp as i64, PSPDEF_OFF_STATE, st) }
+@flow_api
+function PSP_tics(psp: ptr<void>) -> i32 { return psp_i32(psp as i64, PSPDEF_OFF_TICS) }
+@flow_api
+function PSP_set_tics(psp: ptr<void>, v: i32) -> void { psp_set_i32(psp as i64, PSPDEF_OFF_TICS, v) }
+@flow_api
+function PSP_sx(psp: ptr<void>) -> i32 { return psp_i32(psp as i64, PSPDEF_OFF_SX) }
+@flow_api
+function PSP_set_sx(psp: ptr<void>, v: i32) -> void { psp_set_i32(psp as i64, PSPDEF_OFF_SX, v) }
+@flow_api
+function PSP_sy(psp: ptr<void>) -> i32 { return psp_i32(psp as i64, PSPDEF_OFF_SY) }
+@flow_api
+function PSP_set_sy(psp: ptr<void>, v: i32) -> void { psp_set_i32(psp as i64, PSPDEF_OFF_SY, v) }
+
+extern { function MOBJ_x(m: ptr<void>) -> i32 }
+extern { function MOBJ_y(m: ptr<void>) -> i32 }
+extern { function MOBJ_z(m: ptr<void>) -> i32 }
+extern { function MOBJ_height(m: ptr<void>) -> i32 }
+extern { function MOBJ_angle(m: ptr<void>) -> u32 }
+extern { function MOBJ_set_angle(m: ptr<void>, v: u32) -> void }
+extern { function MOBJ_flags(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_flags(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_state(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_target(m: ptr<void>) -> ptr<void> }
+extern { function PLAYER_ammo(p: ptr<void>, a: i32) -> i32 }
+extern { function PLAYER_attackdown(p: ptr<void>) -> i32 }
+extern { function PLAYER_bob(p: ptr<void>) -> i32 }
+extern { function PLAYER_cmd_buttons(p: ptr<void>) -> i32 }
+extern { function PLAYER_health(p: ptr<void>) -> i32 }
+extern { function PLAYER_maxammo(p: ptr<void>, a: i32) -> i32 }
+extern { function PLAYER_mo(p: ptr<void>) -> ptr<void> }
+extern { function PLAYER_pendingweapon(p: ptr<void>) -> i32 }
+extern { function PLAYER_playerstate(p: ptr<void>) -> i32 }
+extern { function PLAYER_power(p: ptr<void>, pw: i32) -> i32 }
+extern { function PLAYER_readyweapon(p: ptr<void>) -> i32 }
+extern { function PLAYER_refire(p: ptr<void>) -> i32 }
+extern { function PLAYER_set_ammo(p: ptr<void>, a: i32, v: i32) -> void }
+extern { function PLAYER_set_attackdown(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_extralight(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_maxammo(p: ptr<void>, a: i32, v: i32) -> void }
+extern { function PLAYER_set_pendingweapon(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_readyweapon(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_refire(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_weaponowned(p: ptr<void>, w: i32) -> i32 }
+extern { function PLAYER_psp(p: ptr<void>, i: i32) -> ptr<void> }
+
+# ---- constants --------------------------------------------------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+const PSPR_FRACUNIT: i32 = 65536
+const PSPR_FRACBITS: i32 = 16
+const PSPR_LOWERSPEED: i32 = 393216           # FRACUNIT*6
+const PSPR_RAISESPEED: i32 = 393216
+const PSPR_WEAPONBOTTOM: i32 = 8388608        # 128*FRACUNIT
+const PSPR_WEAPONTOP: i32 = 2097152           # 32*FRACUNIT
+const PSPR_MELEERANGE: i32 = 4194304          # 64*FRACUNIT
+const PSPR_MISSILERANGE: i32 = 134217728      # 32*64*FRACUNIT
+const PSPR_AIMRANGE: i32 = 67108864           # 16*64*FRACUNIT
+
+const PSPR_FINEANGLES: i32 = 8192
+const PSPR_FINEMASK: i32 = 8191
+const PSPR_ANG90: u32 = 1073741824
+const PSPR_ANG180: u32 = 2147483648
+const PSPR_ANG90_20: i32 = 53687091           # ANG90/20
+const PSPR_ANG90_21: i32 = 51130534           # ANG90/21
+
+const PSPR_PS_WEAPON: i32 = 0
+const PSPR_PS_FLASH: i32 = 1
+const PSPR_NUMPSPRITES: i32 = 2
+const PSPR_NUMAMMO: i32 = 4
+const PSPR_AM_NOAMMO: i32 = 5
+const PSPR_AM_CLIP: i32 = 0
+const PSPR_AM_SHELL: i32 = 1
+const PSPR_AM_CELL: i32 = 2
+const PSPR_AM_MISL: i32 = 3
+
+const PSPR_WP_FIST: i32 = 0
+const PSPR_WP_PISTOL: i32 = 1
+const PSPR_WP_SHOTGUN: i32 = 2
+const PSPR_WP_CHAINGUN: i32 = 3
+const PSPR_WP_MISSILE: i32 = 4
+const PSPR_WP_PLASMA: i32 = 5
+const PSPR_WP_BFG: i32 = 6
+const PSPR_WP_CHAINSAW: i32 = 7
+const PSPR_WP_SUPERSHOTGUN: i32 = 8
+const PSPR_WP_NOCHANGE: i32 = 10
+
+const PSPR_PST_DEAD: i32 = 1
+const PSPR_PW_STRENGTH: i32 = 1
+const PSPR_BT_ATTACK: i32 = 1
+const PSPR_SHAREWARE: i32 = 0
+const PSPR_COMMERCIAL: i32 = 2
+
+const PSPR_S_NULL: i32 = 0
+const PSPR_S_SAW: i32 = 67
+const PSPR_S_CHAIN1: i32 = 52
+const PSPR_S_PLAY: i32 = 149
+const PSPR_S_PLAY_ATK1: i32 = 154
+const PSPR_S_PLAY_ATK2: i32 = 155
+
+const PSPR_MT_ROCKET: i32 = 33
+const PSPR_MT_PLASMA: i32 = 34
+const PSPR_MT_BFG: i32 = 35
+const PSPR_MT_EXTRABFG: i32 = 42
+const PSPR_MF_JUSTATTACKED: i32 = 128
+
+const PSPR_SFX_PISTOL: i32 = 1
+const PSPR_SFX_SHOTGN: i32 = 2
+const PSPR_SFX_DSHTGN: i32 = 4
+const PSPR_SFX_BFG: i32 = 9
+const PSPR_SFX_SAWUP: i32 = 10
+const PSPR_SFX_SAWIDL: i32 = 11
+const PSPR_SFX_SAWFUL: i32 = 12
+const PSPR_SFX_SAWHIT: i32 = 13
+const PSPR_SFX_PUNCH: i32 = 83
+
+# ---- private swing state (was file-scope in p_pspr.c) -----------------
+
+let mut bulletslope: i32 = 0
+let mut swingx: i32 = 0
+let mut swingy: i32 = 0
+
+# ---- DecreaseAmmo (Dehacked overflow quirk) ---------------------------
+
+function PSPR_DecreaseAmmo(player: ptr<void>, ammonum: i32, amount: i32) -> void {
+    if ammonum < PSPR_NUMAMMO {
+        PLAYER_set_ammo(player, ammonum, PLAYER_ammo(player, ammonum) - amount)
+    } else {
+        PLAYER_set_maxammo(player, ammonum - PSPR_NUMAMMO,
+            PLAYER_maxammo(player, ammonum - PSPR_NUMAMMO) - amount)
+    }
+}
+
+# ---- P_SetPsprite -----------------------------------------------------
+
+function P_SetPsprite(player: ptr<void>, position: i32, stnum_in: i32) -> void {
+    let psp: ptr<void> = PLAYER_psp(player, position)
+    let mut stnum: i32 = stnum_in
+
+    while 1 != 0 {
+        if stnum == 0 {
+            PSP_set_state(psp, null)
+            break
+        }
+
+        let state: ptr<void> = STATE_at(stnum)
+        PSP_set_state(psp, state)
+        PSP_set_tics(psp, STATE_tics(state))
+
+        if STATE_misc1(state) != 0 {
+            PSP_set_sx(psp, STATE_misc1(state) << PSPR_FRACBITS)
+            PSP_set_sy(psp, STATE_misc2(state) << PSPR_FRACBITS)
+        }
+
+        if (STATE_action(state) as i64) != 0 {
+            STATE_call_acp2(state, player, psp)
+            if (PSP_state(psp) as i64) == 0 {
+                break
+            }
+        }
+
+        stnum = STATE_nextstate(PSP_state(psp))
+        if PSP_tics(psp) != 0 {
+            break
+        }
+    }
+}
+
+# ---- P_CalcSwing ------------------------------------------------------
+
+function P_CalcSwing(player: ptr<void>) -> void {
+    let swing: i32 = PLAYER_bob(player)
+    let mut angle: i32 = (PSPR_FINEANGLES / 70 * STAT_leveltime()) & PSPR_FINEMASK
+    swingx = FixedMul(swing, TABLES_finesine(angle as i32))
+    angle = (PSPR_FINEANGLES / 70 * STAT_leveltime() + PSPR_FINEANGLES / 2) & PSPR_FINEMASK
+    swingy = 0 - FixedMul(swingx, TABLES_finesine(angle as i32))
+}
+
+# ---- P_BringUpWeapon --------------------------------------------------
+
+function P_BringUpWeapon(player: ptr<void>) -> void {
+    if PLAYER_pendingweapon(player) == PSPR_WP_NOCHANGE {
+        PLAYER_set_pendingweapon(player, PLAYER_readyweapon(player))
+    }
+    if PLAYER_pendingweapon(player) == PSPR_WP_CHAINSAW {
+        S_StartSound(PLAYER_mo(player), PSPR_SFX_SAWUP)
+    }
+    let newstate: i32 = WEAPONINFO_upstate(PLAYER_pendingweapon(player))
+    PLAYER_set_pendingweapon(player, PSPR_WP_NOCHANGE)
+    PSP_set_sy(PLAYER_psp(player, PSPR_PS_WEAPON), PSPR_WEAPONBOTTOM)
+    P_SetPsprite(player, PSPR_PS_WEAPON, newstate)
+}
+
+# ---- P_CheckAmmo ------------------------------------------------------
+
+function P_CheckAmmo(player: ptr<void>) -> i32 {
+    let ammo: i32 = WEAPONINFO_ammo(PLAYER_readyweapon(player))
+    let mut count: i32 = 1
+    if PLAYER_readyweapon(player) == PSPR_WP_BFG {
+        count = PSPR_DEH_BFG_CELLS
+    } elif PLAYER_readyweapon(player) == PSPR_WP_SUPERSHOTGUN {
+        count = 2
+    }
+
+    if ammo == PSPR_AM_NOAMMO or PLAYER_ammo(player, ammo) >= count {
+        return 1
+    }
+
+    # Out of ammo — pick next weapon (preferences hardcoded).
+    while 1 != 0 {
+        if PLAYER_weaponowned(player, PSPR_WP_PLASMA) != 0
+            and PLAYER_ammo(player, PSPR_AM_CELL) != 0
+            and STAT_gamemode() != PSPR_SHAREWARE {
+            PLAYER_set_pendingweapon(player, PSPR_WP_PLASMA)
+        } elif PLAYER_weaponowned(player, PSPR_WP_SUPERSHOTGUN) != 0
+            and PLAYER_ammo(player, PSPR_AM_SHELL) > 2
+            and STAT_gamemode() == PSPR_COMMERCIAL {
+            PLAYER_set_pendingweapon(player, PSPR_WP_SUPERSHOTGUN)
+        } elif PLAYER_weaponowned(player, PSPR_WP_CHAINGUN) != 0
+            and PLAYER_ammo(player, PSPR_AM_CLIP) != 0 {
+            PLAYER_set_pendingweapon(player, PSPR_WP_CHAINGUN)
+        } elif PLAYER_weaponowned(player, PSPR_WP_SHOTGUN) != 0
+            and PLAYER_ammo(player, PSPR_AM_SHELL) != 0 {
+            PLAYER_set_pendingweapon(player, PSPR_WP_SHOTGUN)
+        } elif PLAYER_ammo(player, PSPR_AM_CLIP) != 0 {
+            PLAYER_set_pendingweapon(player, PSPR_WP_PISTOL)
+        } elif PLAYER_weaponowned(player, PSPR_WP_CHAINSAW) != 0 {
+            PLAYER_set_pendingweapon(player, PSPR_WP_CHAINSAW)
+        } elif PLAYER_weaponowned(player, PSPR_WP_MISSILE) != 0
+            and PLAYER_ammo(player, PSPR_AM_MISL) != 0 {
+            PLAYER_set_pendingweapon(player, PSPR_WP_MISSILE)
+        } elif PLAYER_weaponowned(player, PSPR_WP_BFG) != 0
+            and PLAYER_ammo(player, PSPR_AM_CELL) > 40
+            and STAT_gamemode() != PSPR_SHAREWARE {
+            PLAYER_set_pendingweapon(player, PSPR_WP_BFG)
+        } else {
+            PLAYER_set_pendingweapon(player, PSPR_WP_FIST)
+        }
+
+        if PLAYER_pendingweapon(player) != PSPR_WP_NOCHANGE {
+            break
+        }
+    }
+
+    P_SetPsprite(player, PSPR_PS_WEAPON, WEAPONINFO_downstate(PLAYER_readyweapon(player)))
+    return 0
+}
+
+# ---- P_FireWeapon -----------------------------------------------------
+
+function P_FireWeapon(player: ptr<void>) -> void {
+    if P_CheckAmmo(player) == 0 {
+        return
+    }
+    P_SetMobjState(PLAYER_mo(player), PSPR_S_PLAY_ATK1)
+    P_SetPsprite(player, PSPR_PS_WEAPON, WEAPONINFO_atkstate(PLAYER_readyweapon(player)))
+    P_NoiseAlert(PLAYER_mo(player), PLAYER_mo(player))
+}
+
+# ---- P_DropWeapon -----------------------------------------------------
+
+@flow_api
+function P_DropWeapon(player: ptr<void>) -> void {
+    P_SetPsprite(player, PSPR_PS_WEAPON, WEAPONINFO_downstate(PLAYER_readyweapon(player)))
+}
+
+# ---- A_WeaponReady ----------------------------------------------------
+
+@flow_api
+function A_WeaponReady(player: ptr<void>, psp: ptr<void>) -> void {
+    let mo: ptr<void> = PLAYER_mo(player)
+    if (MOBJ_state(mo) as i64) == (STATE_at(PSPR_S_PLAY_ATK1) as i64)
+        or (MOBJ_state(mo) as i64) == (STATE_at(PSPR_S_PLAY_ATK2) as i64) {
+        P_SetMobjState(mo, PSPR_S_PLAY)
+    }
+
+    if PLAYER_readyweapon(player) == PSPR_WP_CHAINSAW
+        and (PSP_state(psp) as i64) == (STATE_at(PSPR_S_SAW) as i64) {
+        S_StartSound(mo, PSPR_SFX_SAWIDL)
+    }
+
+    if PLAYER_pendingweapon(player) != PSPR_WP_NOCHANGE or PLAYER_health(player) == 0 {
+        P_SetPsprite(player, PSPR_PS_WEAPON, WEAPONINFO_downstate(PLAYER_readyweapon(player)))
+        return
+    }
+
+    if (PLAYER_cmd_buttons(player) & PSPR_BT_ATTACK) != 0 {
+        if PLAYER_attackdown(player) == 0
+            or (PLAYER_readyweapon(player) != PSPR_WP_MISSILE
+                and PLAYER_readyweapon(player) != PSPR_WP_BFG) {
+            PLAYER_set_attackdown(player, 1)
+            P_FireWeapon(player)
+            return
+        }
+    } else {
+        PLAYER_set_attackdown(player, 0)
+    }
+
+    let mut angle: i32 = (128 * STAT_leveltime()) & PSPR_FINEMASK
+    PSP_set_sx(psp, PSPR_FRACUNIT + FixedMul(PLAYER_bob(player), TABLES_finecosine(angle as i32)))
+    angle = angle & (PSPR_FINEANGLES / 2 - 1)
+    PSP_set_sy(psp, PSPR_WEAPONTOP + FixedMul(PLAYER_bob(player), TABLES_finesine(angle as i32)))
+}
+
+# ---- A_ReFire / A_CheckReload -----------------------------------------
+
+@flow_api
+function A_ReFire(player: ptr<void>, psp: ptr<void>) -> void {
+    if (PLAYER_cmd_buttons(player) & PSPR_BT_ATTACK) != 0
+        and PLAYER_pendingweapon(player) == PSPR_WP_NOCHANGE
+        and PLAYER_health(player) != 0 {
+        PLAYER_set_refire(player, PLAYER_refire(player) + 1)
+        P_FireWeapon(player)
+    } else {
+        PLAYER_set_refire(player, 0)
+        P_CheckAmmo(player)
+    }
+}
+
+@flow_api
+function A_CheckReload(player: ptr<void>, psp: ptr<void>) -> void {
+    P_CheckAmmo(player)
+}
+
+# ---- A_Lower / A_Raise ------------------------------------------------
+
+@flow_api
+function A_Lower(player: ptr<void>, psp: ptr<void>) -> void {
+    PSP_set_sy(psp, PSP_sy(psp) + PSPR_LOWERSPEED)
+    if PSP_sy(psp) < PSPR_WEAPONBOTTOM {
+        return
+    }
+
+    if PLAYER_playerstate(player) == PSPR_PST_DEAD {
+        PSP_set_sy(psp, PSPR_WEAPONBOTTOM)
+        return
+    }
+
+    if PLAYER_health(player) == 0 {
+        P_SetPsprite(player, PSPR_PS_WEAPON, PSPR_S_NULL)
+        return
+    }
+
+    PLAYER_set_readyweapon(player, PLAYER_pendingweapon(player))
+    P_BringUpWeapon(player)
+}
+
+@flow_api
+function A_Raise(player: ptr<void>, psp: ptr<void>) -> void {
+    PSP_set_sy(psp, PSP_sy(psp) - PSPR_RAISESPEED)
+    if PSP_sy(psp) > PSPR_WEAPONTOP {
+        return
+    }
+    PSP_set_sy(psp, PSPR_WEAPONTOP)
+    P_SetPsprite(player, PSPR_PS_WEAPON, WEAPONINFO_readystate(PLAYER_readyweapon(player)))
+}
+
+# ---- A_GunFlash -------------------------------------------------------
+
+@flow_api
+function A_GunFlash(player: ptr<void>, psp: ptr<void>) -> void {
+    P_SetMobjState(PLAYER_mo(player), PSPR_S_PLAY_ATK2)
+    P_SetPsprite(player, PSPR_PS_FLASH, WEAPONINFO_flashstate(PLAYER_readyweapon(player)))
+}
+
+# ---- A_Punch ----------------------------------------------------------
+
+@flow_api
+function A_Punch(player: ptr<void>, psp: ptr<void>) -> void {
+    let mut damage: i32 = (P_Random() % 10 + 1) << 1
+    if PLAYER_power(player, PSPR_PW_STRENGTH) != 0 {
+        damage = damage * 10
+    }
+    let mo: ptr<void> = PLAYER_mo(player)
+    let mut angle: u32 = MOBJ_angle(mo)
+    angle = angle + (((P_Random() - P_Random()) << 18) as u32)
+    let slope: i32 = P_AimLineAttack(mo, angle, PSPR_MELEERANGE)
+    P_LineAttack(mo, angle, PSPR_MELEERANGE, slope, damage)
+
+    let lt: ptr<void> = MAP_linetarget()
+    if (lt as i64) != 0 {
+        S_StartSound(mo, PSPR_SFX_PUNCH)
+        MOBJ_set_angle(mo, R_PointToAngle2(
+            MOBJ_x(mo), MOBJ_y(mo),
+            MOBJ_x(lt), MOBJ_y(lt)))
+    }
+}
+
+# ---- A_Saw ------------------------------------------------------------
+
+@flow_api
+function A_Saw(player: ptr<void>, psp: ptr<void>) -> void {
+    let damage: i32 = 2 * (P_Random() % 10 + 1)
+    let mo: ptr<void> = PLAYER_mo(player)
+    let mut angle: u32 = MOBJ_angle(mo)
+    angle = angle + (((P_Random() - P_Random()) << 18) as u32)
+
+    # meleerange + 1 so the puff doesn't skip the flash
+    let slope: i32 = P_AimLineAttack(mo, angle, PSPR_MELEERANGE + 1)
+    P_LineAttack(mo, angle, PSPR_MELEERANGE + 1, slope, damage)
+
+    let lt: ptr<void> = MAP_linetarget()
+    if (lt as i64) == 0 {
+        S_StartSound(mo, PSPR_SFX_SAWFUL)
+        return
+    }
+    S_StartSound(mo, PSPR_SFX_SAWHIT)
+
+    angle = R_PointToAngle2(
+        MOBJ_x(mo), MOBJ_y(mo),
+        MOBJ_x(lt), MOBJ_y(lt))
+    let delta: u32 = angle - MOBJ_angle(mo)
+    if delta > PSPR_ANG180 {
+        let sdelta: i32 = delta as i32
+        if sdelta < (0 - PSPR_ANG90_20) {
+            MOBJ_set_angle(mo, angle + (PSPR_ANG90_21 as u32))
+        } else {
+            MOBJ_set_angle(mo, MOBJ_angle(mo) - (PSPR_ANG90_20 as u32))
+        }
+    } else {
+        if delta > (PSPR_ANG90_20 as u32) {
+            MOBJ_set_angle(mo, angle - (PSPR_ANG90_21 as u32))
+        } else {
+            MOBJ_set_angle(mo, MOBJ_angle(mo) + (PSPR_ANG90_20 as u32))
+        }
+    }
+    MOBJ_set_flags(mo, MOBJ_flags(mo) | PSPR_MF_JUSTATTACKED)
+}
+
+# ---- missile / plasma / BFG fire --------------------------------------
+
+@flow_api
+function A_FireMissile(player: ptr<void>, psp: ptr<void>) -> void {
+    PSPR_DecreaseAmmo(player, WEAPONINFO_ammo(PLAYER_readyweapon(player)), 1)
+    P_SpawnPlayerMissile(PLAYER_mo(player), PSPR_MT_ROCKET)
+}
+
+@flow_api
+function A_FireBFG(player: ptr<void>, psp: ptr<void>) -> void {
+    PSPR_DecreaseAmmo(player, WEAPONINFO_ammo(PLAYER_readyweapon(player)),
+        PSPR_DEH_BFG_CELLS)
+    P_SpawnPlayerMissile(PLAYER_mo(player), PSPR_MT_BFG)
+}
+
+@flow_api
+function A_FirePlasma(player: ptr<void>, psp: ptr<void>) -> void {
+    PSPR_DecreaseAmmo(player, WEAPONINFO_ammo(PLAYER_readyweapon(player)), 1)
+    P_SetPsprite(player, PSPR_PS_FLASH,
+        WEAPONINFO_flashstate(PLAYER_readyweapon(player)) + (P_Random() & 1))
+    P_SpawnPlayerMissile(PLAYER_mo(player), PSPR_MT_PLASMA)
+}
+
+# ---- P_BulletSlope / P_GunShot ----------------------------------------
+
+# maputl.flow blockmap-overrun poke needs the address of bulletslope.
+@flow_api
+function psprshim_bulletslope_addr() -> ptr<i32> { return &bulletslope }
+
+function P_BulletSlope(mo: ptr<void>) -> void {
+    let mut an: u32 = MOBJ_angle(mo)
+    bulletslope = P_AimLineAttack(mo, an, PSPR_AIMRANGE)
+    if (MAP_linetarget() as i64) == 0 {
+        an = an + (1 << 26)
+        bulletslope = P_AimLineAttack(mo, an, PSPR_AIMRANGE)
+        if (MAP_linetarget() as i64) == 0 {
+            an = an - (2 << 26)
+            bulletslope = P_AimLineAttack(mo, an, PSPR_AIMRANGE)
+        }
+    }
+}
+
+function P_GunShot(mo: ptr<void>, accurate: i32) -> void {
+    let damage: i32 = 5 * (P_Random() % 3 + 1)
+    let mut angle: u32 = MOBJ_angle(mo)
+    if accurate == 0 {
+        angle = angle + (((P_Random() - P_Random()) << 18) as u32)
+    }
+    P_LineAttack(mo, angle, PSPR_MISSILERANGE, bulletslope, damage)
+}
+
+# ---- hitscan weapons --------------------------------------------------
+
+@flow_api
+function A_FirePistol(player: ptr<void>, psp: ptr<void>) -> void {
+    let mo: ptr<void> = PLAYER_mo(player)
+    S_StartSound(mo, PSPR_SFX_PISTOL)
+    P_SetMobjState(mo, PSPR_S_PLAY_ATK2)
+    PSPR_DecreaseAmmo(player, WEAPONINFO_ammo(PLAYER_readyweapon(player)), 1)
+    P_SetPsprite(player, PSPR_PS_FLASH, WEAPONINFO_flashstate(PLAYER_readyweapon(player)))
+    P_BulletSlope(mo)
+    let accurate: i32 = 1
+    if PLAYER_refire(player) != 0 {
+        accurate = 0
+    }
+    P_GunShot(mo, accurate)
+}
+
+@flow_api
+function A_FireShotgun(player: ptr<void>, psp: ptr<void>) -> void {
+    let mo: ptr<void> = PLAYER_mo(player)
+    S_StartSound(mo, PSPR_SFX_SHOTGN)
+    P_SetMobjState(mo, PSPR_S_PLAY_ATK2)
+    PSPR_DecreaseAmmo(player, WEAPONINFO_ammo(PLAYER_readyweapon(player)), 1)
+    P_SetPsprite(player, PSPR_PS_FLASH, WEAPONINFO_flashstate(PLAYER_readyweapon(player)))
+    P_BulletSlope(mo)
+    for i in 0 to 7 {
+        P_GunShot(mo, 0)
+    }
+}
+
+@flow_api
+function A_FireShotgun2(player: ptr<void>, psp: ptr<void>) -> void {
+    let mo: ptr<void> = PLAYER_mo(player)
+    S_StartSound(mo, PSPR_SFX_DSHTGN)
+    P_SetMobjState(mo, PSPR_S_PLAY_ATK2)
+    PSPR_DecreaseAmmo(player, WEAPONINFO_ammo(PLAYER_readyweapon(player)), 2)
+    P_SetPsprite(player, PSPR_PS_FLASH, WEAPONINFO_flashstate(PLAYER_readyweapon(player)))
+    P_BulletSlope(mo)
+    for i in 0 to 20 {
+        let damage: i32 = 5 * (P_Random() % 3 + 1)
+        let mut angle: u32 = MOBJ_angle(mo)
+        angle = angle + (((P_Random() - P_Random()) << 19) as u32)
+        P_LineAttack(mo, angle, PSPR_MISSILERANGE,
+            bulletslope + ((P_Random() - P_Random()) << 5), damage)
+    }
+}
+
+@flow_api
+function A_FireCGun(player: ptr<void>, psp: ptr<void>) -> void {
+    let mo: ptr<void> = PLAYER_mo(player)
+    S_StartSound(mo, PSPR_SFX_PISTOL)
+    let ammo: i32 = WEAPONINFO_ammo(PLAYER_readyweapon(player))
+    if PLAYER_ammo(player, ammo) == 0 {
+        return
+    }
+    P_SetMobjState(mo, PSPR_S_PLAY_ATK2)
+    PSPR_DecreaseAmmo(player, ammo, 1)
+    # flashstate + (psp->state - &states[S_CHAIN1])
+    let flash: i32 = WEAPONINFO_flashstate(PLAYER_readyweapon(player))
+        + STATE_index(PSP_state(psp)) - PSPR_S_CHAIN1
+    P_SetPsprite(player, PSPR_PS_FLASH, flash)
+    P_BulletSlope(mo)
+    let accurate: i32 = 1
+    if PLAYER_refire(player) != 0 {
+        accurate = 0
+    }
+    P_GunShot(mo, accurate)
+}
+
+# ---- light levels -----------------------------------------------------
+
+@flow_api
+function A_Light0(player: ptr<void>, psp: ptr<void>) -> void {
+    PLAYER_set_extralight(player, 0)
+}
+
+@flow_api
+function A_Light1(player: ptr<void>, psp: ptr<void>) -> void {
+    PLAYER_set_extralight(player, 1)
+}
+
+@flow_api
+function A_Light2(player: ptr<void>, psp: ptr<void>) -> void {
+    PLAYER_set_extralight(player, 2)
+}
+
+# ---- A_BFGSpray / A_BFGsound ------------------------------------------
+
+@flow_api
+function A_BFGSpray(mo: ptr<void>) -> void {
+    for i in 0 to 40 {
+        let an: u32 = MOBJ_angle(mo) - PSPR_ANG90 / (2 as u32)
+            + PSPR_ANG90 / (40 as u32) * (i as u32)
+        let origin: ptr<void> = MOBJ_target(mo)
+        P_AimLineAttack(origin, an, PSPR_AIMRANGE)
+        let lt: ptr<void> = MAP_linetarget()
+        if (lt as i64) == 0 {
+            continue
+        }
+        P_SpawnMobj(
+            MOBJ_x(lt),
+            MOBJ_y(lt),
+            MOBJ_z(lt) + (MOBJ_height(lt) >> 2),
+            PSPR_MT_EXTRABFG)
+        let mut damage: i32 = 0
+        for j in 0 to 15 {
+            damage = damage + (P_Random() & 7) + 1
+        }
+        P_DamageMobj(lt, origin, origin, damage)
+    }
+}
+
+@flow_api
+function A_BFGsound(player: ptr<void>, psp: ptr<void>) -> void {
+    S_StartSound(PLAYER_mo(player), PSPR_SFX_BFG)
+}
+
+# ---- P_SetupPsprites / P_MovePsprites ---------------------------------
+
+@flow_api
+function P_SetupPsprites(player: ptr<void>) -> void {
+    for i in 0 to PSPR_NUMPSPRITES {
+        PSP_set_state(PLAYER_psp(player, i), null)
+    }
+    PLAYER_set_pendingweapon(player, PLAYER_readyweapon(player))
+    P_BringUpWeapon(player)
+}
+
+@flow_api
+function P_MovePsprites(player: ptr<void>) -> void {
+    for i in 0 to PSPR_NUMPSPRITES {
+        let psp: ptr<void> = PLAYER_psp(player, i)
+        let state: ptr<void> = PSP_state(psp)
+        if (state as i64) != 0 {
+            if PSP_tics(psp) != (0 - 1) {
+                PSP_set_tics(psp, PSP_tics(psp) - 1)
+                if PSP_tics(psp) == 0 {
+                    P_SetPsprite(player, i, STATE_nextstate(PSP_state(psp)))
+                }
+            }
+        }
+    }
+    let weapon: ptr<void> = PLAYER_psp(player, PSPR_PS_WEAPON)
+    let flash: ptr<void> = PLAYER_psp(player, PSPR_PS_FLASH)
+    PSP_set_sx(flash, PSP_sx(weapon))
+    PSP_set_sy(flash, PSP_sy(weapon))
+}

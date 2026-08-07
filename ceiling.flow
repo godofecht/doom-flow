@@ -1,0 +1,413 @@
+# Ceiling movers, ported from p_ceilng.c to Flow.
+#
+# ceiling_t layout is kept identical to p_spec.h (LP64 offsetof):
+#
+#   thinker_t  thinker;        0
+#   ceiling_e  type;          24
+#   sector_t*  sector;        32
+#   fixed_t    bottomheight;  40
+#   fixed_t    topheight;     44
+#   fixed_t    speed;         48
+#   boolean    crush;         52
+#   int        direction;     56
+#   int        tag;           60
+#   int        olddirection;  64
+#                     SIZEOF  72
+#
+# activeceilings[MAXCEILINGS] is Flow-owned in spec.flow (specshim_*).
+# Sector / line / leveltime go through GEOM_* / STAT_*.
+
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function P_AddThinker(thinker: ptr<void>) -> void }
+extern { function P_RemoveThinker(thinker: ptr<void>) -> void }
+extern { function P_FindSectorFromLineTag(line: ptr<void>, start: i32) -> i32 }
+extern { function P_FindHighestCeilingSurrounding(sec: ptr<void>) -> i32 }
+extern { function T_MovePlane(sector: ptr<void>, speed: i32, dest: i32, crush: i32, floorOrCeiling: i32, direction: i32) -> i32 }
+extern { function S_StartSound(origin: ptr<void>, sound_id: i32) -> void }
+
+extern { function specshim_activeceilings() -> ptr<i64> }
+
+extern { function GEOM_sector(i: i32) -> ptr<void> }
+extern { function GEOM_sector_floorheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_ceilingheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_tag(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_specialdata(s: ptr<void>) -> ptr<void> }
+extern { function GEOM_sector_set_specialdata(s: ptr<void>, v: ptr<void>) -> void }
+extern { function GEOM_sector_soundorg(s: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_tag(ld: ptr<void>) -> i32 }
+extern { function THINKER_set_move_ceiling(th: ptr<void>) -> void }
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+# Constants from p_spec.h / z_zone.h / m_fixed.h / sounds.h.
+const CEIL_SPEED: i32 = 65536
+const CEIL_WAIT: i32 = 150
+const CEIL_MAXCEILINGS: i32 = 30
+const CEIL_PU_LEVSPEC: i32 = 6
+const CEIL_FRACUNIT: i32 = 65536
+const CEIL_SIZEOF: i32 = 72
+
+# ceiling_e
+const CEIL_LOWER_TO_FLOOR: i32 = 0
+const CEIL_RAISE_TO_HIGHEST: i32 = 1
+const CEIL_LOWER_AND_CRUSH: i32 = 2
+const CEIL_CRUSH_AND_RAISE: i32 = 3
+const CEIL_FAST_CRUSH_AND_RAISE: i32 = 4
+const CEIL_SILENT_CRUSH_AND_RAISE: i32 = 5
+
+# result_e
+const CEIL_RES_CRUSHED: i32 = 1
+const CEIL_RES_PASTDEST: i32 = 2
+
+# sfxenum_t
+const CEIL_SFX_PSTOP: i32 = 19
+const CEIL_SFX_STNMOV: i32 = 22
+
+# ---- thinker.function -------------------------------------------------
+
+function ceil_set_acv_null(obj: i64) -> void {
+    let p: ptr<i64> = (obj + 16) as ptr<i64>
+    p[0] = 0
+}
+
+# ---- ceiling_t field access -------------------------------------------
+
+function ceil_type(c: i64) -> i32 {
+    let p: ptr<i32> = (c + 24) as ptr<i32>
+    return p[0]
+}
+
+function ceil_set_type(c: i64, v: i32) -> void {
+    let p: ptr<i32> = (c + 24) as ptr<i32>
+    p[0] = v
+}
+
+function ceil_sector(c: i64) -> ptr<void> {
+    let p: ptr<i64> = (c + 32) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+function ceil_set_sector(c: i64, s: ptr<void>) -> void {
+    let p: ptr<i64> = (c + 32) as ptr<i64>
+    p[0] = s as i64
+}
+
+function ceil_bottomheight(c: i64) -> i32 {
+    let p: ptr<i32> = (c + 40) as ptr<i32>
+    return p[0]
+}
+
+function ceil_set_bottomheight(c: i64, v: i32) -> void {
+    let p: ptr<i32> = (c + 40) as ptr<i32>
+    p[0] = v
+}
+
+function ceil_topheight(c: i64) -> i32 {
+    let p: ptr<i32> = (c + 44) as ptr<i32>
+    return p[0]
+}
+
+function ceil_set_topheight(c: i64, v: i32) -> void {
+    let p: ptr<i32> = (c + 44) as ptr<i32>
+    p[0] = v
+}
+
+function ceil_speed(c: i64) -> i32 {
+    let p: ptr<i32> = (c + 48) as ptr<i32>
+    return p[0]
+}
+
+function ceil_set_speed(c: i64, v: i32) -> void {
+    let p: ptr<i32> = (c + 48) as ptr<i32>
+    p[0] = v
+}
+
+function ceil_crush(c: i64) -> i32 {
+    let p: ptr<i32> = (c + 52) as ptr<i32>
+    return p[0]
+}
+
+function ceil_set_crush(c: i64, v: i32) -> void {
+    let p: ptr<i32> = (c + 52) as ptr<i32>
+    p[0] = v
+}
+
+function ceil_direction(c: i64) -> i32 {
+    let p: ptr<i32> = (c + 56) as ptr<i32>
+    return p[0]
+}
+
+function ceil_set_direction(c: i64, v: i32) -> void {
+    let p: ptr<i32> = (c + 56) as ptr<i32>
+    p[0] = v
+}
+
+function ceil_tag(c: i64) -> i32 {
+    let p: ptr<i32> = (c + 60) as ptr<i32>
+    return p[0]
+}
+
+function ceil_set_tag(c: i64, v: i32) -> void {
+    let p: ptr<i32> = (c + 60) as ptr<i32>
+    p[0] = v
+}
+
+function ceil_olddirection(c: i64) -> i32 {
+    let p: ptr<i32> = (c + 64) as ptr<i32>
+    return p[0]
+}
+
+function ceil_set_olddirection(c: i64, v: i32) -> void {
+    let p: ptr<i32> = (c + 64) as ptr<i32>
+    p[0] = v
+}
+
+# ---- thinkers ---------------------------------------------------------
+
+@flow_api
+function T_MoveCeiling(ceiling: ptr<void>) -> void {
+    let c: i64 = ceiling as i64
+    let dir: i32 = ceil_direction(c)
+    let sec: ptr<void> = ceil_sector(c)
+    let org: ptr<void> = GEOM_sector_soundorg(sec)
+    let ty: i32 = ceil_type(c)
+
+    if dir == 0 {
+        # IN STASIS
+        return
+    }
+
+    if dir == 1 {
+        # UP
+        let res: i32 = T_MovePlane(sec, ceil_speed(c), ceil_topheight(c), 0, 1, dir)
+
+        if (STAT_leveltime() & 7) == 0 {
+            if ty != CEIL_SILENT_CRUSH_AND_RAISE {
+                S_StartSound(org, CEIL_SFX_STNMOV)
+            }
+        }
+
+        if res == CEIL_RES_PASTDEST {
+            if ty == CEIL_RAISE_TO_HIGHEST {
+                P_RemoveActiveCeiling(ceiling)
+            } else {
+                if ty == CEIL_SILENT_CRUSH_AND_RAISE {
+                    S_StartSound(org, CEIL_SFX_PSTOP)
+                    ceil_set_direction(c, 0 - 1)
+                } else {
+                    if ty == CEIL_FAST_CRUSH_AND_RAISE or ty == CEIL_CRUSH_AND_RAISE {
+                        ceil_set_direction(c, 0 - 1)
+                    }
+                }
+            }
+        }
+        return
+    }
+
+    if dir == (0 - 1) {
+        # DOWN
+        let res2: i32 = T_MovePlane(sec, ceil_speed(c), ceil_bottomheight(c), ceil_crush(c), 1, dir)
+
+        if (STAT_leveltime() & 7) == 0 {
+            if ty != CEIL_SILENT_CRUSH_AND_RAISE {
+                S_StartSound(org, CEIL_SFX_STNMOV)
+            }
+        }
+
+        if res2 == CEIL_RES_PASTDEST {
+            if ty == CEIL_SILENT_CRUSH_AND_RAISE {
+                S_StartSound(org, CEIL_SFX_PSTOP)
+                ceil_set_speed(c, CEIL_SPEED)
+                ceil_set_direction(c, 1)
+            } else {
+                if ty == CEIL_CRUSH_AND_RAISE {
+                    ceil_set_speed(c, CEIL_SPEED)
+                    ceil_set_direction(c, 1)
+                } else {
+                    if ty == CEIL_FAST_CRUSH_AND_RAISE {
+                        ceil_set_direction(c, 1)
+                    } else {
+                        if ty == CEIL_LOWER_AND_CRUSH or ty == CEIL_LOWER_TO_FLOOR {
+                            P_RemoveActiveCeiling(ceiling)
+                        }
+                    }
+                }
+            }
+        } else {
+            if res2 == CEIL_RES_CRUSHED {
+                if ty == CEIL_SILENT_CRUSH_AND_RAISE or ty == CEIL_CRUSH_AND_RAISE or ty == CEIL_LOWER_AND_CRUSH {
+                    ceil_set_speed(c, CEIL_SPEED / 8)
+                }
+            }
+        }
+    }
+}
+
+@flow_api
+function EV_DoCeiling(line: ptr<void>, ceiltype: i32) -> i32 {
+    let mut secnum: i32 = 0 - 1
+    let mut rtn: i32 = 0
+
+    # Reactivate in-stasis ceilings for certain types.
+    if ceiltype == CEIL_FAST_CRUSH_AND_RAISE or ceiltype == CEIL_SILENT_CRUSH_AND_RAISE or ceiltype == CEIL_CRUSH_AND_RAISE {
+        P_ActivateInStasisCeiling(line)
+    }
+
+    let mut looping: bool = true
+    while looping {
+        secnum = P_FindSectorFromLineTag(line, secnum)
+        if secnum < 0 {
+            looping = false
+        } else {
+            let sec: ptr<void> = GEOM_sector(secnum)
+            if (GEOM_sector_specialdata(sec) as i64) == 0 {
+                rtn = 1
+                let ceiling: ptr<void> = Z_Malloc(CEIL_SIZEOF, CEIL_PU_LEVSPEC, 0 as ptr<void>)
+                P_AddThinker(ceiling)
+                GEOM_sector_set_specialdata(sec, ceiling)
+
+                let c: i64 = ceiling as i64
+                THINKER_set_move_ceiling(ceiling)
+                ceil_set_sector(c, sec)
+                ceil_set_crush(c, 0)
+
+                if ceiltype == CEIL_FAST_CRUSH_AND_RAISE {
+                    ceil_set_crush(c, 1)
+                    ceil_set_topheight(c, GEOM_sector_ceilingheight(sec))
+                    ceil_set_bottomheight(c, GEOM_sector_floorheight(sec) + 8 * CEIL_FRACUNIT)
+                    ceil_set_direction(c, 0 - 1)
+                    ceil_set_speed(c, CEIL_SPEED * 2)
+                } else {
+                    if ceiltype == CEIL_SILENT_CRUSH_AND_RAISE or ceiltype == CEIL_CRUSH_AND_RAISE {
+                        ceil_set_crush(c, 1)
+                        ceil_set_topheight(c, GEOM_sector_ceilingheight(sec))
+                        ceil_set_bottomheight(c, GEOM_sector_floorheight(sec))
+                        if ceiltype != CEIL_LOWER_TO_FLOOR {
+                            ceil_set_bottomheight(c, ceil_bottomheight(c) + 8 * CEIL_FRACUNIT)
+                        }
+                        ceil_set_direction(c, 0 - 1)
+                        ceil_set_speed(c, CEIL_SPEED)
+                    } else {
+                        if ceiltype == CEIL_LOWER_AND_CRUSH or ceiltype == CEIL_LOWER_TO_FLOOR {
+                            ceil_set_bottomheight(c, GEOM_sector_floorheight(sec))
+                            if ceiltype != CEIL_LOWER_TO_FLOOR {
+                                ceil_set_bottomheight(c, ceil_bottomheight(c) + 8 * CEIL_FRACUNIT)
+                            }
+                            ceil_set_direction(c, 0 - 1)
+                            ceil_set_speed(c, CEIL_SPEED)
+                        } else {
+                            if ceiltype == CEIL_RAISE_TO_HIGHEST {
+                                ceil_set_topheight(c, P_FindHighestCeilingSurrounding(sec))
+                                ceil_set_direction(c, 1)
+                                ceil_set_speed(c, CEIL_SPEED)
+                            }
+                        }
+                    }
+                }
+
+                ceil_set_tag(c, GEOM_sector_tag(sec))
+                ceil_set_type(c, ceiltype)
+                P_AddActiveCeiling(ceiling)
+            }
+        }
+    }
+    return rtn
+}
+
+@flow_api
+function P_ActiveCeilingIndex(th: ptr<void>) -> i32 {
+    let ceils: ptr<i64> = specshim_activeceilings()
+    for i in 0 to CEIL_MAXCEILINGS {
+        if ceils[i] == (th as i64) {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+@flow_api
+function P_AddActiveCeiling(c: ptr<void>) -> void {
+    let ceils: ptr<i64> = specshim_activeceilings()
+    let mut i: i32 = 0
+    let mut found: bool = false
+    while i < CEIL_MAXCEILINGS and !found {
+        if ceils[i] == 0 {
+            ceils[i] = c as i64
+            found = true
+        }
+        i = i + 1
+    }
+}
+
+@flow_api
+function P_RemoveActiveCeiling(c: ptr<void>) -> void {
+    let ceils: ptr<i64> = specshim_activeceilings()
+    let mut i: i32 = 0
+    let mut found: bool = false
+    while i < CEIL_MAXCEILINGS and !found {
+        if ceils[i] == (c as i64) {
+            let ac: i64 = ceils[i]
+            GEOM_sector_set_specialdata(ceil_sector(ac), 0 as ptr<void>)
+            P_RemoveThinker(ac as ptr<void>)
+            ceils[i] = 0
+            found = true
+        }
+        i = i + 1
+    }
+}
+
+@flow_api
+function P_ActivateInStasisCeiling(line: ptr<void>) -> void {
+    let ltag: i32 = GEOM_line_tag(line)
+    let ceils: ptr<i64> = specshim_activeceilings()
+    let mut i: i32 = 0
+    while i < CEIL_MAXCEILINGS {
+        let ac: i64 = ceils[i]
+        if ac != 0 {
+            if ceil_tag(ac) == ltag and ceil_direction(ac) == 0 {
+                ceil_set_direction(ac, ceil_olddirection(ac))
+                THINKER_set_move_ceiling(ac as ptr<void>)
+            }
+        }
+        i = i + 1
+    }
+}
+
+@flow_api
+function EV_CeilingCrushStop(line: ptr<void>) -> i32 {
+    let ltag: i32 = GEOM_line_tag(line)
+    let ceils: ptr<i64> = specshim_activeceilings()
+    let mut rtn: i32 = 0
+    let mut i: i32 = 0
+    while i < CEIL_MAXCEILINGS {
+        let ac: i64 = ceils[i]
+        if ac != 0 {
+            if ceil_tag(ac) == ltag and ceil_direction(ac) != 0 {
+                ceil_set_olddirection(ac, ceil_direction(ac))
+                ceil_set_acv_null(ac)
+                ceil_set_direction(ac, 0)
+                rtn = 1
+            }
+        }
+        i = i + 1
+    }
+    return rtn
+}

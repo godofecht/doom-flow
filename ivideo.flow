@@ -1,0 +1,531 @@
+# doomgeneric video bridge, ported from i_video.c to Flow.
+#
+# Owns the 8-bit draw buffer handoff (I_VideoBuffer), palette→FB conversion
+# (cmap_to_fb / I_FinishUpdate), and the doomgeneric init path
+# (I_InitGraphics). CMAP256 is off in this build; SYS_BIG_ENDIAN is off.
+#
+# Engine-visible globals (I_VideoBuffer, usegamma, mouse_*, screenvisible,
+# screensaver_mode, usemouse) live here; unported C shims reach them through
+# @flow_api accessors. Module-private FB state, colors[], and
+# rgb565_palette[] stay Flow-side (heap structs; module statics cannot hold
+# Flow structs).
+
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+extern { function memset(dest: ptr<void>, c: i32, n: i64) -> ptr<void> }
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+extern { function strcmp(a: string, b: string) -> i32 }
+extern { function printf(fmt: string) -> i32 }
+extern { function printf(fmt: string, a: i32) -> i32 }
+extern { function printf(fmt: string, a: i32, b: i32) -> i32 }
+extern { function printf(fmt: string, a: i32, b: i32, c: i32, d: i32, e: i32) -> i32 }
+extern { function printf(fmt: string, a: i32, b: i32, c: i32, d: i32, e: i32, f: i32, g: i32, h: i32) -> i32 }
+extern { function snprintf(buf: string, n: i64, fmt: string, a: i32) -> i32 }
+extern { function snprintf(buf: string, n: i64, fmt: string, s: string) -> i32 }
+extern { function I_Error(msg: string) -> void }
+
+extern { function M_CheckParmWithArgs(check: string, num_args: i32) -> i32 }
+extern { function argvflow_argv() -> ptr<i64> }
+extern { function M_BindVariable(name: string, location: ptr<void>) -> void }
+
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function Z_Free(p: ptr<void>) -> void }
+
+extern { function I_InitInput() -> void }
+extern { function I_GetEvent() -> void }
+
+extern { function TABLES_gammatable(row: i32, col: i32) -> u8 }
+
+let mut ivideo_errbuf: array<u8, 128> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+function ivideoshim_print_fb(xres: i32, yres: i32, xv: i32, yv: i32, bpp: i32) -> void {
+    printf("I_InitGraphics: framebuffer: x_res: %d, y_res: %d, x_virtual: %d, y_virtual: %d, bpp: %d\n",
+           xres, yres, xv, yv, bpp)
+}
+
+function ivideoshim_print_rgba(rl: i32, gl: i32, bl: i32, tl: i32, ro: i32, go: i32, bo: i32, t_off: i32) -> void {
+    printf("I_InitGraphics: framebuffer: RGBA: %d%d%d%d, red_off: %d, green_off: %d, blue_off: %d, transp_off: %d\n",
+           rl, gl, bl, tl, ro, go, bo, t_off)
+}
+
+function ivideoshim_print_doom_size(w: i32, h: i32) -> void {
+    printf("I_InitGraphics: DOOM screen size: w x h: %d x %d\n", w, h)
+}
+
+function ivideoshim_print_scaling(s: i32) -> void {
+    printf("I_InitGraphics: Scaling factor: %d\n", s)
+}
+
+function ivideoshim_print_auto_scaling(s: i32) -> void {
+    printf("I_InitGraphics: Auto-scaling factor: %d\n", s)
+}
+
+function ivideoshim_error_bpp(bpp: i32) -> void {
+    snprintf((&ivideo_errbuf[0]) as string, 128, "No idea how to convert %d bpp pixels", bpp)
+    I_Error((&ivideo_errbuf[0]) as string)
+}
+
+function ivideoshim_error_gfxmode(mode: string) -> void {
+    snprintf((&ivideo_errbuf[0]) as string, 128, "Unknown gfxmode value: %s\n", mode)
+    I_Error((&ivideo_errbuf[0]) as string)
+}
+
+# ---- engine-visible globals (were i_video.c) --------------------------
+
+let mut ivideo_buffer: ptr<u8> = null
+let mut screensaver_mode: i32 = 0
+let mut screenvisible: i32 = 0
+let mut mouse_acceleration: f32 = 2.0
+let mut mouse_threshold: i32 = 10
+let mut usegamma: i32 = 0
+let mut usemouse: i32 = 0
+
+# ---- doomgeneric screen bridge (formerly dg_shim.c) -------------------
+#
+# DG_ScreenBuffer / DOOMGENERIC_RESX/RESY. DG_Init/DG_DrawFrame/
+# DG_SetWindowTitle were empty stubs in dg_shim.c, so their call sites
+# below (I_FinishUpdate / I_SetWindowTitle) simply no longer call them.
+
+const DG_RESX: i32 = 640
+const DG_RESY: i32 = 400
+
+let mut dg_screen_buf: ptr<u8> = null
+
+@flow_api
+function dg_resx() -> i32 { return DG_RESX }
+
+@flow_api
+function dg_resy() -> i32 { return DG_RESY }
+
+@flow_api
+function dg_screen() -> ptr<u8> {
+    if (dg_screen_buf as i64) == 0 {
+        dg_screen_buf = calloc((DG_RESX * DG_RESY * 4) as i64, 1) as ptr<u8>
+    }
+    return dg_screen_buf
+}
+
+@flow_api
+function VIDEO_buffer() -> ptr<u8> { return ivideo_buffer }
+
+@flow_api
+function VIDEO_set_buffer(p: ptr<u8>) -> void { ivideo_buffer = p }
+
+@flow_api
+function IVIDEO_usegamma() -> i32 { return usegamma }
+
+@flow_api
+function IVIDEO_set_usegamma(v: i32) -> void { usegamma = v }
+
+@flow_api
+function IVIDEO_usegamma_addr() -> ptr<i32> { return &usegamma }
+
+@flow_api
+function IVIDEO_screenvisible() -> i32 { return screenvisible }
+
+@flow_api
+function IVIDEO_set_screenvisible(v: i32) -> void { screenvisible = v }
+
+@flow_api
+function IVIDEO_screensaver_mode() -> i32 { return screensaver_mode }
+
+@flow_api
+function IVIDEO_set_screensaver_mode(v: i32) -> void { screensaver_mode = v }
+
+@flow_api
+function IVIDEO_usemouse() -> i32 { return usemouse }
+
+@flow_api
+function IVIDEO_usemouse_addr() -> ptr<i32> { return &usemouse }
+
+@flow_api
+function IVIDEO_mouse_threshold() -> i32 { return mouse_threshold }
+
+@flow_api
+function IVIDEO_mouse_threshold_addr() -> ptr<i32> { return &mouse_threshold }
+
+@flow_api
+function IVIDEO_mouse_acceleration() -> f32 { return mouse_acceleration }
+
+@flow_api
+function IVIDEO_mouse_acceleration_addr() -> ptr<f32> { return &mouse_acceleration }
+
+# i_video.h
+const IVIDEO_SCREENWIDTH: i32 = 320
+const IVIDEO_SCREENHEIGHT: i32 = 200
+
+# z_zone.h
+const IVIDEO_PU_STATIC: i32 = 1
+
+# limits.h
+const IVIDEO_INT_MAX: i32 = 2147483647
+
+# sizeof(FBScreenInfo): 13 * u32 = 52
+const IVIDEO_FB_SIZE: i64 = 52
+
+# struct color (i_video.h bitfields → byte order B,G,R,A on LE)
+struct IVideoColor {
+    b: u8,
+    g: u8,
+    r: u8,
+    a: u8
+}
+
+# FB_ScreenInfo (i_video.c), module-private
+struct FBScreenInfo {
+    xres: u32,
+    yres: u32,
+    xres_virtual: u32,
+    yres_virtual: u32,
+    bits_per_pixel: u32,
+    red_offset: u32,
+    red_length: u32,
+    green_offset: u32,
+    green_length: u32,
+    blue_offset: u32,
+    blue_length: u32,
+    transp_offset: u32,
+    transp_length: u32
+}
+
+# Heap-backed; module statics cannot hold Flow structs.
+let mut s_Fb_ptr: ptr<FBScreenInfo> = null
+
+# int fb_scaling (i_video.c); only this module uses it.
+let mut fb_scaling: i32 = 1
+
+# static struct color colors[256]
+let mut colors_ptr: ptr<IVideoColor> = null
+
+# static uint16_t rgb565_palette[256]
+let mut rgb565_palette_ptr: ptr<u16> = null
+
+function ivideo_fb() -> ptr<FBScreenInfo> {
+    if (s_Fb_ptr as i64) == 0 {
+        s_Fb_ptr = calloc(1, IVIDEO_FB_SIZE) as ptr<FBScreenInfo>
+    }
+    return s_Fb_ptr
+}
+
+function ivideo_colors() -> ptr<IVideoColor> {
+    if (colors_ptr as i64) == 0 {
+        colors_ptr = calloc(256, 4) as ptr<IVideoColor>
+    }
+    return colors_ptr
+}
+
+function ivideo_rgb565_palette() -> ptr<u16> {
+    if (rgb565_palette_ptr as i64) == 0 {
+        rgb565_palette_ptr = calloc(256, 2) as ptr<u16>
+    }
+    return rgb565_palette_ptr
+}
+
+function ivideo_argv_at(i: i32) -> ptr<u8> {
+    let words: ptr<i64> = argvflow_argv()
+    return words[i] as ptr<u8>
+}
+
+function ivideo_atoi(s: ptr<u8>) -> i32 {
+    let mut i: i32 = 0
+    while s[i] as i32 == 32 or (s[i] as i32 >= 9 and s[i] as i32 <= 13) {
+        i = i + 1
+    }
+    let mut sign: i32 = 1
+    if s[i] as i32 == 45 {
+        sign = 0 - 1
+        i = i + 1
+    } elif s[i] as i32 == 43 {
+        i = i + 1
+    }
+    let mut v: i32 = 0
+    let mut c: i32 = s[i] as i32
+    while c >= 48 and c <= 57 {
+        v = v * 10 + (c - 48)
+        i = i + 1
+        c = s[i] as i32
+    }
+    return v * sign
+}
+
+function ivideo_addr(base: ptr<u8>, off: i32) -> ptr<u8> {
+    return ((base as i64) + off as i64) as ptr<u8>
+}
+
+# GFX_RGB565_* macros from i_video.c
+function ivideo_rgb565_r(color: i32) -> i32 {
+    return (0xF800 & color) >> 11
+}
+
+function ivideo_rgb565_g(color: i32) -> i32 {
+    return (0x07E0 & color) >> 5
+}
+
+function ivideo_rgb565_b(color: i32) -> i32 {
+    return 0x001F & color
+}
+
+@flow_api
+function cmap_to_rgb565(out: ptr<u16>, inp: ptr<u8>, in_pixels: i32) -> void {
+    let cols: ptr<IVideoColor> = ivideo_colors()
+    let mut i: i32 = 0
+    let mut out_i: i32 = 0
+    let mut in_i: i32 = 0
+    while i < in_pixels {
+        let c: IVideoColor = cols[inp[in_i] as i32]
+        let r: u16 = ((c.r as u16) >> 3) << 11
+        let g: u16 = ((c.g as u16) >> 2) << 5
+        let b: u16 = ((c.b as u16) >> 3) << 0
+        out[out_i] = r | g | b
+        in_i = in_i + 1
+        for j in 0 to fb_scaling {
+            out_i = out_i + 1
+        }
+        i = i + 1
+    }
+}
+
+@flow_api
+function cmap_to_fb(out: ptr<u8>, inp: ptr<u8>, in_pixels: i32) -> void {
+    let cols: ptr<IVideoColor> = ivideo_colors()
+    let fb: ptr<FBScreenInfo> = ivideo_fb()
+    let mut i: i32 = 0
+    let mut out_p: ptr<u8> = out
+    let mut in_i: i32 = 0
+    while i < in_pixels {
+        let c: IVideoColor = cols[inp[in_i] as i32]
+        let bpp: i32 = fb[0].bits_per_pixel as i32
+
+        if bpp == 16 {
+            let p: u16 = ((((c.r as i32) & 0xF8) << 8)
+                | (((c.g as i32) & 0xFC) << 3)
+                | ((c.b as i32) >> 3)) as u16
+            for k in 0 to fb_scaling {
+                let out16: ptr<u16> = out_p as ptr<u16>
+                out16[0] = p
+                out_p = ivideo_addr(out_p, 2)
+            }
+        } elif bpp == 32 {
+            let pix: u32 = ((c.r as u32) << fb[0].red_offset)
+                | ((c.g as u32) << fb[0].green_offset)
+                | ((c.b as u32) << fb[0].blue_offset)
+            for k in 0 to fb_scaling {
+                let out32: ptr<u32> = out_p as ptr<u32>
+                out32[0] = pix
+                out_p = ivideo_addr(out_p, 4)
+            }
+        } else {
+            ivideoshim_error_bpp(bpp)
+        }
+
+        in_i = in_i + 1
+        i = i + 1
+    }
+}
+
+@flow_api
+function I_InitGraphics() -> void {
+    let fb: ptr<FBScreenInfo> = ivideo_fb()
+    memset(fb as ptr<void>, 0, IVIDEO_FB_SIZE)
+
+    fb[0].xres = dg_resx() as u32
+    fb[0].yres = dg_resy() as u32
+    fb[0].xres_virtual = fb[0].xres
+    fb[0].yres_virtual = fb[0].yres
+
+    # CMAP256 off: -gfxmode path
+    let gfxmodeparm: i32 = M_CheckParmWithArgs("-gfxmode", 1)
+    let mut mode: string = "rgba8888"
+    if gfxmodeparm != 0 {
+        mode = ivideo_argv_at(gfxmodeparm + 1) as string
+    }
+
+    if strcmp(mode, "rgba8888") == 0 {
+        fb[0].bits_per_pixel = 32 as u32
+        fb[0].blue_length = 8 as u32
+        fb[0].green_length = 8 as u32
+        fb[0].red_length = 8 as u32
+        fb[0].transp_length = 8 as u32
+        fb[0].blue_offset = 0 as u32
+        fb[0].green_offset = 8 as u32
+        fb[0].red_offset = 16 as u32
+        fb[0].transp_offset = 24 as u32
+    } elif strcmp(mode, "rgb565") == 0 {
+        fb[0].bits_per_pixel = 16 as u32
+        fb[0].blue_length = 5 as u32
+        fb[0].green_length = 6 as u32
+        fb[0].red_length = 5 as u32
+        fb[0].transp_length = 0 as u32
+        fb[0].blue_offset = 11 as u32
+        fb[0].green_offset = 5 as u32
+        fb[0].red_offset = 0 as u32
+        fb[0].transp_offset = 16 as u32
+    } else {
+        ivideoshim_error_gfxmode(mode)
+    }
+
+    ivideoshim_print_fb(
+        fb[0].xres as i32, fb[0].yres as i32,
+        fb[0].xres_virtual as i32, fb[0].yres_virtual as i32,
+        fb[0].bits_per_pixel as i32)
+    ivideoshim_print_rgba(
+        fb[0].red_length as i32, fb[0].green_length as i32,
+        fb[0].blue_length as i32, fb[0].transp_length as i32,
+        fb[0].red_offset as i32, fb[0].green_offset as i32,
+        fb[0].blue_offset as i32, fb[0].transp_offset as i32)
+    ivideoshim_print_doom_size(IVIDEO_SCREENWIDTH, IVIDEO_SCREENHEIGHT)
+
+    let mut i: i32 = M_CheckParmWithArgs("-scaling", 1)
+    if i > 0 {
+        i = ivideo_atoi(ivideo_argv_at(i + 1))
+        fb_scaling = i
+        ivideoshim_print_scaling(fb_scaling)
+    } else {
+        fb_scaling = (fb[0].xres as i32) / IVIDEO_SCREENWIDTH
+        if (fb[0].yres as i32) / IVIDEO_SCREENHEIGHT < fb_scaling {
+            fb_scaling = (fb[0].yres as i32) / IVIDEO_SCREENHEIGHT
+        }
+        ivideoshim_print_auto_scaling(fb_scaling)
+    }
+
+    VIDEO_set_buffer(
+        Z_Malloc(IVIDEO_SCREENWIDTH * IVIDEO_SCREENHEIGHT, IVIDEO_PU_STATIC, null) as ptr<u8>)
+    IVIDEO_set_screenvisible(1)
+
+    I_InitInput()
+}
+
+@flow_api
+function I_ShutdownGraphics() -> void {
+    Z_Free(VIDEO_buffer() as ptr<void>)
+}
+
+@flow_api
+function I_StartFrame() -> void {
+}
+
+@flow_api
+function I_StartTic() -> void {
+    I_GetEvent()
+}
+
+@flow_api
+function I_UpdateNoBlit() -> void {
+}
+
+@flow_api
+function I_FinishUpdate() -> void {
+    let fb: ptr<FBScreenInfo> = ivideo_fb()
+    let bpp_bytes: i32 = (fb[0].bits_per_pixel as i32) / 8
+    # y_offset computed in C but unused (siglent leftover); omitted.
+    let x_offset: i32 = (((fb[0].xres as i32) - (IVIDEO_SCREENWIDTH * fb_scaling)) * bpp_bytes) / 2
+    let x_offset_end: i32 = (((fb[0].xres as i32) - (IVIDEO_SCREENWIDTH * fb_scaling)) * bpp_bytes) - x_offset
+
+    let mut line_in: ptr<u8> = VIDEO_buffer()
+    let mut line_out: ptr<u8> = dg_screen()
+
+    let mut y: i32 = IVIDEO_SCREENHEIGHT
+    while y > 0 {
+        y = y - 1
+        for si in 0 to fb_scaling {
+            line_out = ivideo_addr(line_out, x_offset)
+            cmap_to_fb(line_out, line_in, IVIDEO_SCREENWIDTH)
+            line_out = ivideo_addr(line_out,
+                (IVIDEO_SCREENWIDTH * fb_scaling * bpp_bytes) + x_offset_end)
+        }
+        line_in = ivideo_addr(line_in, IVIDEO_SCREENWIDTH)
+    }
+}
+
+@flow_api
+function I_ReadScreen(scr: ptr<u8>) -> void {
+    memcpy(scr as ptr<void>, VIDEO_buffer() as ptr<void>,
+        (IVIDEO_SCREENWIDTH * IVIDEO_SCREENHEIGHT) as i64)
+}
+
+@flow_api
+function I_SetPalette(palette: ptr<u8>) -> void {
+    let cols: ptr<IVideoColor> = ivideo_colors()
+    let gamma: i32 = IVIDEO_usegamma()
+    let mut p: ptr<u8> = palette
+    for i in 0 to 256 {
+        cols[i].a = 0 as u8
+        cols[i].r = TABLES_gammatable(gamma, p[0] as i32)
+        p = ivideo_addr(p, 1)
+        cols[i].g = TABLES_gammatable(gamma, p[0] as i32)
+        p = ivideo_addr(p, 1)
+        cols[i].b = TABLES_gammatable(gamma, p[0] as i32)
+        p = ivideo_addr(p, 1)
+    }
+}
+
+@flow_api
+function I_GetPaletteIndex(r: i32, g: i32, b: i32) -> i32 {
+    printf("I_GetPaletteIndex\n")
+
+    let pal: ptr<u16> = ivideo_rgb565_palette()
+    let mut best: i32 = 0
+    let mut best_diff: i32 = IVIDEO_INT_MAX
+    let mut i: i32 = 0
+    while i < 256 {
+        let color_u: i32 = pal[i] as i32
+        let cr: i32 = ivideo_rgb565_r(color_u)
+        let cg: i32 = ivideo_rgb565_g(color_u)
+        let cb: i32 = ivideo_rgb565_b(color_u)
+        let diff: i32 = (r - cr) * (r - cr) + (g - cg) * (g - cg) + (b - cb) * (b - cb)
+        if diff < best_diff {
+            best = i
+            best_diff = diff
+        }
+        if diff == 0 {
+            break
+        }
+        i = i + 1
+    }
+    return best
+}
+
+@flow_api
+function I_BeginRead() -> void {
+}
+
+@flow_api
+function I_EndRead() -> void {
+}
+
+@flow_api
+function I_SetWindowTitle(title: string) -> void {
+    # DG_SetWindowTitle was an empty stub (dg_shim.c); nothing to do.
+}
+
+@flow_api
+function I_GraphicsCheckCommandLine() -> void {
+}
+
+@flow_api
+function I_SetGrabMouseCallback(func: ptr<void>) -> void {
+}
+
+@flow_api
+function I_EnableLoadingDisk() -> void {
+}
+
+@flow_api
+function I_BindVideoVariables() -> void {
+    M_BindVariable("use_mouse", IVIDEO_usemouse_addr() as ptr<void>)
+    M_BindVariable("usegamma", IVIDEO_usegamma_addr() as ptr<void>)
+    M_BindVariable("mouse_acceleration", IVIDEO_mouse_acceleration_addr() as ptr<void>)
+    M_BindVariable("mouse_threshold", IVIDEO_mouse_threshold_addr() as ptr<void>)
+}
+
+@flow_api
+function I_DisplayFPSDots(dots_on: i32) -> void {
+}
+
+@flow_api
+function I_CheckIsScreensaver() -> void {
+}

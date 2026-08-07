@@ -1,0 +1,357 @@
+# Sound / music device layer, ported from i_sound.c to Flow.
+#
+# FEATURE_SOUND is never #defined in this build (doomfeatures.h only has
+# a commented-out #undef; build uses -DNORMALUNIX -DSNDSERV). That means
+# sound_modules[] = { NULL }, InitMusicModule is a no-op, and the
+# use_libsamplerate binds are compiled out. Active modules stay null;
+# every I_* entry still preserves the exact ABI from i_sound.h.
+#
+# Public snd_* globals + DOS port leftovers live here (were isound_shim.c).
+# Private active-module pointers live in a heap ISoundMods struct (module statics
+# cannot be struct-typed).
+
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+extern { function M_CheckParm(check: string) -> i32 }
+extern { function M_BindVariable(name: string, location: ptr<void>) -> void }
+extern { function IVIDEO_screensaver_mode() -> i32 }
+
+# ---- constants (ISOUND_*: one Flow TU) --------------------------------
+
+# i_sound.h snddevice_t
+const ISOUND_SNDDEVICE_SB: i32 = 3
+const ISOUND_SNDDEVICE_GUS: i32 = 5
+const ISOUND_SNDDEVICE_GENMIDI: i32 = 8
+
+# isound_shim.c int-var ids (lockstep with isound_int_table[])
+const ISOUND_VAR_MUSICDEVICE: i32 = 0
+const ISOUND_VAR_SFXDEVICE: i32 = 1
+const ISOUND_VAR_SBPORT: i32 = 2
+const ISOUND_VAR_SBIRQ: i32 = 3
+const ISOUND_VAR_SBDMA: i32 = 4
+const ISOUND_VAR_MPORT: i32 = 5
+const ISOUND_VAR_MAXSLICETIME_MS: i32 = 6
+const ISOUND_VAR_SAMPLERATE: i32 = 7
+const ISOUND_VAR_CACHESIZE: i32 = 8
+
+# sizeof(ISoundMods) on LP64: two pointers
+const ISOUND_MODS_SIZE: i64 = 16
+
+# ---- public config globals (i_sound.h) --------------------------------
+
+let mut snd_samplerate: i32 = 44100
+let mut snd_cachesize: i32 = 67108864
+let mut snd_maxslicetime_ms: i32 = 28
+let mut snd_musiccmd_empty: array<u8, 1> = [0]
+let mut snd_musiccmd: ptr<u8> = &snd_musiccmd_empty[0] as ptr<u8>
+let mut snd_musicdevice: i32 = ISOUND_SNDDEVICE_SB
+let mut snd_sfxdevice: i32 = ISOUND_SNDDEVICE_SB
+
+# DOS-only leftovers (config-file compatibility)
+let mut snd_sbport: i32 = 0
+let mut snd_sbirq: i32 = 0
+let mut snd_sbdma: i32 = 0
+let mut snd_mport: i32 = 0
+
+# ---- private active-module state --------------------------------------
+
+struct ISoundMods {
+    sound_module: ptr<void>,
+    music_module: ptr<void>
+}
+
+let mut isound_mods_ptr: ptr<ISoundMods> = null
+
+function isound_mods() -> ptr<ISoundMods> {
+    if (isound_mods_ptr as i64) == 0 {
+        isound_mods_ptr = calloc(1, ISOUND_MODS_SIZE) as ptr<ISoundMods>
+        isound_mods_ptr[0].sound_module = null
+        isound_mods_ptr[0].music_module = null
+    }
+    return isound_mods_ptr
+}
+
+function snd_var(id: i32) -> i32 {
+    return isoundshim_int_addr(id)[0]
+}
+
+@flow_api
+function isoundshim_int_addr(id: i32) -> ptr<i32> {
+    if id == ISOUND_VAR_MUSICDEVICE { return &snd_musicdevice }
+    if id == ISOUND_VAR_SFXDEVICE { return &snd_sfxdevice }
+    if id == ISOUND_VAR_SBPORT { return &snd_sbport }
+    if id == ISOUND_VAR_SBIRQ { return &snd_sbirq }
+    if id == ISOUND_VAR_SBDMA { return &snd_sbdma }
+    if id == ISOUND_VAR_MPORT { return &snd_mport }
+    if id == ISOUND_VAR_MAXSLICETIME_MS { return &snd_maxslicetime_ms }
+    if id == ISOUND_VAR_SAMPLERATE { return &snd_samplerate }
+    if id == ISOUND_VAR_CACHESIZE { return &snd_cachesize }
+    return &snd_sbport
+}
+
+@flow_api
+function isoundshim_musiccmd_addr() -> ptr<void> {
+    return &snd_musiccmd as ptr<void>
+}
+
+# Check if a sound device is in the given list of devices (i_sound.c).
+# FEATURE_SOUND off never reaches a non-null module, so this stays unused.
+function SndDeviceInList(device: i32, list: ptr<i32>, len: i32) -> i32 {
+    for i in 0 to len {
+        if device == list[i] {
+            return 1
+        }
+    }
+    return 0
+}
+
+# FEATURE_SOUND off: sound_modules[] = { NULL }; loop never selects a module.
+function InitSfxModule(use_sfx_prefix: i32) -> void {
+    let m: ptr<ISoundMods> = isound_mods()
+    m[0].sound_module = null
+    # use_sfx_prefix would be passed to sound_module->Init when FEATURE_SOUND is on.
+    if use_sfx_prefix != 0 {
+        return
+    }
+}
+
+# FEATURE_SOUND off: music_module stays null (no DG_music_module).
+function InitMusicModule() -> void {
+    return
+}
+
+function CheckVolumeSeparation(vol: ptr<i32>, sep: ptr<i32>) -> void {
+    if sep[0] < 0 {
+        sep[0] = 0
+    } elif sep[0] > 254 {
+        sep[0] = 254
+    }
+
+    if vol[0] < 0 {
+        vol[0] = 0
+    } elif vol[0] > 127 {
+        vol[0] = 127
+    }
+}
+
+# ---- public ABI (i_sound.h) -------------------------------------------
+
+@flow_api
+function I_InitSound(use_sfx_prefix: i32) -> void {
+    let mut nosound: i32 = 0
+    let mut nosfx: i32 = 0
+    let mut nomusic: i32 = 0
+
+    if M_CheckParm("-nosound") > 0 {
+        nosound = 1
+    }
+    if M_CheckParm("-nosfx") > 0 {
+        nosfx = 1
+    }
+    if M_CheckParm("-nomusic") > 0 {
+        nomusic = 1
+    }
+
+    if nosound == 0 and IVIDEO_screensaver_mode() == 0 {
+        # Native MIDI / GUS Timidity setup is commented out in C too.
+        if nomusic == 0 and (snd_var(ISOUND_VAR_MUSICDEVICE) == ISOUND_SNDDEVICE_GENMIDI
+            or snd_var(ISOUND_VAR_MUSICDEVICE) == ISOUND_SNDDEVICE_GUS) {
+            # I_InitTimidityConfig();
+        }
+
+        if nosfx == 0 {
+            InitSfxModule(use_sfx_prefix)
+        }
+
+        if nomusic == 0 {
+            InitMusicModule()
+        }
+    }
+}
+
+@flow_api
+function I_ShutdownSound() -> void {
+    let m: ptr<ISoundMods> = isound_mods()
+    # FEATURE_SOUND off: modules null → no vtable Shutdown()
+    if (m[0].sound_module as i64) != 0 {
+        return
+    }
+    if (m[0].music_module as i64) != 0 {
+        return
+    }
+}
+
+@flow_api
+function I_GetSfxLumpNum(sfxinfo: ptr<void>) -> i32 {
+    let m: ptr<ISoundMods> = isound_mods()
+    if (m[0].sound_module as i64) != 0 {
+        # sound_module->GetSfxLumpNum(sfxinfo) — no module in this build
+        return 0
+    } else {
+        return 0
+    }
+}
+
+@flow_api
+function I_UpdateSound() -> void {
+    let m: ptr<ISoundMods> = isound_mods()
+    if (m[0].sound_module as i64) != 0 {
+        return
+    }
+    if (m[0].music_module as i64) != 0 {
+        return
+    }
+}
+
+@flow_api
+function I_UpdateSoundParams(channel: i32, vol: i32, sep: i32) -> void {
+    let m: ptr<ISoundMods> = isound_mods()
+    if (m[0].sound_module as i64) != 0 {
+        let mut v: i32 = vol
+        let mut s: i32 = sep
+        CheckVolumeSeparation(&v, &s)
+        # sound_module->UpdateSoundParams(channel, v, s)
+    }
+}
+
+@flow_api
+function I_StartSound(sfxinfo: ptr<void>, channel: i32, vol: i32, sep: i32) -> i32 {
+    let m: ptr<ISoundMods> = isound_mods()
+    if (m[0].sound_module as i64) != 0 {
+        let mut v: i32 = vol
+        let mut s: i32 = sep
+        CheckVolumeSeparation(&v, &s)
+        # sound_module->StartSound(sfxinfo, channel, v, s)
+        return 0
+    } else {
+        return 0
+    }
+}
+
+@flow_api
+function I_StopSound(channel: i32) -> void {
+    let m: ptr<ISoundMods> = isound_mods()
+    if (m[0].sound_module as i64) != 0 {
+        # sound_module->StopSound(channel)
+        return
+    }
+}
+
+@flow_api
+function I_SoundIsPlaying(channel: i32) -> i32 {
+    let m: ptr<ISoundMods> = isound_mods()
+    if (m[0].sound_module as i64) != 0 {
+        # sound_module->SoundIsPlaying(channel)
+        return 0
+    } else {
+        return 0
+    }
+}
+
+@flow_api
+function I_PrecacheSounds(sounds: ptr<void>, num_sounds: i32) -> void {
+    let m: ptr<ISoundMods> = isound_mods()
+    if (m[0].sound_module as i64) != 0 {
+        # sound_module->CacheSounds if non-NULL
+        return
+    }
+}
+
+@flow_api
+function I_InitMusic() -> void {
+    let m: ptr<ISoundMods> = isound_mods()
+    if (m[0].music_module as i64) != 0 {
+        return
+    }
+}
+
+@flow_api
+function I_ShutdownMusic() -> void {
+    return
+}
+
+@flow_api
+function I_SetMusicVolume(volume: i32) -> void {
+    let m: ptr<ISoundMods> = isound_mods()
+    if (m[0].music_module as i64) != 0 {
+        return
+    }
+}
+
+@flow_api
+function I_PauseSong() -> void {
+    let m: ptr<ISoundMods> = isound_mods()
+    if (m[0].music_module as i64) != 0 {
+        return
+    }
+}
+
+@flow_api
+function I_ResumeSong() -> void {
+    let m: ptr<ISoundMods> = isound_mods()
+    if (m[0].music_module as i64) != 0 {
+        return
+    }
+}
+
+@flow_api
+function I_RegisterSong(data: ptr<void>, len: i32) -> ptr<void> {
+    let m: ptr<ISoundMods> = isound_mods()
+    if (m[0].music_module as i64) != 0 {
+        # music_module->RegisterSong(data, len)
+        return null
+    } else {
+        return null
+    }
+}
+
+@flow_api
+function I_UnRegisterSong(song_handle: ptr<void>) -> void {
+    let m: ptr<ISoundMods> = isound_mods()
+    if (m[0].music_module as i64) != 0 {
+        # music_module->UnRegisterSong(song_handle)
+        return
+    }
+}
+
+@flow_api
+function I_PlaySong(song_handle: ptr<void>, looping: i32) -> void {
+    let m: ptr<ISoundMods> = isound_mods()
+    if (m[0].music_module as i64) != 0 {
+        # music_module->PlaySong(song_handle, looping)
+        return
+    }
+}
+
+@flow_api
+function I_StopSong() -> void {
+    let m: ptr<ISoundMods> = isound_mods()
+    if (m[0].music_module as i64) != 0 {
+        return
+    }
+}
+
+@flow_api
+function I_MusicIsPlaying() -> i32 {
+    let m: ptr<ISoundMods> = isound_mods()
+    if (m[0].music_module as i64) != 0 {
+        return 0
+    } else {
+        return 0
+    }
+}
+
+@flow_api
+function I_BindSoundVariables() -> void {
+    M_BindVariable("snd_musicdevice", isoundshim_int_addr(ISOUND_VAR_MUSICDEVICE) as ptr<void>)
+    M_BindVariable("snd_sfxdevice", isoundshim_int_addr(ISOUND_VAR_SFXDEVICE) as ptr<void>)
+    M_BindVariable("snd_sbport", isoundshim_int_addr(ISOUND_VAR_SBPORT) as ptr<void>)
+    M_BindVariable("snd_sbirq", isoundshim_int_addr(ISOUND_VAR_SBIRQ) as ptr<void>)
+    M_BindVariable("snd_sbdma", isoundshim_int_addr(ISOUND_VAR_SBDMA) as ptr<void>)
+    M_BindVariable("snd_mport", isoundshim_int_addr(ISOUND_VAR_MPORT) as ptr<void>)
+    M_BindVariable("snd_maxslicetime_ms", isoundshim_int_addr(ISOUND_VAR_MAXSLICETIME_MS) as ptr<void>)
+    M_BindVariable("snd_musiccmd", isoundshim_musiccmd_addr())
+    M_BindVariable("snd_samplerate", isoundshim_int_addr(ISOUND_VAR_SAMPLERATE) as ptr<void>)
+    M_BindVariable("snd_cachesize", isoundshim_int_addr(ISOUND_VAR_CACHESIZE) as ptr<void>)
+
+    # FEATURE_SOUND off: use_libsamplerate / libsamplerate_scale not bound
+}

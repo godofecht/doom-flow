@@ -1,0 +1,1295 @@
+# Line/sector specials dispatcher and utilities, ported from p_spec.c.
+#
+# EV_*/P_* thinkers for doors/floor/plats/ceiling/lights/switch/telept are
+# already in their own Flow modules - this file only owns pic anims, cross/
+# shoot/sector events, surrounding-sector helpers, EV_DoDonut, and spawn/
+# update of specials. Engine structs use GEOM_*/MOBJ_*. buttonlist is
+# Flow-owned here (SWITCH_* APIs). activeceilings / activeplats use
+# specshim_* accessors.
+#
+# Private records use Flow structs (SpecAnim / AnimDef). floormove_t for
+# EV_DoDonut keeps LP64 offsetof access (shared with floor.flow layout).
+
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function P_AddThinker(thinker: ptr<void>) -> void }
+extern { function P_Random() -> i32 }
+extern { function P_DamageMobj(target: ptr<void>, inflictor: ptr<void>, source: ptr<void>, damage: i32) -> void }
+
+extern { function R_CheckTextureNumForName(name: string) -> i32 }
+extern { function R_TextureNumForName(name: string) -> i32 }
+extern { function R_FlatNumForName(name: string) -> i32 }
+extern { function W_CheckNumForName(name: string) -> i32 }
+
+extern { function I_Error(msg: string) -> void }
+extern { function M_CheckParmWithArgs(check: string, num_args: i32) -> i32 }
+extern { function M_StrToInt(str: ptr<u8>, result: ptr<i32>) -> i32 }
+extern { function argvflow_argv() -> ptr<i64> }
+
+extern { function S_StartSound(origin: ptr<void>, sound_id: i32) -> void }
+extern { function G_ExitLevel() -> void }
+extern { function G_SecretExitLevel() -> void }
+
+# Already-ported specials (exact C names).
+extern { function EV_DoDoor(line: ptr<void>, doortype: i32) -> i32 }
+extern { function EV_DoFloor(line: ptr<void>, floortype: i32) -> i32 }
+extern { function EV_DoCeiling(line: ptr<void>, ceiltype: i32) -> i32 }
+extern { function EV_BuildStairs(line: ptr<void>, stairtype: i32) -> i32 }
+extern { function EV_DoPlat(line: ptr<void>, plattype: i32, amount: i32) -> i32 }
+extern { function EV_StopPlat(line: ptr<void>) -> void }
+extern { function EV_CeilingCrushStop(line: ptr<void>) -> i32 }
+extern { function EV_LightTurnOn(line: ptr<void>, bright: i32) -> void }
+extern { function EV_StartLightStrobing(line: ptr<void>) -> void }
+extern { function EV_TurnTagLightsOff(line: ptr<void>) -> void }
+extern { function EV_Teleport(line: ptr<void>, side: i32, thing: ptr<void>) -> i32 }
+extern { function P_ChangeSwitchTexture(line: ptr<void>, useAgain: i32) -> void }
+extern { function P_SpawnLightFlash(sector: ptr<void>) -> void }
+extern { function P_SpawnStrobeFlash(sector: ptr<void>, fastOrSlow: i32, inSync: i32) -> void }
+extern { function P_SpawnGlowingLight(sector: ptr<void>) -> void }
+extern { function P_SpawnFireFlicker(sector: ptr<void>) -> void }
+extern { function P_SpawnDoorCloseIn30(sec: ptr<void>) -> void }
+extern { function P_SpawnDoorRaiseIn5Mins(sec: ptr<void>, secnum: i32) -> void }
+
+# buttonlist / activeceilings / activeplats are Flow-owned arrays below.
+# stderr helpers use printf directly.
+
+extern { function STAT_inc_totalsecret() -> void }
+extern { function RDATA_numflats() -> i32 }
+extern { function GEOM_numsectors() -> i32 }
+extern { function GEOM_numlines() -> i32 }
+extern { function GEOM_sector(i: i32) -> ptr<void> }
+extern { function GEOM_line(i: i32) -> ptr<void> }
+
+extern { function GEOM_sector_floorheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_ceilingheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_floorpic(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_lightlevel(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_special(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_set_special(s: ptr<void>, v: i32) -> void }
+extern { function GEOM_sector_tag(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_specialdata(s: ptr<void>) -> ptr<void> }
+extern { function GEOM_sector_set_specialdata(s: ptr<void>, p: ptr<void>) -> void }
+extern { function GEOM_sector_linecount(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_line(s: ptr<void>, i: i32) -> ptr<void> }
+
+extern { function GEOM_side(sidenum: i32) -> ptr<void> }
+
+extern { function RDATA_set_texturetranslation(i: i32, pic: i32) -> void }
+extern { function RDATA_set_flattranslation(i: i32, pic: i32) -> void }
+
+extern { function MOBJ_player(thing: ptr<void>) -> ptr<void> }
+extern { function MOBJ_type(thing: ptr<void>) -> i32 }
+extern { function MOBJ_z(m: ptr<void>) -> i32 }
+extern { function MOBJ_sector(m: ptr<void>) -> ptr<void> }
+extern { function PLAYER_set_cheats(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_inc_secretcount(p: ptr<void>) -> void }
+
+extern { function THINKER_set_move_floor(floor: ptr<void>) -> void }
+extern { function printf(fmt: string) -> i32 }
+extern { function memset(dest: ptr<void>, c: i32, n: i64) -> ptr<void> }
+extern { function calloc(n: i64, sz: i64) -> ptr<void> }
+extern { function GEOM_line_backsector(ld: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_flags(ld: ptr<void>) -> i32 }
+extern { function GEOM_line_frontsector(ld: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_set_special(ld: ptr<void>, v: i32) -> void }
+extern { function GEOM_line_sidenum(line: ptr<void>, side: i32) -> i32 }
+extern { function GEOM_line_special(ld: ptr<void>) -> i32 }
+extern { function GEOM_line_tag(ld: ptr<void>) -> i32 }
+extern { function GEOM_side_i_add_textureoffset(i: i32, delta: i32) -> void }
+extern { function GEOM_side_i_sector(i: i32) -> ptr<void> }
+extern { function GEOM_side_i_set_bottomtexture(i: i32, v: i32) -> void }
+extern { function GEOM_side_i_set_midtexture(i: i32, v: i32) -> void }
+extern { function GEOM_side_i_set_toptexture(i: i32, v: i32) -> void }
+extern { function PLAYER_cheats(p: ptr<void>) -> i32 }
+extern { function PLAYER_health(p: ptr<void>) -> i32 }
+extern { function PLAYER_mo(p: ptr<void>) -> ptr<void> }
+extern { function PLAYER_power(p: ptr<void>, pw: i32) -> i32 }
+
+# ---- constants (SPEC_*) -----------------------------------------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_timelimit() -> i32 }
+
+const SPEC_MAXANIMS: i32 = 32
+const SPEC_MAXLINEANIMS: i32 = 64
+const SPEC_MAX_ADJOINING_SECTORS: i32 = 20
+const SPEC_MAXCEILINGS: i32 = 30
+const SPEC_MAXPLATS: i32 = 30
+const SPEC_MAXBUTTONS: i32 = 16
+const SPEC_SIZEOF_BUTTON: i32 = 32
+const SPEC_SIZEOF_FLOORMOVE: i32 = 64
+
+let mut spec_buttonlist: ptr<u8> = null
+let mut spec_activeceilings: array<i64, 30> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+let mut spec_activeplats: array<i64, 30> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+function spec_ensure_buttonlist() -> void {
+    if (spec_buttonlist as i64) == 0 {
+        spec_buttonlist = calloc((SPEC_MAXBUTTONS * SPEC_SIZEOF_BUTTON) as i64, 1) as ptr<u8>
+    }
+}
+
+# Shared buttonlist APIs. Prefer SWITCH_* over leftover specshim_button*
+# names.
+@flow_api
+function SWITCH_buttonlist() -> ptr<u8> {
+    spec_ensure_buttonlist()
+    return spec_buttonlist
+}
+
+@flow_api
+function specshim_activeceilings() -> ptr<i64> {
+    return &spec_activeceilings as ptr<i64>
+}
+
+@flow_api
+function specshim_activeplats() -> ptr<i64> {
+    return &spec_activeplats as ptr<i64>
+}
+
+@flow_api
+function SWITCH_clear_button(i: i32) -> void {
+    spec_ensure_buttonlist()
+    memset(
+        ((spec_buttonlist as i64) + (i as i64) * (SPEC_SIZEOF_BUTTON as i64)) as ptr<void>,
+        0,
+        SPEC_SIZEOF_BUTTON as i64)
+}
+
+@flow_api
+function specshim_stderr_msg(msg: string) -> void {
+    printf("%s", msg)
+}
+
+@flow_api
+function specshim_donut_floorpic_warn(nflats: i32) -> void {
+    printf("DonutOverrun: The second parameter for \"-donut\" switch should be greater than 0 and less than number of flats (%d). Using default value (%d) instead. \n", nflats, 0x16)
+}
+
+const SPEC_PU_LEVSPEC: i32 = 6
+const SPEC_FRACUNIT: i32 = 65536
+const SPEC_FLOORSPEED: i32 = 65536
+const SPEC_TICRATE: i32 = 35
+const SPEC_INT_MAX: i32 = 2147483647
+const SPEC_ML_TWOSIDED: i32 = 4
+
+const SPEC_DONUT_FLOORHEIGHT_DEFAULT: i32 = 0
+const SPEC_DONUT_FLOORPIC_DEFAULT: i32 = 22
+
+const SPEC_FASTDARK: i32 = 15
+const SPEC_SLOWDARK: i32 = 35
+
+# floor_e
+const SPEC_LOWERFLOOR: i32 = 0
+const SPEC_LOWERFLOORTOLOWEST: i32 = 1
+const SPEC_TURBOLOWER: i32 = 2
+const SPEC_RAISEFLOOR: i32 = 3
+const SPEC_RAISEFLOORTONEAREST: i32 = 4
+const SPEC_RAISETOTEXTURE: i32 = 5
+const SPEC_LOWERANDCHANGE: i32 = 6
+const SPEC_RAISEFLOOR24: i32 = 7
+const SPEC_RAISEFLOOR24ANDCHANGE: i32 = 8
+const SPEC_RAISEFLOORCRUSH: i32 = 9
+const SPEC_RAISEFLOORTURBO: i32 = 10
+const SPEC_DONUTRAISE: i32 = 11
+
+# stair_e
+const SPEC_BUILD8: i32 = 0
+const SPEC_TURBO16: i32 = 1
+
+# vldoor_e
+const SPEC_VLD_NORMAL: i32 = 0
+const SPEC_VLD_CLOSE30THENOPEN: i32 = 1
+const SPEC_VLD_CLOSE: i32 = 2
+const SPEC_VLD_OPEN: i32 = 3
+const SPEC_VLD_BLAZERAISE: i32 = 5
+const SPEC_VLD_BLAZEOPEN: i32 = 6
+const SPEC_VLD_BLAZECLOSE: i32 = 7
+
+# plattype_e
+const SPEC_PERPETUALRAISE: i32 = 0
+const SPEC_DOWNWAITUPSTAY: i32 = 1
+const SPEC_RAISETONEARESTANDCHANGE: i32 = 3
+const SPEC_BLAZEDWUS: i32 = 4
+
+# ceiling_e
+const SPEC_LOWERTOFLOOR: i32 = 0
+const SPEC_RAISETOHIGHEST: i32 = 1
+const SPEC_LOWERANDCRUSH: i32 = 2
+const SPEC_CRUSHANDRAISE: i32 = 3
+const SPEC_FASTCRUSHANDRAISE: i32 = 4
+const SPEC_SILENTCRUSHANDRAISE: i32 = 5
+
+# bwhere_e
+const SPEC_TOP: i32 = 0
+const SPEC_MIDDLE: i32 = 1
+const SPEC_BOTTOM: i32 = 2
+
+# mobjtype_t
+const SPEC_MT_BRUISERSHOT: i32 = 16
+const SPEC_MT_TROOPSHOT: i32 = 31
+const SPEC_MT_HEADSHOT: i32 = 32
+const SPEC_MT_ROCKET: i32 = 33
+const SPEC_MT_PLASMA: i32 = 34
+const SPEC_MT_BFG: i32 = 35
+
+# powertype_t / cheat
+const SPEC_PW_IRONFEET: i32 = 3
+const SPEC_CF_GODMODE: i32 = 2
+
+# sfxenum_t
+const SPEC_SFX_SWTCHN: i32 = 23
+
+# ---- private structs --------------------------------------------------
+
+struct SpecAnim {
+    istexture: i32,
+    picnum: i32,
+    basepic: i32,
+    numpics: i32,
+    speed: i32
+}
+
+struct AnimDef {
+    istexture: i32,
+    endname: string,
+    startname: string,
+    speed: i32
+}
+
+let mut animdefs: array<AnimDef, 23> = [
+    AnimDef { istexture: 0, endname: "NUKAGE3", startname: "NUKAGE1", speed: 8 },
+    AnimDef { istexture: 0, endname: "FWATER4", startname: "FWATER1", speed: 8 },
+    AnimDef { istexture: 0, endname: "SWATER4", startname: "SWATER1", speed: 8 },
+    AnimDef { istexture: 0, endname: "LAVA4", startname: "LAVA1", speed: 8 },
+    AnimDef { istexture: 0, endname: "BLOOD3", startname: "BLOOD1", speed: 8 },
+    AnimDef { istexture: 0, endname: "RROCK08", startname: "RROCK05", speed: 8 },
+    AnimDef { istexture: 0, endname: "SLIME04", startname: "SLIME01", speed: 8 },
+    AnimDef { istexture: 0, endname: "SLIME08", startname: "SLIME05", speed: 8 },
+    AnimDef { istexture: 0, endname: "SLIME12", startname: "SLIME09", speed: 8 },
+    AnimDef { istexture: 1, endname: "BLODGR4", startname: "BLODGR1", speed: 8 },
+    AnimDef { istexture: 1, endname: "SLADRIP3", startname: "SLADRIP1", speed: 8 },
+    AnimDef { istexture: 1, endname: "BLODRIP4", startname: "BLODRIP1", speed: 8 },
+    AnimDef { istexture: 1, endname: "FIREWALL", startname: "FIREWALA", speed: 8 },
+    AnimDef { istexture: 1, endname: "GSTFONT3", startname: "GSTFONT1", speed: 8 },
+    AnimDef { istexture: 1, endname: "FIRELAVA", startname: "FIRELAV3", speed: 8 },
+    AnimDef { istexture: 1, endname: "FIREMAG3", startname: "FIREMAG1", speed: 8 },
+    AnimDef { istexture: 1, endname: "FIREBLU2", startname: "FIREBLU1", speed: 8 },
+    AnimDef { istexture: 1, endname: "ROCKRED3", startname: "ROCKRED1", speed: 8 },
+    AnimDef { istexture: 1, endname: "BFALL4", startname: "BFALL1", speed: 8 },
+    AnimDef { istexture: 1, endname: "SFALL4", startname: "SFALL1", speed: 8 },
+    AnimDef { istexture: 1, endname: "WFALL4", startname: "WFALL1", speed: 8 },
+    AnimDef { istexture: 1, endname: "DBRAIN4", startname: "DBRAIN1", speed: 8 },
+    AnimDef { istexture: 0 - 1, endname: "", startname: "", speed: 0 }
+]
+
+let mut anims: array<SpecAnim, 32> = [
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 },
+    SpecAnim { istexture: 0, picnum: 0, basepic: 0, numpics: 0, speed: 0 }
+]
+
+let mut numanims: i32 = 0
+
+let mut levelTimer: i32 = 0
+let mut levelTimeCount: i32 = 0
+
+let mut numlinespecials: i32 = 0
+let mut linespeciallist: array<ptr<void>, 64> = [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+]
+
+# DonutOverrun statics
+let mut spec_donut_first: i32 = 1
+let mut spec_donut_floorheight: i32 = 0
+let mut spec_donut_floorpic: i32 = 22
+
+# ---- floormove_t field access (LP64, shared with floor.flow) ----------
+
+function spec_fl_set_type(f: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((f as i64) + 24) as ptr<i32>
+    p[0] = v
+}
+
+function spec_fl_set_crush(f: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((f as i64) + 28) as ptr<i32>
+    p[0] = v
+}
+
+function spec_fl_set_sector(f: ptr<u8>, sec: ptr<void>) -> void {
+    let p: ptr<i64> = ((f as i64) + 32) as ptr<i64>
+    p[0] = sec as i64
+}
+
+function spec_fl_set_direction(f: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((f as i64) + 40) as ptr<i32>
+    p[0] = v
+}
+
+function spec_fl_set_newspecial(f: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((f as i64) + 44) as ptr<i32>
+    p[0] = v
+}
+
+function spec_fl_set_texture(f: ptr<u8>, v: i32) -> void {
+    f[48] = (v & 255) as u8
+    f[49] = ((v >> 8) & 255) as u8
+}
+
+function spec_fl_set_floordestheight(f: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((f as i64) + 52) as ptr<i32>
+    p[0] = v
+}
+
+function spec_fl_set_speed(f: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((f as i64) + 56) as ptr<i32>
+    p[0] = v
+}
+
+# ---- button_t helpers (array owned above via SWITCH_buttonlist) ----
+
+function spec_btn_at(i: i32) -> ptr<u8> {
+    return ((SWITCH_buttonlist() as i64) + (i as i64) * (SPEC_SIZEOF_BUTTON as i64)) as ptr<u8>
+}
+
+function spec_btn_line(i: i32) -> ptr<void> {
+    let p: ptr<i64> = spec_btn_at(i) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+function spec_btn_where(i: i32) -> i32 {
+    let p: ptr<i32> = ((spec_btn_at(i) as i64) + 8) as ptr<i32>
+    return p[0]
+}
+
+function spec_btn_btexture(i: i32) -> i32 {
+    let p: ptr<i32> = ((spec_btn_at(i) as i64) + 12) as ptr<i32>
+    return p[0]
+}
+
+function spec_btn_btimer(i: i32) -> i32 {
+    let p: ptr<i32> = ((spec_btn_at(i) as i64) + 16) as ptr<i32>
+    return p[0]
+}
+
+function spec_btn_set_btimer(i: i32, v: i32) -> void {
+    let p: ptr<i32> = ((spec_btn_at(i) as i64) + 16) as ptr<i32>
+    p[0] = v
+}
+
+# Address of buttonlist[i].soundorg (vanilla P_UpdateSpecials quirk:
+# S_StartSound(&buttonlist[i].soundorg, ...)).
+function spec_btn_soundorg_addr(i: i32) -> ptr<void> {
+    return ((spec_btn_at(i) as i64) + 24) as ptr<void>
+}
+
+function spec_argv_at(i: i32) -> ptr<u8> {
+    let words: ptr<i64> = argvflow_argv()
+    return words[i] as ptr<u8>
+}
+
+# ---- P_InitPicAnims ---------------------------------------------------
+
+@flow_api
+function P_InitPicAnims() -> void {
+    numanims = 0
+    for i in 0 to 23 {
+        if animdefs[i].istexture == (0 - 1) {
+            return
+        }
+        # FEATURE_DEHACKED off - DEH_String is identity.
+        let startname: string = animdefs[i].startname
+        let endname: string = animdefs[i].endname
+        let mut picnum: i32 = 0
+        let mut basepic: i32 = 0
+        let mut ok: i32 = 0
+
+        if animdefs[i].istexture != 0 {
+            if R_CheckTextureNumForName(startname) != (0 - 1) {
+                picnum = R_TextureNumForName(endname)
+                basepic = R_TextureNumForName(startname)
+                ok = 1
+            }
+        } else {
+            if W_CheckNumForName(startname) != (0 - 1) {
+                picnum = R_FlatNumForName(endname)
+                basepic = R_FlatNumForName(startname)
+                ok = 1
+            }
+        }
+
+        if ok != 0 {
+            let np: i32 = picnum - basepic + 1
+            if np < 2 {
+                I_Error("P_InitPicAnims: bad cycle")
+            }
+            anims[numanims] = SpecAnim {
+                istexture: animdefs[i].istexture,
+                picnum: picnum,
+                basepic: basepic,
+                numpics: np,
+                speed: animdefs[i].speed
+            }
+            numanims = numanims + 1
+        }
+    }
+}
+
+# ---- utilities --------------------------------------------------------
+
+@flow_api
+function getSide(currentSector: i32, line: i32, side: i32) -> ptr<void> {
+    let sec: ptr<void> = GEOM_sector(currentSector)
+    let ln: ptr<void> = GEOM_sector_line(sec, line)
+    let sn: i32 = GEOM_line_sidenum(ln, side)
+    return GEOM_side(sn)
+}
+
+@flow_api
+function getSector(currentSector: i32, line: i32, side: i32) -> ptr<void> {
+    let sec: ptr<void> = GEOM_sector(currentSector)
+    let ln: ptr<void> = GEOM_sector_line(sec, line)
+    let sn: i32 = GEOM_line_sidenum(ln, side)
+    return GEOM_side_i_sector(sn)
+}
+
+@flow_api
+function twoSided(sector: i32, line: i32) -> i32 {
+    let sec: ptr<void> = GEOM_sector(sector)
+    let ln: ptr<void> = GEOM_sector_line(sec, line)
+    return GEOM_line_flags(ln) & SPEC_ML_TWOSIDED
+}
+
+@flow_api
+function getNextSector(line: ptr<void>, sec: ptr<void>) -> ptr<void> {
+    if (GEOM_line_flags(line) & SPEC_ML_TWOSIDED) == 0 {
+        return null
+    }
+    if (GEOM_line_frontsector(line) as i64) == (sec as i64) {
+        return GEOM_line_backsector(line)
+    }
+    return GEOM_line_frontsector(line)
+}
+
+# Stack line_t with only .tag set (A_KeenDie / A_BossDeath tag triggers).
+const SPEC_LINE_SIZE: i32 = 88
+const SPEC_LINE_TAG: i32 = 28
+
+let mut spec_tag_line_buf: array<u8, 88> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0
+]
+
+function spec_line_set_tag(buf: ptr<u8>, tag: i32) -> void {
+    buf[SPEC_LINE_TAG] = (tag & 255) as u8
+    buf[SPEC_LINE_TAG + 1] = ((tag >> 8) & 255) as u8
+}
+
+function spec_line_for_tag(tag: i32) -> ptr<void> {
+    for i in 0 to SPEC_LINE_SIZE {
+        spec_tag_line_buf[i] = 0 as u8
+    }
+    spec_line_set_tag(spec_tag_line_buf as ptr<u8>, tag)
+    return spec_tag_line_buf as ptr<void>
+}
+
+@flow_api
+function SPEC_ev_do_door_tag(tag: i32, doortype: i32) -> void {
+    EV_DoDoor(spec_line_for_tag(tag), doortype)
+}
+
+@flow_api
+function SPEC_ev_do_floor_tag(tag: i32, floortype: i32) -> void {
+    EV_DoFloor(spec_line_for_tag(tag), floortype)
+}
+
+@flow_api
+function P_FindLowestFloorSurrounding(sec: ptr<void>) -> i32 {
+    let mut floor: i32 = GEOM_sector_floorheight(sec)
+    let n: i32 = GEOM_sector_linecount(sec)
+    for i in 0 to n {
+        let check: ptr<void> = GEOM_sector_line(sec, i)
+        let other: ptr<void> = getNextSector(check, sec)
+        if (other as i64) != 0 {
+            if GEOM_sector_floorheight(other) < floor {
+                floor = GEOM_sector_floorheight(other)
+            }
+        }
+    }
+    return floor
+}
+
+@flow_api
+function P_FindHighestFloorSurrounding(sec: ptr<void>) -> i32 {
+    let mut floor: i32 = (0 - 500) * SPEC_FRACUNIT
+    let n: i32 = GEOM_sector_linecount(sec)
+    for i in 0 to n {
+        let check: ptr<void> = GEOM_sector_line(sec, i)
+        let other: ptr<void> = getNextSector(check, sec)
+        if (other as i64) != 0 {
+            if GEOM_sector_floorheight(other) > floor {
+                floor = GEOM_sector_floorheight(other)
+            }
+        }
+    }
+    return floor
+}
+
+@flow_api
+function P_FindNextHighestFloor(sec: ptr<void>, currentheight: i32) -> i32 {
+    let mut h: i32 = 0
+    let mut height: i32 = currentheight
+    let mut heightlist: array<i32, 22> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let n: i32 = GEOM_sector_linecount(sec)
+    for i in 0 to n {
+        let check: ptr<void> = GEOM_sector_line(sec, i)
+        let other: ptr<void> = getNextSector(check, sec)
+        if (other as i64) != 0 {
+            if GEOM_sector_floorheight(other) > height {
+                if h == SPEC_MAX_ADJOINING_SECTORS + 1 {
+                    height = GEOM_sector_floorheight(other)
+                } elif h == SPEC_MAX_ADJOINING_SECTORS + 2 {
+                    I_Error("Sector with more than 22 adjoining sectors")
+                }
+                heightlist[h] = GEOM_sector_floorheight(other)
+                h = h + 1
+            }
+        }
+    }
+    if h == 0 {
+        return currentheight
+    }
+    let mut minv: i32 = heightlist[0]
+    for i in 1 to h {
+        if heightlist[i] < minv {
+            minv = heightlist[i]
+        }
+    }
+    return minv
+}
+
+@flow_api
+function P_FindLowestCeilingSurrounding(sec: ptr<void>) -> i32 {
+    let mut height: i32 = SPEC_INT_MAX
+    let n: i32 = GEOM_sector_linecount(sec)
+    for i in 0 to n {
+        let check: ptr<void> = GEOM_sector_line(sec, i)
+        let other: ptr<void> = getNextSector(check, sec)
+        if (other as i64) != 0 {
+            if GEOM_sector_ceilingheight(other) < height {
+                height = GEOM_sector_ceilingheight(other)
+            }
+        }
+    }
+    return height
+}
+
+@flow_api
+function P_FindHighestCeilingSurrounding(sec: ptr<void>) -> i32 {
+    let mut height: i32 = 0
+    let n: i32 = GEOM_sector_linecount(sec)
+    for i in 0 to n {
+        let check: ptr<void> = GEOM_sector_line(sec, i)
+        let other: ptr<void> = getNextSector(check, sec)
+        if (other as i64) != 0 {
+            if GEOM_sector_ceilingheight(other) > height {
+                height = GEOM_sector_ceilingheight(other)
+            }
+        }
+    }
+    return height
+}
+
+@flow_api
+function P_FindSectorFromLineTag(line: ptr<void>, start: i32) -> i32 {
+    let tag: i32 = GEOM_line_tag(line)
+    let n: i32 = GEOM_numsectors()
+    let mut i: i32 = start + 1
+    while i < n {
+        if GEOM_sector_tag(GEOM_sector(i)) == tag {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+@flow_api
+function P_FindMinSurroundingLight(sector: ptr<void>, max: i32) -> i32 {
+    let mut minv: i32 = max
+    let n: i32 = GEOM_sector_linecount(sector)
+    for i in 0 to n {
+        let line: ptr<void> = GEOM_sector_line(sector, i)
+        let check: ptr<void> = getNextSector(line, sector)
+        if (check as i64) != 0 {
+            if GEOM_sector_lightlevel(check) < minv {
+                minv = GEOM_sector_lightlevel(check)
+            }
+        }
+    }
+    return minv
+}
+
+# ---- events -----------------------------------------------------------
+
+@flow_api
+function P_CrossSpecialLine(linenum: i32, side: i32, thing: ptr<void>) -> void {
+    let line: ptr<void> = GEOM_line(linenum)
+    let special: i32 = GEOM_line_special(line)
+
+    if (MOBJ_player(thing) as i64) == 0 {
+        let mtype: i32 = MOBJ_type(thing)
+        if mtype == SPEC_MT_ROCKET or mtype == SPEC_MT_PLASMA or mtype == SPEC_MT_BFG or mtype == SPEC_MT_TROOPSHOT or mtype == SPEC_MT_HEADSHOT or mtype == SPEC_MT_BRUISERSHOT {
+            return
+        }
+        let mut ok: i32 = 0
+        if special == 39 or special == 97 or special == 125 or special == 126 or special == 4 or special == 10 or special == 88 {
+            ok = 1
+        }
+        if ok == 0 {
+            return
+        }
+    }
+
+    if special == 2 {
+        EV_DoDoor(line, SPEC_VLD_OPEN)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 3 {
+        EV_DoDoor(line, SPEC_VLD_CLOSE)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 4 {
+        EV_DoDoor(line, SPEC_VLD_NORMAL)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 5 {
+        EV_DoFloor(line, SPEC_RAISEFLOOR)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 6 {
+        EV_DoCeiling(line, SPEC_FASTCRUSHANDRAISE)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 8 {
+        EV_BuildStairs(line, SPEC_BUILD8)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 10 {
+        EV_DoPlat(line, SPEC_DOWNWAITUPSTAY, 0)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 12 {
+        EV_LightTurnOn(line, 0)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 13 {
+        EV_LightTurnOn(line, 255)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 16 {
+        EV_DoDoor(line, SPEC_VLD_CLOSE30THENOPEN)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 17 {
+        EV_StartLightStrobing(line)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 19 {
+        EV_DoFloor(line, SPEC_LOWERFLOOR)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 22 {
+        EV_DoPlat(line, SPEC_RAISETONEARESTANDCHANGE, 0)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 25 {
+        EV_DoCeiling(line, SPEC_CRUSHANDRAISE)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 30 {
+        EV_DoFloor(line, SPEC_RAISETOTEXTURE)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 35 {
+        EV_LightTurnOn(line, 35)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 36 {
+        EV_DoFloor(line, SPEC_TURBOLOWER)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 37 {
+        EV_DoFloor(line, SPEC_LOWERANDCHANGE)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 38 {
+        EV_DoFloor(line, SPEC_LOWERFLOORTOLOWEST)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 39 {
+        EV_Teleport(line, side, thing)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 40 {
+        EV_DoCeiling(line, SPEC_RAISETOHIGHEST)
+        EV_DoFloor(line, SPEC_LOWERFLOORTOLOWEST)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 44 {
+        EV_DoCeiling(line, SPEC_LOWERANDCRUSH)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 52 {
+        G_ExitLevel()
+    }
+    elif special == 53 {
+        EV_DoPlat(line, SPEC_PERPETUALRAISE, 0)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 54 {
+        EV_StopPlat(line)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 56 {
+        EV_DoFloor(line, SPEC_RAISEFLOORCRUSH)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 57 {
+        EV_CeilingCrushStop(line)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 58 {
+        EV_DoFloor(line, SPEC_RAISEFLOOR24)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 59 {
+        EV_DoFloor(line, SPEC_RAISEFLOOR24ANDCHANGE)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 100 {
+        EV_BuildStairs(line, SPEC_TURBO16)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 104 {
+        EV_TurnTagLightsOff(line)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 108 {
+        EV_DoDoor(line, SPEC_VLD_BLAZERAISE)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 109 {
+        EV_DoDoor(line, SPEC_VLD_BLAZEOPEN)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 110 {
+        EV_DoDoor(line, SPEC_VLD_BLAZECLOSE)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 119 {
+        EV_DoFloor(line, SPEC_RAISEFLOORTONEAREST)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 121 {
+        EV_DoPlat(line, SPEC_BLAZEDWUS, 0)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 124 {
+        G_SecretExitLevel()
+    }
+    elif special == 125 {
+        if (MOBJ_player(thing) as i64) == 0 {
+            EV_Teleport(line, side, thing)
+            GEOM_line_set_special(line, 0)
+        }
+    }
+    elif special == 130 {
+        EV_DoFloor(line, SPEC_RAISEFLOORTURBO)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 141 {
+        EV_DoCeiling(line, SPEC_SILENTCRUSHANDRAISE)
+        GEOM_line_set_special(line, 0)
+    }
+    elif special == 72 {
+        EV_DoCeiling(line, SPEC_LOWERANDCRUSH)
+    }
+    elif special == 73 {
+        EV_DoCeiling(line, SPEC_CRUSHANDRAISE)
+    }
+    elif special == 74 {
+        EV_CeilingCrushStop(line)
+    }
+    elif special == 75 {
+        EV_DoDoor(line, SPEC_VLD_CLOSE)
+    }
+    elif special == 76 {
+        EV_DoDoor(line, SPEC_VLD_CLOSE30THENOPEN)
+    }
+    elif special == 77 {
+        EV_DoCeiling(line, SPEC_FASTCRUSHANDRAISE)
+    }
+    elif special == 79 {
+        EV_LightTurnOn(line, 35)
+    }
+    elif special == 80 {
+        EV_LightTurnOn(line, 0)
+    }
+    elif special == 81 {
+        EV_LightTurnOn(line, 255)
+    }
+    elif special == 82 {
+        EV_DoFloor(line, SPEC_LOWERFLOORTOLOWEST)
+    }
+    elif special == 83 {
+        EV_DoFloor(line, SPEC_LOWERFLOOR)
+    }
+    elif special == 84 {
+        EV_DoFloor(line, SPEC_LOWERANDCHANGE)
+    }
+    elif special == 86 {
+        EV_DoDoor(line, SPEC_VLD_OPEN)
+    }
+    elif special == 87 {
+        EV_DoPlat(line, SPEC_PERPETUALRAISE, 0)
+    }
+    elif special == 88 {
+        EV_DoPlat(line, SPEC_DOWNWAITUPSTAY, 0)
+    }
+    elif special == 89 {
+        EV_StopPlat(line)
+    }
+    elif special == 90 {
+        EV_DoDoor(line, SPEC_VLD_NORMAL)
+    }
+    elif special == 91 {
+        EV_DoFloor(line, SPEC_RAISEFLOOR)
+    }
+    elif special == 92 {
+        EV_DoFloor(line, SPEC_RAISEFLOOR24)
+    }
+    elif special == 93 {
+        EV_DoFloor(line, SPEC_RAISEFLOOR24ANDCHANGE)
+    }
+    elif special == 94 {
+        EV_DoFloor(line, SPEC_RAISEFLOORCRUSH)
+    }
+    elif special == 95 {
+        EV_DoPlat(line, SPEC_RAISETONEARESTANDCHANGE, 0)
+    }
+    elif special == 96 {
+        EV_DoFloor(line, SPEC_RAISETOTEXTURE)
+    }
+    elif special == 97 {
+        EV_Teleport(line, side, thing)
+    }
+    elif special == 98 {
+        EV_DoFloor(line, SPEC_TURBOLOWER)
+    }
+    elif special == 105 {
+        EV_DoDoor(line, SPEC_VLD_BLAZERAISE)
+    }
+    elif special == 106 {
+        EV_DoDoor(line, SPEC_VLD_BLAZEOPEN)
+    }
+    elif special == 107 {
+        EV_DoDoor(line, SPEC_VLD_BLAZECLOSE)
+    }
+    elif special == 120 {
+        EV_DoPlat(line, SPEC_BLAZEDWUS, 0)
+    }
+    elif special == 126 {
+        if (MOBJ_player(thing) as i64) == 0 {
+            EV_Teleport(line, side, thing)
+        }
+    }
+    elif special == 128 {
+        EV_DoFloor(line, SPEC_RAISEFLOORTONEAREST)
+    }
+    elif special == 129 {
+        EV_DoFloor(line, SPEC_RAISEFLOORTURBO)
+    }
+}
+
+@flow_api
+function P_ShootSpecialLine(thing: ptr<void>, line: ptr<void>) -> void {
+    let special: i32 = GEOM_line_special(line)
+    if (MOBJ_player(thing) as i64) == 0 {
+        let mut ok: i32 = 0
+        if special == 46 {
+            ok = 1
+        }
+        if ok == 0 {
+            return
+        }
+    }
+    if special == 24 {
+        EV_DoFloor(line, SPEC_RAISEFLOOR)
+        P_ChangeSwitchTexture(line, 0)
+    } elif special == 46 {
+        EV_DoDoor(line, SPEC_VLD_OPEN)
+        P_ChangeSwitchTexture(line, 1)
+    } elif special == 47 {
+        EV_DoPlat(line, SPEC_RAISETONEARESTANDCHANGE, 0)
+        P_ChangeSwitchTexture(line, 0)
+    }
+}
+
+@flow_api
+function P_PlayerInSpecialSector(player: ptr<void>) -> void {
+    let mo: ptr<void> = PLAYER_mo(player)
+    let sector: ptr<void> = MOBJ_sector(mo)
+    if MOBJ_z(mo) != GEOM_sector_floorheight(sector) {
+        return
+    }
+    let special: i32 = GEOM_sector_special(sector)
+    if special == 5 {
+        if PLAYER_power(player, SPEC_PW_IRONFEET) == 0 {
+            if (STAT_leveltime() & 31) == 0 {
+                P_DamageMobj(mo, null, null, 10)
+            }
+        }
+    } elif special == 7 {
+        if PLAYER_power(player, SPEC_PW_IRONFEET) == 0 {
+            if (STAT_leveltime() & 31) == 0 {
+                P_DamageMobj(mo, null, null, 5)
+            }
+        }
+    } elif special == 16 or special == 4 {
+        if PLAYER_power(player, SPEC_PW_IRONFEET) == 0 or P_Random() < 5 {
+            if (STAT_leveltime() & 31) == 0 {
+                P_DamageMobj(mo, null, null, 20)
+            }
+        }
+    } elif special == 9 {
+        PLAYER_inc_secretcount(player)
+        GEOM_sector_set_special(sector, 0)
+    } elif special == 11 {
+        PLAYER_set_cheats(player, PLAYER_cheats(player) & (0 - 1 - SPEC_CF_GODMODE))
+        if (STAT_leveltime() & 31) == 0 {
+            P_DamageMobj(mo, null, null, 20)
+        }
+        if PLAYER_health(player) <= 10 {
+            G_ExitLevel()
+        }
+    } else {
+        I_Error("P_PlayerInSpecialSector: unknown special")
+    }
+}
+
+@flow_api
+function P_UpdateSpecials() -> void {
+    if levelTimer != 0 {
+        levelTimeCount = levelTimeCount - 1
+        if levelTimeCount == 0 {
+            G_ExitLevel()
+        }
+    }
+
+    let lt: i32 = STAT_leveltime()
+    for a in 0 to numanims {
+        let base: i32 = anims[a].basepic
+        let np: i32 = anims[a].numpics
+        let spd: i32 = anims[a].speed
+        for i in base to (base + np) {
+            let pic: i32 = base + ((lt / spd + i) % np)
+            if anims[a].istexture != 0 {
+                RDATA_set_texturetranslation(i, pic)
+            } else {
+                RDATA_set_flattranslation(i, pic)
+            }
+        }
+    }
+
+    for i in 0 to numlinespecials {
+        let line: ptr<void> = linespeciallist[i]
+        if GEOM_line_special(line) == 48 {
+            GEOM_side_i_add_textureoffset(GEOM_line_sidenum(line, 0), SPEC_FRACUNIT)
+        }
+    }
+
+    for i in 0 to SPEC_MAXBUTTONS {
+        if spec_btn_btimer(i) != 0 {
+            let t: i32 = spec_btn_btimer(i) - 1
+            spec_btn_set_btimer(i, t)
+            if t == 0 {
+                let sn: i32 = GEOM_line_sidenum(spec_btn_line(i), 0)
+                let w: i32 = spec_btn_where(i)
+                if w == SPEC_TOP {
+                    GEOM_side_i_set_toptexture(sn, spec_btn_btexture(i))
+                } elif w == SPEC_MIDDLE {
+                    GEOM_side_i_set_midtexture(sn, spec_btn_btexture(i))
+                } elif w == SPEC_BOTTOM {
+                    GEOM_side_i_set_bottomtexture(sn, spec_btn_btexture(i))
+                }
+                S_StartSound(spec_btn_soundorg_addr(i), SPEC_SFX_SWTCHN)
+                SWITCH_clear_button(i)
+            }
+        }
+    }
+}
+
+# ---- Donut ------------------------------------------------------------
+
+function spec_donut_overrun(s3_floorheight: ptr<i32>, s3_floorpic: ptr<i32>) -> void {
+    if spec_donut_first != 0 {
+        spec_donut_first = 0
+        spec_donut_floorheight = SPEC_DONUT_FLOORHEIGHT_DEFAULT
+        spec_donut_floorpic = SPEC_DONUT_FLOORPIC_DEFAULT
+        let p: i32 = M_CheckParmWithArgs("-donut", 2)
+        if p > 0 {
+            M_StrToInt(spec_argv_at(p + 1), &spec_donut_floorheight)
+            M_StrToInt(spec_argv_at(p + 2), &spec_donut_floorpic)
+            if spec_donut_floorpic >= RDATA_numflats() {
+                specshim_donut_floorpic_warn(RDATA_numflats())
+                spec_donut_floorpic = SPEC_DONUT_FLOORPIC_DEFAULT
+            }
+        }
+    }
+    s3_floorheight[0] = spec_donut_floorheight
+    s3_floorpic[0] = spec_donut_floorpic
+}
+
+@flow_api
+function EV_DoDonut(line: ptr<void>) -> i32 {
+    let mut secnum: i32 = 0 - 1
+    let mut rtn: i32 = 0
+    while true {
+        secnum = P_FindSectorFromLineTag(line, secnum)
+        if secnum < 0 {
+            return rtn
+        }
+        let s1: ptr<void> = GEOM_sector(secnum)
+        if (GEOM_sector_specialdata(s1) as i64) != 0 {
+            # continue
+        } else {
+            rtn = 1
+            let s2: ptr<void> = getNextSector(GEOM_sector_line(s1, 0), s1)
+            if (s2 as i64) == 0 {
+                specshim_stderr_msg("EV_DoDonut: linedef had no second sidedef! Unexpected behavior may occur in Vanilla Doom. \n")
+                return rtn
+            }
+            let n2: i32 = GEOM_sector_linecount(s2)
+            let mut i: i32 = 0
+            let mut done: i32 = 0
+            while i < n2 and done == 0 {
+                let s3: ptr<void> = GEOM_line_backsector(GEOM_sector_line(s2, i))
+                if (s3 as i64) != (s1 as i64) {
+                    let mut s3_floorheight: i32 = 0
+                    let mut s3_floorpic: i32 = 0
+                    if (s3 as i64) == 0 {
+                        specshim_stderr_msg("EV_DoDonut: WARNING: emulating buffer overrun due to NULL back sector. Unexpected behavior may occur in Vanilla Doom.\n")
+                        spec_donut_overrun(&s3_floorheight, &s3_floorpic)
+                    } else {
+                        s3_floorheight = GEOM_sector_floorheight(s3)
+                        s3_floorpic = GEOM_sector_floorpic(s3)
+                    }
+
+                    let floor: ptr<void> = Z_Malloc(SPEC_SIZEOF_FLOORMOVE, SPEC_PU_LEVSPEC, 0 as ptr<void>)
+                    P_AddThinker(floor)
+                    GEOM_sector_set_specialdata(s2, floor)
+                    THINKER_set_move_floor(floor)
+                    let f: ptr<u8> = floor as ptr<u8>
+                    spec_fl_set_type(f, SPEC_DONUTRAISE)
+                    spec_fl_set_crush(f, 0)
+                    spec_fl_set_direction(f, 1)
+                    spec_fl_set_sector(f, s2)
+                    spec_fl_set_speed(f, SPEC_FLOORSPEED / 2)
+                    spec_fl_set_texture(f, s3_floorpic)
+                    spec_fl_set_newspecial(f, 0)
+                    spec_fl_set_floordestheight(f, s3_floorheight)
+
+                    let floor2: ptr<void> = Z_Malloc(SPEC_SIZEOF_FLOORMOVE, SPEC_PU_LEVSPEC, 0 as ptr<void>)
+                    P_AddThinker(floor2)
+                    GEOM_sector_set_specialdata(s1, floor2)
+                    THINKER_set_move_floor(floor2)
+                    let f2: ptr<u8> = floor2 as ptr<u8>
+                    spec_fl_set_type(f2, SPEC_LOWERFLOOR)
+                    spec_fl_set_crush(f2, 0)
+                    spec_fl_set_direction(f2, 0 - 1)
+                    spec_fl_set_sector(f2, s1)
+                    spec_fl_set_speed(f2, SPEC_FLOORSPEED / 2)
+                    spec_fl_set_floordestheight(f2, s3_floorheight)
+                    done = 1
+                }
+                i = i + 1
+            }
+        }
+    }
+    return rtn
+}
+
+# ---- spawn ------------------------------------------------------------
+
+@flow_api
+function P_SpawnSpecials() -> void {
+    if STAT_timelimit() > 0 and STAT_deathmatch() != 0 {
+        levelTimer = 1
+        levelTimeCount = STAT_timelimit() * 60 * SPEC_TICRATE
+    } else {
+        levelTimer = 0
+    }
+
+    let nsec: i32 = GEOM_numsectors()
+    for i in 0 to nsec {
+        let sector: ptr<void> = GEOM_sector(i)
+        let special: i32 = GEOM_sector_special(sector)
+        if special != 0 {
+            if special == 1 {
+                P_SpawnLightFlash(sector)
+            } elif special == 2 {
+                P_SpawnStrobeFlash(sector, SPEC_FASTDARK, 0)
+            } elif special == 3 {
+                P_SpawnStrobeFlash(sector, SPEC_SLOWDARK, 0)
+            } elif special == 4 {
+                P_SpawnStrobeFlash(sector, SPEC_FASTDARK, 0)
+                GEOM_sector_set_special(sector, 4)
+            } elif special == 8 {
+                P_SpawnGlowingLight(sector)
+            } elif special == 9 {
+                STAT_inc_totalsecret()
+            } elif special == 10 {
+                P_SpawnDoorCloseIn30(sector)
+            } elif special == 12 {
+                P_SpawnStrobeFlash(sector, SPEC_SLOWDARK, 1)
+            } elif special == 13 {
+                P_SpawnStrobeFlash(sector, SPEC_FASTDARK, 1)
+            } elif special == 14 {
+                P_SpawnDoorRaiseIn5Mins(sector, i)
+            } elif special == 17 {
+                P_SpawnFireFlicker(sector)
+            }
+        }
+    }
+
+    numlinespecials = 0
+    let nlines: i32 = GEOM_numlines()
+    for i in 0 to nlines {
+        let line: ptr<void> = GEOM_line(i)
+        if GEOM_line_special(line) == 48 {
+            if numlinespecials >= SPEC_MAXLINEANIMS {
+                I_Error("Too many scrolling wall linedefs!")
+            }
+            linespeciallist[numlinespecials] = line
+            numlinespecials = numlinespecials + 1
+        }
+    }
+
+    let ceils: ptr<i64> = specshim_activeceilings()
+    for i in 0 to SPEC_MAXCEILINGS {
+        ceils[i] = 0
+    }
+    let plats: ptr<i64> = specshim_activeplats()
+    for i in 0 to SPEC_MAXPLATS {
+        plats[i] = 0
+    }
+    for i in 0 to SPEC_MAXBUTTONS {
+        SWITCH_clear_button(i)
+    }
+}

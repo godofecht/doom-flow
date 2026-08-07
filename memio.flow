@@ -1,0 +1,152 @@
+# In-memory stdio, ported from memio.c to Flow.
+#
+# MEMFILE is opaque to every other TU (memio.h only forward-declares it),
+# so we can use a real Flow struct instead of byte-offset helpers. Layout
+# matches the C original on LP64 (sizeof 32, verified).
+
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+extern { function printf(fmt: string) -> i32 }
+
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function Z_Free(p: ptr<void>) -> void }
+
+struct MemFile {
+    buf: ptr<u8>,
+    buflen: i64,
+    alloced: i64,
+    position: u32,
+    mode: i32
+}
+
+const MEMIO_PU_STATIC: i32 = 1
+const MEMFILE_SIZE: i32 = 32
+
+const MODE_READ: i32 = 0
+const MODE_WRITE: i32 = 1
+
+const MEM_SEEK_SET: i32 = 0
+const MEM_SEEK_CUR: i32 = 1
+const MEM_SEEK_END: i32 = 2
+
+const MEMIO_SIZE_ERROR: i64 = 0 - 1
+
+function mf(stream: ptr<void>) -> ptr<MemFile> {
+    return stream as ptr<MemFile>
+}
+
+@flow_api
+function mem_fopen_read(buf: ptr<void>, buflen: i64) -> ptr<void> {
+    let file: ptr<MemFile> = Z_Malloc(MEMFILE_SIZE, MEMIO_PU_STATIC, null) as ptr<MemFile>
+    file[0] = MemFile {
+        buf: buf as ptr<u8>,
+        buflen: buflen,
+        alloced: 0,
+        position: 0 as u32,
+        mode: MODE_READ
+    }
+    return file as ptr<void>
+}
+
+@flow_api
+function mem_fread(buf: ptr<void>, size: i64, nmemb: i64, stream: ptr<void>) -> i64 {
+    let f: ptr<MemFile> = mf(stream)
+    if f[0].mode != MODE_READ {
+        printf("not a read stream\n")
+        return MEMIO_SIZE_ERROR
+    }
+
+    let mut items: i64 = nmemb
+    let remaining: i64 = f[0].buflen - (f[0].position as i64)
+    if items * size > remaining {
+        items = remaining / size
+    }
+
+    let src: ptr<u8> = ((f[0].buf as i64) + (f[0].position as i64)) as ptr<u8>
+    memcpy(buf, src as ptr<void>, items * size)
+    f[0].position = f[0].position + (items * size) as u32
+    return items
+}
+
+@flow_api
+function mem_fopen_write() -> ptr<void> {
+    let file: ptr<MemFile> = Z_Malloc(MEMFILE_SIZE, MEMIO_PU_STATIC, null) as ptr<MemFile>
+    file[0] = MemFile {
+        buf: Z_Malloc(1024, MEMIO_PU_STATIC, null) as ptr<u8>,
+        buflen: 0,
+        alloced: 1024,
+        position: 0 as u32,
+        mode: MODE_WRITE
+    }
+    return file as ptr<void>
+}
+
+@flow_api
+function mem_fwrite(ptr: ptr<void>, size: i64, nmemb: i64, stream: ptr<void>) -> i64 {
+    let f: ptr<MemFile> = mf(stream)
+    if f[0].mode != MODE_WRITE {
+        return MEMIO_SIZE_ERROR
+    }
+
+    let bytes: i64 = size * nmemb
+    while bytes > f[0].alloced - (f[0].position as i64) {
+        let newbuf: ptr<u8> = Z_Malloc((f[0].alloced * 2) as i32, MEMIO_PU_STATIC, null) as ptr<u8>
+        memcpy(newbuf as ptr<void>, f[0].buf as ptr<void>, f[0].alloced)
+        Z_Free(f[0].buf as ptr<void>)
+        f[0].buf = newbuf
+        f[0].alloced = f[0].alloced * 2
+    }
+
+    let dst: ptr<u8> = ((f[0].buf as i64) + (f[0].position as i64)) as ptr<u8>
+    memcpy(dst as ptr<void>, ptr, bytes)
+    f[0].position = f[0].position + bytes as u32
+
+    if (f[0].position as i64) > f[0].buflen {
+        f[0].buflen = f[0].position as i64
+    }
+    return nmemb
+}
+
+@flow_api
+function mem_get_buf(stream: ptr<void>, buf: ptr<ptr<void> >, buflen: ptr<i64>) -> void {
+    let f: ptr<MemFile> = mf(stream)
+    buf[0] = f[0].buf as ptr<void>
+    buflen[0] = f[0].buflen
+}
+
+@flow_api
+function mem_fclose(stream: ptr<void>) -> void {
+    let f: ptr<MemFile> = mf(stream)
+    if f[0].mode == MODE_WRITE {
+        Z_Free(f[0].buf as ptr<void>)
+    }
+    Z_Free(f as ptr<void>)
+}
+
+@flow_api
+function mem_ftell(stream: ptr<void>) -> i64 {
+    return mf(stream)[0].position as i64
+}
+
+@flow_api
+function mem_fseek(stream: ptr<void>, position: i64, whence: i32) -> i32 {
+    let f: ptr<MemFile> = mf(stream)
+    let mut newpos: u32 = 0
+
+    if whence == MEM_SEEK_SET {
+        newpos = position as u32
+    } elif whence == MEM_SEEK_CUR {
+        newpos = (f[0].position as i64 + position) as u32
+    } elif whence == MEM_SEEK_END {
+        newpos = (f[0].buflen + position) as u32
+    } else {
+        return 0 - 1
+    }
+
+    if (newpos as i64) < f[0].buflen {
+        f[0].position = newpos
+        return 0
+    }
+
+    printf("Error seeking in mem file\n")
+    return 0 - 1
+}

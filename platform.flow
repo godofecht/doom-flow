@@ -1,0 +1,80 @@
+# Host / platform helpers for doom-flow.
+#
+# Formerly platform_stub.c. All host ABI goes through Flow runtime
+# trampolines (flow_rt_support.c). Feature request / docs:
+# Flow docs/language/c-fnptr-call.md.
+
+extern {
+    function flow_rt_call_void(fn: ptr<void>) -> void
+    function flow_rt_call_p1(fn: ptr<void>, arg: ptr<void>) -> void
+    function flow_rt_call_p1_bool(fn: ptr<void>, arg: ptr<void>) -> i32
+    function flow_rt_call_p3_bool(fn: ptr<void>, a: ptr<void>, x: i32, y: i32) -> i32
+    function flow_rt_errno_is_isdir() -> i32
+    function flow_rt_error_popup(msg: string) -> void
+    function flow_rt_unlink(path: string) -> i32
+    function flow_rt_rename(old_path: string, new_path: string) -> i32
+    function flow_rt_mkdir(path: string, mode: i32) -> i32
+}
+
+const PLATFORM_MKDIR_MODE: i32 = 493  # 0755
+
+# ---- C fnptr dispatch ------------------------------------------------
+
+@flow_api
+function sysshim_call_void(fn: ptr<void>) -> void {
+    flow_rt_call_void(fn)
+}
+
+@flow_api
+function sysshim_call_acp1(fn: ptr<void>, arg: ptr<void>) -> void {
+    flow_rt_call_p1(fn, arg)
+}
+
+@flow_api
+function sysshim_call_line_fn(fn: ptr<void>, line: ptr<void>) -> i32 {
+    return flow_rt_call_p1_bool(fn, line)
+}
+
+@flow_api
+function sysshim_call_mobj_fn(fn: ptr<void>, mobj: ptr<void>) -> i32 {
+    return flow_rt_call_p1_bool(fn, mobj)
+}
+
+@flow_api
+function sysshim_call_intercept_fn(fn: ptr<void>, icpt: ptr<void>) -> i32 {
+    return flow_rt_call_p1_bool(fn, icpt)
+}
+
+@flow_api
+function vshim_call_patchclip(fn: ptr<void>, patch: ptr<void>, x: i32, y: i32) -> i32 {
+    return flow_rt_call_p3_bool(fn, patch, x, y)
+}
+
+# ---- filesystem ------------------------------------------------------
+
+@flow_api
+function sysshim_remove(path: string) -> i32 {
+    return flow_rt_unlink(path)
+}
+
+@flow_api
+function sysshim_rename(old_path: string, new_path: string) -> i32 {
+    return flow_rt_rename(old_path, new_path)
+}
+
+@flow_api
+function miscshim_mkdir(path: ptr<u8>) -> void {
+    flow_rt_mkdir(path as string, PLATFORM_MKDIR_MODE)
+}
+
+@flow_api
+function miscshim_errno_is_isdir() -> i32 {
+    return flow_rt_errno_is_isdir()
+}
+
+# ---- host error UI ---------------------------------------------------
+
+@flow_api
+function sysshim_error_popup(msg: string) -> void {
+    flow_rt_error_popup(msg)
+}

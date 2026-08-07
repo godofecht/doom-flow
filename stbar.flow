@@ -1,0 +1,1477 @@
+# Status bar, ported from st_lib.c and st_stuff.c as one unit.
+#
+# The exported symbols keep the exact C names via @flow_api. The widget
+# structs (st_number_t, st_percent_t, st_multicon_t, st_binicon_t) were
+# private to these two files (verified by grep: no other engine file
+# touches them, st_backing_screen, st_palette or the STlib_* entry
+# points), so they are flattened into module-internal parallel arrays.
+# Where the C widgets stored int*/boolean* pointers into player_t or into
+# module statics, this port stores a small source id and resolves the
+# value at draw time, which reads the same memory at the same moment.
+#
+# player_t fields go through PLAYER_* (user.flow) on st_plyr, bound in
+# ST_initData to PLAYER_at(STAT_consoleplayer()). patch_t fields use
+# PATCH_* (video.flow). cheatseq_t tables and idmypos formatting live here.
+
+# ---- libc -------------------------------------------------------------
+extern { function malloc(n: i64) -> ptr<void> }
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+extern { function snprintf(buf: string, n: i64, fmt: string, a: u32, x: i32, y: i32) -> i32 }
+
+# ---- engine C ---------------------------------------------------------
+extern { function I_Error(msg: string) -> void }
+extern { function I_SetPalette(pal: ptr<u8>) -> void }
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function V_DrawPatch(x: i32, y: i32, patch: ptr<void>) -> void }
+extern { function V_CopyRect(srcx: i32, srcy: i32, source: ptr<u8>, width: i32, height: i32, destx: i32, desty: i32) -> void }
+extern { function V_UseBuffer(buffer: ptr<u8>) -> void }
+extern { function V_RestoreBuffer() -> void }
+extern { function S_ChangeMusic(music_id: i32, looping: i32) -> void }
+extern { function G_DeferedInitNew(skill: i32, episode: i32, map: i32) -> void }
+extern { function R_PointToAngle2(x1: i32, y1: i32, x2: i32, y2: i32) -> u32 }
+extern { function P_GivePower(player: ptr<void>, power: i32) -> i32 }
+
+# ---- Flow modules (same ABI as their C ancestors; signatures must match
+# the defining module exactly, since everything lands in one C file) ----
+# wad.flow
+extern { function W_CacheLumpName(name: string, tag: i32) -> ptr<void> }
+extern { function W_CacheLumpNum(lumpnum: i32, tag: i32) -> ptr<void> }
+extern { function W_GetNumForName(name: string) -> i32 }
+extern { function W_ReleaseLumpName(name: string) -> void }
+# fixp.flow
+extern { function M_Random() -> i32 }
+# cheat.flow
+extern { function cht_CheckCheat(cht: ptr<u8>, key: u8) -> i32 }
+extern { function cht_GetParam(cht: ptr<u8>, buffer: ptr<u8>) -> void }
+
+# ---- PLAYER_* / MOBJ_* helpers ----------------------------------------
+extern { function PLAYER_at(i: i32) -> ptr<void> }
+extern { function PLAYER_ammo(p: ptr<void>, a: i32) -> i32 }
+extern { function PLAYER_armorpoints(p: ptr<void>) -> i32 }
+extern { function PLAYER_attackdown(p: ptr<void>) -> i32 }
+extern { function PLAYER_attacker(p: ptr<void>) -> ptr<void> }
+extern { function PLAYER_bonuscount(p: ptr<void>) -> i32 }
+extern { function PLAYER_card(p: ptr<void>, c: i32) -> i32 }
+extern { function PLAYER_cheats(p: ptr<void>) -> i32 }
+extern { function PLAYER_damagecount(p: ptr<void>) -> i32 }
+extern { function PLAYER_frags(p: ptr<void>, i: i32) -> i32 }
+extern { function PLAYER_health(p: ptr<void>) -> i32 }
+extern { function PLAYER_maxammo(p: ptr<void>, a: i32) -> i32 }
+extern { function PLAYER_mo(p: ptr<void>) -> ptr<void> }
+extern { function PLAYER_power(p: ptr<void>, pw: i32) -> i32 }
+extern { function PLAYER_readyweapon(p: ptr<void>) -> i32 }
+extern { function PLAYER_set_ammo(p: ptr<void>, a: i32, v: i32) -> void }
+extern { function PLAYER_set_armorpoints(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_armortype(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_card(p: ptr<void>, c: i32, v: i32) -> void }
+extern { function PLAYER_set_cheats(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_health(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_message(p: ptr<void>, msg: string) -> void }
+extern { function PLAYER_set_power(p: ptr<void>, pw: i32, v: i32) -> void }
+extern { function PLAYER_set_weaponowned(p: ptr<void>, w: i32, v: i32) -> void }
+extern { function PLAYER_weaponowned(p: ptr<void>, w: i32) -> i32 }
+extern { function MOBJ_set_health(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_x(m: ptr<void>) -> i32 }
+extern { function MOBJ_y(m: ptr<void>) -> i32 }
+extern { function MOBJ_angle(m: ptr<void>) -> u32 }
+extern { function WEAPONINFO_ammo(w: i32) -> i32 }
+extern { function PATCH_width(p: ptr<void>) -> i32 }
+extern { function PATCH_height(p: ptr<void>) -> i32 }
+extern { function PATCH_leftoffset(p: ptr<void>) -> i32 }
+extern { function PATCH_topoffset(p: ptr<void>) -> i32 }
+
+extern { function STAT_gameskill() -> i32 }
+extern { function STAT_automapactive() -> i32 }
+extern { function STAT_logical_gamemission() -> i32 }
+
+# ---- constants hardcoded from C headers -------------------------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+# st_stuff.h
+const ST_HEIGHT_C: i32 = 32
+const ST_WIDTH_C: i32 = 320        # SCREENWIDTH, i_video.h
+const ST_Y_C: i32 = 168            # SCREENHEIGHT - ST_HEIGHT
+
+# z_zone.h
+const PU_STATIC_C: i32 = 1
+const PU_CACHE_C: i32 = 8
+
+# st_stuff.c palette indices
+const STARTREDPALS: i32 = 1
+const STARTBONUSPALS: i32 = 9
+const NUMREDPALS: i32 = 8
+const NUMBONUSPALS: i32 = 4
+const RADIATIONPAL: i32 = 13
+
+# st_stuff.c layout macros
+const ST_X_C: i32 = 0
+const ST_FX_C: i32 = 143
+const ST_FACESX: i32 = 143
+const ST_FACESY: i32 = 168
+const ST_AMMOWIDTH: i32 = 3
+const ST_AMMOX: i32 = 44
+const ST_AMMOY: i32 = 171
+const ST_HEALTHX: i32 = 90
+const ST_HEALTHY: i32 = 171
+const ST_ARMSX: i32 = 111
+const ST_ARMSY: i32 = 172
+const ST_ARMSBGX: i32 = 104
+const ST_ARMSBGY: i32 = 168
+const ST_ARMSXSPACE: i32 = 12
+const ST_ARMSYSPACE: i32 = 10
+const ST_FRAGSX: i32 = 138
+const ST_FRAGSY: i32 = 171
+const ST_FRAGSWIDTH: i32 = 2
+const ST_ARMORX: i32 = 221
+const ST_ARMORY: i32 = 171
+const ST_KEY0X: i32 = 239
+const ST_KEY0Y: i32 = 171
+const ST_KEY1X: i32 = 239
+const ST_KEY1Y: i32 = 181
+const ST_KEY2X: i32 = 239
+const ST_KEY2Y: i32 = 191
+const ST_AMMO0X: i32 = 288
+const ST_AMMO0Y: i32 = 173
+const ST_AMMO1X: i32 = 288
+const ST_AMMO1Y: i32 = 179
+const ST_AMMO2X: i32 = 288
+const ST_AMMO2Y: i32 = 191
+const ST_AMMO3X: i32 = 288
+const ST_AMMO3Y: i32 = 185
+const ST_MAXAMMO0X: i32 = 314
+const ST_MAXAMMO0Y: i32 = 173
+const ST_MAXAMMO1X: i32 = 314
+const ST_MAXAMMO1Y: i32 = 179
+const ST_MAXAMMO2X: i32 = 314
+const ST_MAXAMMO2Y: i32 = 191
+const ST_MAXAMMO3X: i32 = 314
+const ST_MAXAMMO3Y: i32 = 185
+
+# st_stuff.c face machine (TICRATE = 35, i_timer.h)
+const ST_NUMPAINFACES: i32 = 5
+const ST_FACESTRIDE: i32 = 8       # straight 3 + turn 2 + special 3
+const ST_NUMFACES: i32 = 42        # 8*5 + 2 extra
+const ST_TURNOFFSET: i32 = 3
+const ST_OUCHOFFSET: i32 = 5
+const ST_EVILGRINOFFSET: i32 = 6
+const ST_RAMPAGEOFFSET: i32 = 7
+const ST_GODFACE: i32 = 40
+const ST_DEADFACE: i32 = 41
+const ST_EVILGRINCOUNT: i32 = 70   # 2*TICRATE
+const ST_STRAIGHTFACECOUNT: i32 = 17  # TICRATE/2
+const ST_TURNCOUNT: i32 = 35       # 1*TICRATE
+const ST_RAMPAGEDELAY: i32 = 70    # 2*TICRATE
+const ST_MUCHPAIN: i32 = 20
+
+# doomdef.h enums
+const NUMWEAPONS_C: i32 = 9
+const NUMAMMO_C: i32 = 4
+const NUMCARDS_C: i32 = 6
+const AM_NOAMMO: i32 = 5           # ammotype_t am_noammo
+const WP_CHAINSAW: i32 = 7         # weapontype_t wp_chainsaw
+const PW_INVULNERABILITY: i32 = 0  # powertype_t
+const PW_STRENGTH: i32 = 1
+const PW_IRONFEET: i32 = 3
+const MAXPLAYERS_C: i32 = 4
+
+# d_player.h cheat_t
+const CF_NOCLIP: i32 = 1
+const CF_GODMODE: i32 = 2
+
+# d_mode.h GameMode_t
+const GM_SHAREWARE: i32 = 0
+const GM_REGISTERED: i32 = 1
+const GM_COMMERCIAL: i32 = 2
+const GM_RETAIL: i32 = 3
+# d_mode.h GameMission_t
+const GMI_DOOM: i32 = 0
+# d_mode.h GameVersion_t
+const EXE_ULTIMATE: i32 = 6
+const EXE_CHEX: i32 = 9
+# d_mode.h skill_t
+const SK_NIGHTMARE: i32 = 4
+
+# sounds.h musicenum_t
+const MUS_E1M1: i32 = 1
+const MUS_RUNNIN: i32 = 33
+
+# tables.h
+const ANG45_C: u32 = 536870912     # 0x20000000
+
+# am_map.h message codes: ('a'<<24)+('m'<<16) [ | ('e'|'x')<<8 ]
+# (STB_ prefix: automap.flow already claims the AM_MSG* const names)
+const STB_AM_MSGHEADER: i32 = 1634533376
+const STB_AM_MSGENTERED: i32 = 1634559232
+const STB_AM_MSGEXITED: i32 = 1634564096
+
+# d_event.h evtype_t
+const EV_KEYDOWN: i32 = 0
+const EV_KEYUP: i32 = 1
+
+# st_stuff.h st_stateenum_t / st_chatstateenum_t
+const AUTOMAP_STATE: i32 = 0
+const FIRSTPERSON_STATE: i32 = 1
+const START_CHAT_STATE: i32 = 0
+
+# deh_misc.h defaults (FEATURE_DEHACKED is off in this build)
+const DEH_GOD_MODE_HEALTH: i32 = 100
+const DEH_IDFA_ARMOR: i32 = 200
+const DEH_IDFA_ARMOR_CLASS: i32 = 2
+const DEH_IDKFA_ARMOR: i32 = 200
+const DEH_IDKFA_ARMOR_CLASS: i32 = 2
+
+# ---- cheatseq_t tables (layout in cheat.flow) ---------------------------
+
+let mut cheat_mus_ptr: ptr<u8> = null
+let mut cheat_god_ptr: ptr<u8> = null
+let mut cheat_ammo_ptr: ptr<u8> = null
+let mut cheat_ammonokey_ptr: ptr<u8> = null
+let mut cheat_noclip_ptr: ptr<u8> = null
+let mut cheat_commercial_noclip_ptr: ptr<u8> = null
+let mut cheat_choppers_ptr: ptr<u8> = null
+let mut cheat_clev_ptr: ptr<u8> = null
+let mut cheat_mypos_ptr: ptr<u8> = null
+let mut cheat_powerup_ptr: array<ptr<u8>, 7> = [null, null, null, null, null, null, null]
+
+let mut st_mypos_buf: array<u8, 52> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0
+]
+
+let mut st_cheats_ready: i32 = 0
+
+function st_cheat_alloc() -> ptr<u8> {
+    return calloc(1, 72) as ptr<u8>
+}
+
+function st_cheat_init(buf: ptr<u8>, seq: string, param_chars: i32) -> void {
+    let s: ptr<u8> = seq as ptr<u8>
+    let mut i: i32 = 0
+    while s[i] as i32 != 0 {
+        buf[i] = s[i]
+        i = i + 1
+    }
+    buf[i] = 0 as u8
+    let slen: ptr<i64> = ((buf as i64) + 32) as ptr<i64>
+    slen[0] = i as i64
+    let pc: ptr<i32> = ((buf as i64) + 40) as ptr<i32>
+    pc[0] = param_chars
+}
+
+function st_init_cheats() -> void {
+    if st_cheats_ready != 0 {
+        return
+    }
+    cheat_mus_ptr = st_cheat_alloc()
+    cheat_god_ptr = st_cheat_alloc()
+    cheat_ammo_ptr = st_cheat_alloc()
+    cheat_ammonokey_ptr = st_cheat_alloc()
+    cheat_noclip_ptr = st_cheat_alloc()
+    cheat_commercial_noclip_ptr = st_cheat_alloc()
+    cheat_choppers_ptr = st_cheat_alloc()
+    cheat_clev_ptr = st_cheat_alloc()
+    cheat_mypos_ptr = st_cheat_alloc()
+    for i in 0 to 7 {
+        cheat_powerup_ptr[i] = st_cheat_alloc()
+    }
+    st_cheat_init(cheat_mus_ptr, "idmus", 2)
+    st_cheat_init(cheat_god_ptr, "iddqd", 0)
+    st_cheat_init(cheat_ammo_ptr, "idkfa", 0)
+    st_cheat_init(cheat_ammonokey_ptr, "idfa", 0)
+    st_cheat_init(cheat_noclip_ptr, "idspispopd", 0)
+    st_cheat_init(cheat_commercial_noclip_ptr, "idclip", 0)
+    st_cheat_init(cheat_powerup_ptr[0], "idbeholdv", 0)
+    st_cheat_init(cheat_powerup_ptr[1], "idbeholds", 0)
+    st_cheat_init(cheat_powerup_ptr[2], "idbeholdi", 0)
+    st_cheat_init(cheat_powerup_ptr[3], "idbeholdr", 0)
+    st_cheat_init(cheat_powerup_ptr[4], "idbeholda", 0)
+    st_cheat_init(cheat_powerup_ptr[5], "idbeholdl", 0)
+    st_cheat_init(cheat_powerup_ptr[6], "idbehold", 0)
+    st_cheat_init(cheat_choppers_ptr, "idchoppers", 0)
+    st_cheat_init(cheat_clev_ptr, "idclev", 2)
+    st_cheat_init(cheat_mypos_ptr, "idmypos", 0)
+    st_cheats_ready = 1
+}
+
+function st_cheat_ptr(buf: ptr<u8>) -> ptr<void> {
+    return buf as ptr<void>
+}
+
+function st_cheat_powerup(i: i32) -> ptr<void> {
+    return st_cheat_ptr(cheat_powerup_ptr[i])
+}
+
+function st_mypos_message(p: ptr<void>) -> void {
+    let mo: ptr<void> = PLAYER_mo(p)
+    snprintf(
+        &st_mypos_buf[0] as string,
+        52,
+        "ang=0x%x;x,y=(0x%x,0x%x)",
+        MOBJ_angle(mo),
+        MOBJ_x(mo),
+        MOBJ_y(mo))
+    PLAYER_set_message(p, &st_mypos_buf[0] as string)
+}
+
+# ---- module state (all C statics of st_stuff.c / st_lib.c) ------------
+
+let mut st_plyr: ptr<void> = null   # console player, bound in ST_initData
+let mut st_backing_screen: ptr<u8> = null
+let mut st_firsttime: i32 = 0
+let mut lu_palette: i32 = 0
+let mut st_clock: u32 = 0
+let mut st_msgcounter: i32 = 0
+let mut st_chatstate: i32 = 0
+let mut st_gamestate: i32 = 0
+let mut st_statusbaron: i32 = 0
+let mut st_chat: i32 = 0
+let mut st_oldchat: i32 = 0
+let mut st_cursoron: i32 = 0
+let mut st_notdeathmatch: i32 = 0
+let mut st_armson: i32 = 0
+let mut st_fragson: i32 = 0
+let mut st_fragscount: i32 = 0
+let mut st_oldhealth: i32 = -1
+let mut st_facecount: i32 = 0
+let mut st_faceindex: i32 = 0
+let mut st_randomnumber: i32 = 0
+let mut st_palette: i32 = 0
+let mut st_stopped: i32 = 1
+
+let mut oldweaponsowned: array<i32, 9> = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+let mut keyboxes: array<i32, 3> = [0, 0, 0]
+
+# ST_updateFaceWidget function statics
+let mut face_lastattackdown: i32 = -1
+let mut face_priority: i32 = 0
+# ST_calcPainOffset function statics
+let mut pain_lastcalc: i32 = 0
+let mut pain_oldhealth: i32 = -1
+
+# ---- patches (opaque pointers from W_CacheLumpName, stored as i64) ----
+
+let mut p_sbar: i64 = 0
+let mut p_tallpercent: i64 = 0
+let mut p_faceback: i64 = 0
+let mut p_armsbg: i64 = 0
+let mut p_sttminus: i64 = 0
+let mut p_tallnum: array<i64, 10> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+let mut p_shortnum: array<i64, 10> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+let mut p_keys: array<i64, 6> = [0, 0, 0, 0, 0, 0]
+let mut p_armsgray: array<i64, 6> = [0, 0, 0, 0, 0, 0]
+let mut p_faces: array<i64, 42> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+# ---- widgets, flattened -----------------------------------------------
+#
+# Number widgets (indices):
+#   0        w_ready
+#   1..4     w_ammo[0..3]
+#   5..8     w_maxammo[0..3]
+#   9        w_frags
+#   10       w_health.n   (percent widget's number)
+#   11       w_armor.n    (percent widget's number)
+let mut nw_x: array<i32, 12> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+let mut nw_y: array<i32, 12> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+let mut nw_width: array<i32, 12> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+let mut nw_oldnum: array<i32, 12> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+let mut nw_font: array<i32, 12> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  # 0 tall, 1 short
+let mut nw_on: array<i32, 12> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]    # 0 statusbaron, 2 fragson
+
+# w_ready's redirected num pointer: ammo type to read live, -1 = the
+# C "largeammo = 1994" pointer target.
+let mut w_ready_ammo: i32 = 0
+# w_ready.data (kept for fidelity with the C struct; never read)
+let mut w_ready_data: i32 = 0
+
+# Multicon widgets (indices): 0..5 w_arms, 6 w_faces, 7..9 w_keyboxes
+let mut mc_x: array<i32, 10> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+let mut mc_y: array<i32, 10> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+let mut mc_oldinum: array<i32, 10> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+# Binicon widget: w_armsbg
+let mut bi_oldval: i32 = 0
+
+# scratch buffers
+let mut namebuf: ptr<u8> = null
+let mut parambuf: ptr<u8> = null
+
+# ---- helpers ----------------------------------------------------------
+
+# DEH_snprintf(namebuf, 9, "PFX%d[%d]") equivalent: base, then up to two
+# decimal digits (pass -1 to skip). DEH_String is identity in this build.
+function make_name(base: string, d1: i32, d2: i32) -> string {
+    if (namebuf as i64) == 0 {
+        namebuf = malloc(16) as ptr<u8>
+    }
+    let bp: ptr<u8> = base as ptr<u8>
+    let n: i32 = strlen(base) as i32
+    let mut i: i32 = 0
+    while i < n {
+        namebuf[i] = bp[i]
+        i = i + 1
+    }
+    if d1 >= 0 {
+        namebuf[i] = (48 + d1) as u8
+        i = i + 1
+    }
+    if d2 >= 0 {
+        namebuf[i] = (48 + d2) as u8
+        i = i + 1
+    }
+    namebuf[i] = 0
+    return namebuf as string
+}
+
+function digit_patch(font: i32, d: i32) -> ptr<void> {
+    if font == 0 {
+        return p_tallnum[d] as ptr<void>
+    }
+    return p_shortnum[d] as ptr<void>
+}
+
+# what the C widget's *n->num pointer reads right now
+function num_value(id: i32) -> i32 {
+    if id == 0 {
+        if w_ready_ammo < 0 {
+            return 1994        # largeammo, "n/a"
+        }
+        return PLAYER_ammo(st_plyr, w_ready_ammo)
+    }
+    if id <= 4 {
+        return PLAYER_ammo(st_plyr, id - 1)
+    }
+    if id <= 8 {
+        return PLAYER_maxammo(st_plyr, id - 5)
+    }
+    if id == 9 {
+        return st_fragscount
+    }
+    if id == 10 {
+        return PLAYER_health(st_plyr)
+    }
+    return PLAYER_armorpoints(st_plyr)
+}
+
+# what the C widget's *n->on pointer reads right now
+function num_on(id: i32) -> i32 {
+    if nw_on[id] == 2 {
+        return st_fragson
+    }
+    return st_statusbaron
+}
+
+function mc_inum(id: i32) -> i32 {
+    if id <= 5 {
+        # (int*)&plyr->weaponowned[id+1]
+        return PLAYER_weaponowned(st_plyr, id + 1)
+    }
+    if id == 6 {
+        return st_faceindex
+    }
+    return keyboxes[id - 7]
+}
+
+function mc_on(id: i32) -> i32 {
+    if id <= 5 {
+        return st_armson
+    }
+    return st_statusbaron
+}
+
+function mc_patch(id: i32, inum: i32) -> ptr<void> {
+    if id <= 5 {
+        # arms[i][0] is the gray STGNUM patch, arms[i][1] aliases
+        # shortnum[i+2] (yellow), exactly as ST_loadUnloadGraphics set up.
+        if inum == 0 {
+            return p_armsgray[id] as ptr<void>
+        }
+        return p_shortnum[id + 2] as ptr<void>
+    }
+    if id == 6 {
+        return p_faces[inum] as ptr<void>
+    }
+    return p_keys[inum] as ptr<void>
+}
+
+# ---- st_lib.c ---------------------------------------------------------
+
+function stlib_init() -> void {
+    p_sttminus = W_CacheLumpName("STTMINUS", PU_STATIC_C) as i64
+}
+
+function stlib_drawNum(id: i32) -> void {
+    let mut numdigits: i32 = nw_width[id]
+    let mut num: i32 = num_value(id)
+
+    let w: i32 = PATCH_width(digit_patch(nw_font[id], 0))
+    let h: i32 = PATCH_height(digit_patch(nw_font[id], 0))
+    let mut x: i32 = nw_x[id]
+
+    let mut neg: i32 = 0
+
+    nw_oldnum[id] = num
+
+    if num < 0 {
+        neg = 1
+        if numdigits == 2 and num < -9 {
+            num = -9
+        } else {
+            if numdigits == 3 and num < -99 {
+                num = -99
+            }
+        }
+        num = 0 - num
+    }
+
+    # clear the area
+    x = nw_x[id] - numdigits * w
+
+    if nw_y[id] - ST_Y_C < 0 {
+        I_Error("drawNum: n->y - ST_Y < 0")
+    }
+
+    V_CopyRect(x, nw_y[id] - ST_Y_C, st_backing_screen, w * numdigits, h, x, nw_y[id])
+
+    # if non-number, do not draw it
+    if num == 1994 {
+        return
+    }
+
+    x = nw_x[id]
+
+    # in the special case of 0, you draw 0
+    if num == 0 {
+        V_DrawPatch(x - w, nw_y[id], digit_patch(nw_font[id], 0))
+    }
+
+    # draw the new number
+    while num != 0 and numdigits != 0 {
+        numdigits = numdigits - 1
+        x = x - w
+        V_DrawPatch(x, nw_y[id], digit_patch(nw_font[id], num % 10))
+        num = num / 10
+    }
+
+    # draw a minus sign if necessary
+    if neg != 0 {
+        V_DrawPatch(x - 8, nw_y[id], p_sttminus as ptr<void>)
+    }
+}
+
+function stlib_updateNum(id: i32, refresh: i32) -> void {
+    if num_on(id) != 0 {
+        stlib_drawNum(id)
+    }
+}
+
+function stlib_updatePercent(id: i32, refresh: i32) -> void {
+    if refresh != 0 and num_on(id) != 0 {
+        V_DrawPatch(nw_x[id], nw_y[id], p_tallpercent as ptr<void>)
+    }
+    stlib_updateNum(id, refresh)
+}
+
+function stlib_updateMultIcon(id: i32, refresh: i32) -> void {
+    let inum: i32 = mc_inum(id)
+
+    if mc_on(id) != 0 and (mc_oldinum[id] != inum or refresh != 0) and inum != -1 {
+        if mc_oldinum[id] != -1 {
+            let oldp: ptr<void> = mc_patch(id, mc_oldinum[id])
+            let x: i32 = mc_x[id] - PATCH_leftoffset(oldp)
+            let y: i32 = mc_y[id] - PATCH_topoffset(oldp)
+            let w: i32 = PATCH_width(oldp)
+            let h: i32 = PATCH_height(oldp)
+
+            if y - ST_Y_C < 0 {
+                I_Error("updateMultIcon: y - ST_Y < 0")
+            }
+
+            V_CopyRect(x, y - ST_Y_C, st_backing_screen, w, h, x, y)
+        }
+        V_DrawPatch(mc_x[id], mc_y[id], mc_patch(id, inum))
+        mc_oldinum[id] = inum
+    }
+}
+
+function stlib_updateBinIcon(refresh: i32) -> void {
+    let val: i32 = st_notdeathmatch
+
+    if st_statusbaron != 0 and (bi_oldval != val or refresh != 0) {
+        let p: ptr<void> = p_armsbg as ptr<void>
+        let x: i32 = ST_ARMSBGX - PATCH_leftoffset(p)
+        let y: i32 = ST_ARMSBGY - PATCH_topoffset(p)
+        let w: i32 = PATCH_width(p)
+        let h: i32 = PATCH_height(p)
+
+        if y - ST_Y_C < 0 {
+            I_Error("updateBinIcon: y - ST_Y < 0")
+        }
+
+        if val != 0 {
+            V_DrawPatch(ST_ARMSBGX, ST_ARMSBGY, p)
+        } else {
+            V_CopyRect(x, y - ST_Y_C, st_backing_screen, w, h, x, y)
+        }
+
+        bi_oldval = val
+    }
+}
+
+# ---- st_stuff.c -------------------------------------------------------
+
+@flow_api
+function ST_refreshBackground() -> void {
+    if st_statusbaron != 0 {
+        V_UseBuffer(st_backing_screen)
+
+        V_DrawPatch(ST_X_C, 0, p_sbar as ptr<void>)
+
+        if STAT_netgame() != 0 {
+            V_DrawPatch(ST_FX_C, 0, p_faceback as ptr<void>)
+        }
+
+        V_RestoreBuffer()
+
+        V_CopyRect(ST_X_C, 0, st_backing_screen, ST_WIDTH_C, ST_HEIGHT_C, ST_X_C, ST_Y_C)
+    }
+}
+
+function param_buf() -> ptr<u8> {
+    if (parambuf as i64) == 0 {
+        parambuf = malloc(8) as ptr<u8>
+    }
+    return parambuf
+}
+
+# cht_CheckCheat keeps m_cheat's C ABI: cheatseq_t* and a char key.
+function check_cheat(cht: ptr<void>, key: i32) -> i32 {
+    return cht_CheckCheat(cht as ptr<u8>, key as u8)
+}
+
+function get_param(cht: ptr<void>, buffer: ptr<u8>) -> void {
+    cht_GetParam(cht as ptr<u8>, buffer)
+}
+
+# The cheat chain preserves the C else-if structure exactly: each
+# cht_CheckCheat call advances that cheat's state machine, so a cheat
+# later in the chain must not see the key once an earlier one matched.
+function st_cheat_keydown(key: i32) -> void {
+    if STAT_netgame() == 0 and STAT_gameskill() != SK_NIGHTMARE {
+        # 'dqd' cheat for toggleable god mode
+        if check_cheat(st_cheat_ptr(cheat_god_ptr), key) != 0 {
+            let cheats: i32 = PLAYER_cheats(st_plyr) ^ CF_GODMODE
+            PLAYER_set_cheats(st_plyr, cheats)
+            if (cheats & CF_GODMODE) != 0 {
+                if (PLAYER_mo(st_plyr) as i64) != 0 {
+                    MOBJ_set_health(PLAYER_mo(st_plyr), 100)
+                }
+                PLAYER_set_health(st_plyr, DEH_GOD_MODE_HEALTH)
+                PLAYER_set_message(st_plyr, "Degreelessness Mode On")       # STSTR_DQDON
+            } else {
+                PLAYER_set_message(st_plyr, "Degreelessness Mode Off")      # STSTR_DQDOFF
+            }
+        } else {
+            # 'fa' cheat for killer fucking arsenal
+            if check_cheat(st_cheat_ptr(cheat_ammonokey_ptr), key) != 0 {
+                PLAYER_set_armorpoints(st_plyr, DEH_IDFA_ARMOR)
+                PLAYER_set_armortype(st_plyr, DEH_IDFA_ARMOR_CLASS)
+                let mut i: i32 = 0
+                while i < NUMWEAPONS_C {
+                    PLAYER_set_weaponowned(st_plyr, i, 1)
+                    i = i + 1
+                }
+                i = 0
+                while i < NUMAMMO_C {
+                    PLAYER_set_ammo(st_plyr, i, PLAYER_maxammo(st_plyr, i))
+                    i = i + 1
+                }
+                PLAYER_set_message(st_plyr, "Ammo (no keys) Added")         # STSTR_FAADDED
+            } else {
+                # 'kfa' cheat for key full ammo
+                if check_cheat(st_cheat_ptr(cheat_ammo_ptr), key) != 0 {
+                    PLAYER_set_armorpoints(st_plyr, DEH_IDKFA_ARMOR)
+                    PLAYER_set_armortype(st_plyr, DEH_IDKFA_ARMOR_CLASS)
+                    let mut i: i32 = 0
+                    while i < NUMWEAPONS_C {
+                        PLAYER_set_weaponowned(st_plyr, i, 1)
+                        i = i + 1
+                    }
+                    i = 0
+                    while i < NUMAMMO_C {
+                        PLAYER_set_ammo(st_plyr, i, PLAYER_maxammo(st_plyr, i))
+                        i = i + 1
+                    }
+                    i = 0
+                    while i < NUMCARDS_C {
+                        PLAYER_set_card(st_plyr, i, 1)
+                        i = i + 1
+                    }
+                    PLAYER_set_message(st_plyr, "Very Happy Ammo Added")    # STSTR_KFAADDED
+                } else {
+                    # 'mus' cheat for changing music
+                    if check_cheat(st_cheat_ptr(cheat_mus_ptr), key) != 0 {
+                        PLAYER_set_message(st_plyr, "Music Change")         # STSTR_MUS
+                        let buf: ptr<u8> = param_buf()
+                        get_param(st_cheat_ptr(cheat_mus_ptr), buf)
+
+                        # The original v1.9 played Doom II music regardless
+                        # of gamemode; Ultimate Doom fixed it for Doom 1.
+                        if STAT_gamemode() == GM_COMMERCIAL or STAT_gameversion() < EXE_ULTIMATE {
+                            let sel: i32 = ((buf[0] as i32) - 48) * 10 + (buf[1] as i32) - 48
+                            let musnum: i32 = MUS_RUNNIN + sel - 1
+                            if sel > 35 {
+                                PLAYER_set_message(st_plyr, "IMPOSSIBLE SELECTION")  # STSTR_NOMUS
+                            } else {
+                                S_ChangeMusic(musnum, 1)
+                            }
+                        } else {
+                            let sel: i32 = ((buf[0] as i32) - 49) * 9 + (buf[1] as i32) - 49
+                            let musnum: i32 = MUS_E1M1 + sel
+                            if sel > 31 {
+                                PLAYER_set_message(st_plyr, "IMPOSSIBLE SELECTION")  # STSTR_NOMUS
+                            } else {
+                                S_ChangeMusic(musnum, 1)
+                            }
+                        }
+                    } else {
+                        # Noclip: idspispopd for Doom 1, idclip otherwise.
+                        # `and`/`or` short-circuit, so only the mission's
+                        # own sequence sees the key, as in C.
+                        if (STAT_logical_gamemission() == GMI_DOOM and check_cheat(st_cheat_ptr(cheat_noclip_ptr), key) != 0)
+                            or (STAT_logical_gamemission() != GMI_DOOM and check_cheat(st_cheat_ptr(cheat_commercial_noclip_ptr), key) != 0) {
+                            let cheats: i32 = PLAYER_cheats(st_plyr) ^ CF_NOCLIP
+                            PLAYER_set_cheats(st_plyr, cheats)
+                            if (cheats & CF_NOCLIP) != 0 {
+                                PLAYER_set_message(st_plyr, "No Clipping Mode ON")   # STSTR_NCON
+                            } else {
+                                PLAYER_set_message(st_plyr, "No Clipping Mode OFF")  # STSTR_NCOFF
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        # 'behold?' power-up cheats (a fresh statement in C, not part of
+        # the else-if chain above)
+        let mut i: i32 = 0
+        while i < 6 {
+            if check_cheat(st_cheat_powerup(i), key) != 0 {
+                if PLAYER_power(st_plyr, i) == 0 {
+                    P_GivePower(st_plyr, i)
+                } else {
+                    if i != PW_STRENGTH {
+                        PLAYER_set_power(st_plyr, i, 1)
+                    } else {
+                        PLAYER_set_power(st_plyr, i, 0)
+                    }
+                }
+                PLAYER_set_message(st_plyr, "Power-up Toggled")             # STSTR_BEHOLDX
+            }
+            i = i + 1
+        }
+
+        # 'behold' power-up menu
+        if check_cheat(st_cheat_powerup(6), key) != 0 {
+            # STSTR_BEHOLD
+            PLAYER_set_message(st_plyr, "inVuln, Str, Inviso, Rad, Allmap, or Lite-amp")
+        } else {
+            # 'choppers' invulnerability & chainsaw
+            if check_cheat(st_cheat_ptr(cheat_choppers_ptr), key) != 0 {
+                PLAYER_set_weaponowned(st_plyr, WP_CHAINSAW, 1)
+                PLAYER_set_power(st_plyr, PW_INVULNERABILITY, 1)
+                PLAYER_set_message(st_plyr, "... doesn't suck - GM")        # STSTR_CHOPPERS
+            } else {
+                # 'mypos' for player position
+                if check_cheat(st_cheat_ptr(cheat_mypos_ptr), key) != 0 {
+                    st_mypos_message(st_plyr)
+                }
+            }
+        }
+    }
+}
+
+@flow_api
+function ST_Responder(ev: ptr<void>) -> i32 {
+    # event_t (d_event.h): { evtype_t type; int data1, data2, data3, data4; }
+    # (ptr<void> parameter: automap.flow externs ST_Responder with ptr<void>)
+    let e: ptr<i32> = ev as ptr<i32>
+    let etype: i32 = e[0]
+    let data1: i32 = e[1]
+    let data2: i32 = e[2]
+
+    # Filter automap on/off.
+    if etype == EV_KEYUP and ((data1 as u32) & 4294901760) == (STB_AM_MSGHEADER as u32) {
+        if data1 == STB_AM_MSGENTERED {
+            st_gamestate = AUTOMAP_STATE
+            st_firsttime = 1
+        }
+        if data1 == STB_AM_MSGEXITED {
+            st_gamestate = FIRSTPERSON_STATE
+        }
+    } else {
+        if etype == EV_KEYDOWN {
+            st_cheat_keydown(data2)
+
+            # 'clev' change-level cheat
+            if STAT_netgame() == 0 and check_cheat(st_cheat_ptr(cheat_clev_ptr), data2) != 0 {
+                let buf: ptr<u8> = param_buf()
+                let mut epsd: i32 = 0
+                let mut map: i32 = 0
+
+                get_param(st_cheat_ptr(cheat_clev_ptr), buf)
+
+                if STAT_gamemode() == GM_COMMERCIAL {
+                    epsd = 1
+                    map = ((buf[0] as i32) - 48) * 10 + (buf[1] as i32) - 48
+                } else {
+                    epsd = (buf[0] as i32) - 48
+                    map = (buf[1] as i32) - 48
+                }
+
+                # Chex.exe always warps to episode 1.
+                if STAT_gameversion() == EXE_CHEX {
+                    epsd = 1
+                }
+
+                # Catch invalid maps.
+                if epsd < 1 {
+                    return 0
+                }
+                if map < 1 {
+                    return 0
+                }
+                if STAT_gamemode() == GM_RETAIL and (epsd > 4 or map > 9) {
+                    return 0
+                }
+                if STAT_gamemode() == GM_REGISTERED and (epsd > 3 or map > 9) {
+                    return 0
+                }
+                if STAT_gamemode() == GM_SHAREWARE and (epsd > 1 or map > 9) {
+                    return 0
+                }
+                # Vanilla allows IDCLEV up to MAP40.
+                if STAT_gamemode() == GM_COMMERCIAL and (epsd > 1 or map > 40) {
+                    return 0
+                }
+
+                # So be it.
+                PLAYER_set_message(st_plyr, "Changing Level...")            # STSTR_CLEV
+                G_DeferedInitNew(STAT_gameskill(), epsd, map)
+            }
+        }
+    }
+    return 0
+}
+
+@flow_api
+function ST_calcPainOffset() -> i32 {
+    let mut health: i32 = PLAYER_health(st_plyr)
+    if health > 100 {
+        health = 100
+    }
+
+    if health != pain_oldhealth {
+        pain_lastcalc = ST_FACESTRIDE * (((100 - health) * ST_NUMPAINFACES) / 101)
+        pain_oldhealth = health
+    }
+    return pain_lastcalc
+}
+
+# The face state machine. Precedence: dead > evil grin > turned head >
+# straight ahead, driven by the priority latch.
+@flow_api
+function ST_updateFaceWidget() -> void {
+    if face_priority < 10 {
+        # dead
+        if PLAYER_health(st_plyr) == 0 {
+            face_priority = 9
+            st_faceindex = ST_DEADFACE
+            st_facecount = 1
+        }
+    }
+
+    if face_priority < 9 {
+        if PLAYER_bonuscount(st_plyr) != 0 {
+            # picking up bonus
+            let mut doevilgrin: i32 = 0
+
+            let mut i: i32 = 0
+            while i < NUMWEAPONS_C {
+                if oldweaponsowned[i] != PLAYER_weaponowned(st_plyr, i) {
+                    doevilgrin = 1
+                    oldweaponsowned[i] = PLAYER_weaponowned(st_plyr, i)
+                }
+                i = i + 1
+            }
+            if doevilgrin != 0 {
+                # evil grin if just picked up weapon
+                face_priority = 8
+                st_facecount = ST_EVILGRINCOUNT
+                st_faceindex = ST_calcPainOffset() + ST_EVILGRINOFFSET
+            }
+        }
+    }
+
+    if face_priority < 8 {
+        let att: ptr<void> = PLAYER_attacker(st_plyr)
+        let mo: ptr<void> = PLAYER_mo(st_plyr)
+        if PLAYER_damagecount(st_plyr) != 0 and (att as i64) != 0 and (att as i64) != (mo as i64) {
+            # being attacked
+            face_priority = 7
+
+            if PLAYER_health(st_plyr) - st_oldhealth > ST_MUCHPAIN {
+                st_facecount = ST_TURNCOUNT
+                st_faceindex = ST_calcPainOffset() + ST_OUCHOFFSET
+            } else {
+                let badguyangle: u32 = R_PointToAngle2(MOBJ_x(mo), MOBJ_y(mo), MOBJ_x(att), MOBJ_y(att))
+                let moangle: u32 = MOBJ_angle(mo)
+                let ang180: u32 = ANG45_C * 4
+                let mut diffang: u32 = 0
+                let mut i: i32 = 0
+
+                if badguyangle > moangle {
+                    # whether right or left
+                    diffang = badguyangle - moangle
+                    if diffang > ang180 {
+                        i = 1
+                    }
+                } else {
+                    # whether left or right
+                    diffang = moangle - badguyangle
+                    if diffang <= ang180 {
+                        i = 1
+                    }
+                } # confusing, aint it?
+
+                st_facecount = ST_TURNCOUNT
+                st_faceindex = ST_calcPainOffset()
+
+                if diffang < ANG45_C {
+                    # head-on
+                    st_faceindex = st_faceindex + ST_RAMPAGEOFFSET
+                } else {
+                    if i != 0 {
+                        # turn face right
+                        st_faceindex = st_faceindex + ST_TURNOFFSET
+                    } else {
+                        # turn face left
+                        st_faceindex = st_faceindex + ST_TURNOFFSET + 1
+                    }
+                }
+            }
+        }
+    }
+
+    if face_priority < 7 {
+        # getting hurt because of your own damn stupidity
+        if PLAYER_damagecount(st_plyr) != 0 {
+            if PLAYER_health(st_plyr) - st_oldhealth > ST_MUCHPAIN {
+                face_priority = 7
+                st_facecount = ST_TURNCOUNT
+                st_faceindex = ST_calcPainOffset() + ST_OUCHOFFSET
+            } else {
+                face_priority = 6
+                st_facecount = ST_TURNCOUNT
+                st_faceindex = ST_calcPainOffset() + ST_RAMPAGEOFFSET
+            }
+        }
+    }
+
+    if face_priority < 6 {
+        # rapid firing
+        if PLAYER_attackdown(st_plyr) != 0 {
+            if face_lastattackdown == -1 {
+                face_lastattackdown = ST_RAMPAGEDELAY
+            } else {
+                face_lastattackdown = face_lastattackdown - 1
+                if face_lastattackdown == 0 {
+                    face_priority = 5
+                    st_faceindex = ST_calcPainOffset() + ST_RAMPAGEOFFSET
+                    st_facecount = 1
+                    face_lastattackdown = 1
+                }
+            }
+        } else {
+            face_lastattackdown = -1
+        }
+    }
+
+    if face_priority < 5 {
+        # invulnerability
+        if (PLAYER_cheats(st_plyr) & CF_GODMODE) != 0 or PLAYER_power(st_plyr, PW_INVULNERABILITY) != 0 {
+            face_priority = 4
+            st_faceindex = ST_GODFACE
+            st_facecount = 1
+        }
+    }
+
+    # look left or look right if the facecount has timed out
+    if st_facecount == 0 {
+        st_faceindex = ST_calcPainOffset() + (st_randomnumber % 3)
+        st_facecount = ST_STRAIGHTFACECOUNT
+        face_priority = 0
+    }
+
+    st_facecount = st_facecount - 1
+}
+
+@flow_api
+function ST_updateWidgets() -> void {
+    # must redirect the pointer if the ready weapon has changed
+    let at: i32 = WEAPONINFO_ammo(PLAYER_readyweapon(st_plyr))
+    if at == AM_NOAMMO {
+        w_ready_ammo = -1      # points at largeammo (1994)
+    } else {
+        w_ready_ammo = at
+    }
+    w_ready_data = PLAYER_readyweapon(st_plyr)
+
+    # update keycard multiple widgets
+    let mut i: i32 = 0
+    while i < 3 {
+        if PLAYER_card(st_plyr, i) != 0 {
+            keyboxes[i] = i
+        } else {
+            keyboxes[i] = -1
+        }
+        if PLAYER_card(st_plyr, i + 3) != 0 {
+            keyboxes[i] = i + 3
+        }
+        i = i + 1
+    }
+
+    # refresh everything if this is him coming back to life
+    ST_updateFaceWidget()
+
+    # used by the w_armsbg widget
+    if STAT_deathmatch() == 0 {
+        st_notdeathmatch = 1
+    } else {
+        st_notdeathmatch = 0
+    }
+
+    # used by w_arms[] widgets
+    st_armson = 0
+    if st_statusbaron != 0 and STAT_deathmatch() == 0 {
+        st_armson = 1
+    }
+
+    # used by w_frags widget
+    st_fragson = 0
+    if STAT_deathmatch() != 0 and st_statusbaron != 0 {
+        st_fragson = 1
+    }
+    st_fragscount = 0
+
+    i = 0
+    while i < MAXPLAYERS_C {
+        if i != STAT_consoleplayer() {
+            st_fragscount = st_fragscount + PLAYER_frags(st_plyr, i)
+        } else {
+            st_fragscount = st_fragscount - PLAYER_frags(st_plyr, i)
+        }
+        i = i + 1
+    }
+
+    # get rid of chat window if up because of message
+    st_msgcounter = st_msgcounter - 1
+    if st_msgcounter == 0 {
+        st_chat = st_oldchat
+    }
+}
+
+@flow_api
+function ST_Ticker() -> void {
+    st_clock = st_clock + 1
+    st_randomnumber = M_Random()
+    ST_updateWidgets()
+    st_oldhealth = PLAYER_health(st_plyr)
+}
+
+@flow_api
+function ST_doPaletteStuff() -> void {
+    let mut palette: i32 = 0
+    let mut cnt: i32 = PLAYER_damagecount(st_plyr)
+
+    if PLAYER_power(st_plyr, PW_STRENGTH) != 0 {
+        # slowly fade the berzerk out
+        let bzc: i32 = 12 - (PLAYER_power(st_plyr, PW_STRENGTH) >> 6)
+        if bzc > cnt {
+            cnt = bzc
+        }
+    }
+
+    if cnt != 0 {
+        palette = (cnt + 7) >> 3
+        if palette >= NUMREDPALS {
+            palette = NUMREDPALS - 1
+        }
+        palette = palette + STARTREDPALS
+    } else {
+        if PLAYER_bonuscount(st_plyr) != 0 {
+            palette = (PLAYER_bonuscount(st_plyr) + 7) >> 3
+            if palette >= NUMBONUSPALS {
+                palette = NUMBONUSPALS - 1
+            }
+            palette = palette + STARTBONUSPALS
+        } else {
+            if PLAYER_power(st_plyr, PW_IRONFEET) > 128 or (PLAYER_power(st_plyr, PW_IRONFEET) & 8) != 0 {
+                palette = RADIATIONPAL
+            } else {
+                palette = 0
+            }
+        }
+    }
+
+    # In Chex Quest the player never sees red; the radiation suit
+    # palette tints the screen green instead.
+    if STAT_gameversion() == EXE_CHEX and palette >= STARTREDPALS and palette < STARTREDPALS + NUMREDPALS {
+        palette = RADIATIONPAL
+    }
+
+    if palette != st_palette {
+        st_palette = palette
+        let base: ptr<void> = W_CacheLumpNum(lu_palette, PU_CACHE_C)
+        let pal: ptr<u8> = ((base as i64) + (palette * 768) as i64) as ptr<u8>
+        I_SetPalette(pal)
+    }
+}
+
+@flow_api
+function ST_drawWidgets(refresh: i32) -> void {
+    # used by w_arms[] widgets
+    st_armson = 0
+    if st_statusbaron != 0 and STAT_deathmatch() == 0 {
+        st_armson = 1
+    }
+
+    # used by w_frags widget
+    st_fragson = 0
+    if STAT_deathmatch() != 0 and st_statusbaron != 0 {
+        st_fragson = 1
+    }
+
+    stlib_updateNum(0, refresh)                 # w_ready
+
+    let mut i: i32 = 0
+    while i < 4 {
+        stlib_updateNum(1 + i, refresh)         # w_ammo[i]
+        stlib_updateNum(5 + i, refresh)         # w_maxammo[i]
+        i = i + 1
+    }
+
+    stlib_updatePercent(10, refresh)            # w_health
+    stlib_updatePercent(11, refresh)            # w_armor
+
+    stlib_updateBinIcon(refresh)                # w_armsbg
+
+    i = 0
+    while i < 6 {
+        stlib_updateMultIcon(i, refresh)        # w_arms[i]
+        i = i + 1
+    }
+
+    stlib_updateMultIcon(6, refresh)            # w_faces
+
+    i = 0
+    while i < 3 {
+        stlib_updateMultIcon(7 + i, refresh)    # w_keyboxes[i]
+        i = i + 1
+    }
+
+    stlib_updateNum(9, refresh)                 # w_frags
+}
+
+@flow_api
+function ST_doRefresh() -> void {
+    st_firsttime = 0
+
+    # draw status bar background to off-screen buff
+    ST_refreshBackground()
+
+    # and refresh all widgets
+    ST_drawWidgets(1)
+}
+
+@flow_api
+function ST_diffDraw() -> void {
+    # update all widgets
+    ST_drawWidgets(0)
+}
+
+@flow_api
+function ST_Drawer(fullscreen: i32, refresh: i32) -> void {
+    st_statusbaron = 0
+    if fullscreen == 0 or STAT_automapactive() != 0 {
+        st_statusbaron = 1
+    }
+    if refresh != 0 {
+        st_firsttime = 1
+    }
+
+    # Do red-/gold-shifts from damage/items
+    ST_doPaletteStuff()
+
+    # If just after ST_Start(), refresh all
+    if st_firsttime != 0 {
+        ST_doRefresh()
+    } else {
+        # Otherwise, update as little as possible
+        ST_diffDraw()
+    }
+}
+
+# ST_loadUnloadGraphics with its two callbacks folded in: load caches the
+# lump and stores the pointer, unload releases it and stores NULL. Same
+# iteration order in both directions.
+function gfx_one(load: i32, name: string) -> i64 {
+    if load != 0 {
+        return W_CacheLumpName(name, PU_STATIC_C) as i64
+    }
+    W_ReleaseLumpName(name)
+    return 0
+}
+
+function st_loadUnloadGraphics(load: i32) -> void {
+    # Load the numbers, tall and short
+    let mut i: i32 = 0
+    while i < 10 {
+        p_tallnum[i] = gfx_one(load, make_name("STTNUM", i, -1))
+        p_shortnum[i] = gfx_one(load, make_name("STYSNUM", i, -1))
+        i = i + 1
+    }
+
+    # Load percent key.
+    p_tallpercent = gfx_one(load, "STTPRCNT")
+
+    # key cards
+    i = 0
+    while i < NUMCARDS_C {
+        p_keys[i] = gfx_one(load, make_name("STKEYS", i, -1))
+        i = i + 1
+    }
+
+    # arms background
+    p_armsbg = gfx_one(load, "STARMS")
+
+    # arms ownership widgets: gray STGNUM; the yellow number aliases
+    # shortnum[i+2] (see mc_patch), so it is neither cached nor released.
+    i = 0
+    while i < 6 {
+        p_armsgray[i] = gfx_one(load, make_name("STGNUM", i + 2, -1))
+        i = i + 1
+    }
+
+    # face background for this player color
+    p_faceback = gfx_one(load, make_name("STFB", STAT_consoleplayer(), -1))
+
+    # status bar background bits
+    p_sbar = gfx_one(load, "STBAR")
+
+    # face states
+    let mut facenum: i32 = 0
+    i = 0
+    while i < ST_NUMPAINFACES {
+        let mut j: i32 = 0
+        while j < 3 {
+            p_faces[facenum] = gfx_one(load, make_name("STFST", i, j))
+            facenum = facenum + 1
+            j = j + 1
+        }
+        p_faces[facenum] = gfx_one(load, make_name("STFTR", i, 0))    # turn right
+        facenum = facenum + 1
+        p_faces[facenum] = gfx_one(load, make_name("STFTL", i, 0))    # turn left
+        facenum = facenum + 1
+        p_faces[facenum] = gfx_one(load, make_name("STFOUCH", i, -1)) # ouch!
+        facenum = facenum + 1
+        p_faces[facenum] = gfx_one(load, make_name("STFEVL", i, -1))  # evil grin ;)
+        facenum = facenum + 1
+        p_faces[facenum] = gfx_one(load, make_name("STFKILL", i, -1)) # pissed off
+        facenum = facenum + 1
+        i = i + 1
+    }
+
+    p_faces[facenum] = gfx_one(load, "STFGOD0")
+    facenum = facenum + 1
+    p_faces[facenum] = gfx_one(load, "STFDEAD0")
+}
+
+@flow_api
+function ST_loadGraphics() -> void {
+    st_loadUnloadGraphics(1)
+}
+
+@flow_api
+function ST_loadData() -> void {
+    lu_palette = W_GetNumForName("PLAYPAL")
+    ST_loadGraphics()
+}
+
+@flow_api
+function ST_unloadGraphics() -> void {
+    st_loadUnloadGraphics(0)
+}
+
+@flow_api
+function ST_unloadData() -> void {
+    ST_unloadGraphics()
+}
+
+@flow_api
+function ST_initData() -> void {
+    st_firsttime = 1
+    st_plyr = PLAYER_at(STAT_consoleplayer())
+
+    st_clock = 0
+    st_chatstate = START_CHAT_STATE
+    st_gamestate = FIRSTPERSON_STATE
+
+    st_statusbaron = 1
+    st_oldchat = 0
+    st_chat = 0
+    st_cursoron = 0
+
+    st_faceindex = 0
+    st_palette = -1
+
+    st_oldhealth = -1
+
+    let mut i: i32 = 0
+    while i < NUMWEAPONS_C {
+        oldweaponsowned[i] = PLAYER_weaponowned(st_plyr, i)
+        i = i + 1
+    }
+
+    i = 0
+    while i < 3 {
+        keyboxes[i] = -1
+        i = i + 1
+    }
+
+    stlib_init()
+}
+
+function init_num(id: i32, x: i32, y: i32, font: i32, on: i32, width: i32) -> void {
+    nw_x[id] = x
+    nw_y[id] = y
+    nw_oldnum[id] = 0
+    nw_width[id] = width
+    nw_font[id] = font
+    nw_on[id] = on
+}
+
+function init_multicon(id: i32, x: i32, y: i32) -> void {
+    mc_x[id] = x
+    mc_y[id] = y
+    mc_oldinum[id] = -1
+}
+
+@flow_api
+function ST_createWidgets() -> void {
+    # ready weapon ammo (num pointer = &plyr->ammo[weaponinfo[rw].ammo],
+    # re-resolved each tick by ST_updateWidgets)
+    init_num(0, ST_AMMOX, ST_AMMOY, 0, 0, ST_AMMOWIDTH)
+    let at: i32 = WEAPONINFO_ammo(PLAYER_readyweapon(st_plyr))
+    if at == AM_NOAMMO {
+        w_ready_ammo = -1
+    } else {
+        w_ready_ammo = at
+    }
+
+    # the last weapon type
+    w_ready_data = PLAYER_readyweapon(st_plyr)
+
+    # health percentage
+    init_num(10, ST_HEALTHX, ST_HEALTHY, 0, 0, 3)
+
+    # arms background
+    bi_oldval = 0
+
+    # weapons owned
+    let mut i: i32 = 0
+    while i < 6 {
+        init_multicon(i, ST_ARMSX + (i % 3) * ST_ARMSXSPACE, ST_ARMSY + (i / 3) * ST_ARMSYSPACE)
+        i = i + 1
+    }
+
+    # frags sum
+    init_num(9, ST_FRAGSX, ST_FRAGSY, 0, 2, ST_FRAGSWIDTH)
+
+    # faces
+    init_multicon(6, ST_FACESX, ST_FACESY)
+
+    # armor percentage - should be colored later
+    init_num(11, ST_ARMORX, ST_ARMORY, 0, 0, 3)
+
+    # keyboxes 0-2
+    init_multicon(7, ST_KEY0X, ST_KEY0Y)
+    init_multicon(8, ST_KEY1X, ST_KEY1Y)
+    init_multicon(9, ST_KEY2X, ST_KEY2Y)
+
+    # ammo count (all four kinds)
+    init_num(1, ST_AMMO0X, ST_AMMO0Y, 1, 0, 3)
+    init_num(2, ST_AMMO1X, ST_AMMO1Y, 1, 0, 3)
+    init_num(3, ST_AMMO2X, ST_AMMO2Y, 1, 0, 3)
+    init_num(4, ST_AMMO3X, ST_AMMO3Y, 1, 0, 3)
+
+    # max ammo count (all four kinds)
+    init_num(5, ST_MAXAMMO0X, ST_MAXAMMO0Y, 1, 0, 3)
+    init_num(6, ST_MAXAMMO1X, ST_MAXAMMO1Y, 1, 0, 3)
+    init_num(7, ST_MAXAMMO2X, ST_MAXAMMO2Y, 1, 0, 3)
+    init_num(8, ST_MAXAMMO3X, ST_MAXAMMO3Y, 1, 0, 3)
+}
+
+@flow_api
+function ST_Stop() -> void {
+    if st_stopped != 0 {
+        return
+    }
+
+    I_SetPalette(W_CacheLumpNum(lu_palette, PU_CACHE_C) as ptr<u8>)
+
+    st_stopped = 1
+}
+
+@flow_api
+function ST_Start() -> void {
+    if st_stopped == 0 {
+        ST_Stop()
+    }
+
+    ST_initData()
+    ST_createWidgets()
+    st_stopped = 0
+}
+
+@flow_api
+function ST_Init() -> void {
+    st_init_cheats()
+    ST_loadData()
+    st_backing_screen = Z_Malloc(ST_WIDTH_C * ST_HEIGHT_C, PU_STATIC_C, null) as ptr<u8>
+}

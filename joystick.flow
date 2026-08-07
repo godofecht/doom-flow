@@ -1,0 +1,83 @@
+# Joystick interface, ported from i_joystick.c to Flow.
+#
+# ORIGCODE is off in this doomgeneric build, so Init/Update/Shutdown are
+# no-ops (no SDL). Config variables stay module-private in a heap JoyState
+# struct so M_BindVariable can take stable field addresses.
+
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+extern { function M_BindVariable(name: string, location: ptr<void>) -> void }
+
+# i_joystick.h
+const JOY_NUM_VIRTUAL_BUTTONS: i32 = 10
+# sizeof JoyState: 8 i32 fields + buttons[10] = 72
+const JOY_STATE_SIZE: i64 = 72
+
+struct JoyState {
+    usejoystick: i32,
+    joystick_index: i32,
+    joystick_x_axis: i32,
+    joystick_x_invert: i32,
+    joystick_y_axis: i32,
+    joystick_y_invert: i32,
+    joystick_strafe_axis: i32,
+    joystick_strafe_invert: i32,
+    buttons: array<i32, 10>
+}
+
+let mut joy_ptr: ptr<JoyState> = null
+
+function joy_state() -> ptr<JoyState> {
+    if (joy_ptr as i64) == 0 {
+        joy_ptr = calloc(1, JOY_STATE_SIZE) as ptr<JoyState>
+        joy_ptr[0].usejoystick = 0
+        joy_ptr[0].joystick_index = 0 - 1
+        joy_ptr[0].joystick_x_axis = 0
+        joy_ptr[0].joystick_x_invert = 0
+        joy_ptr[0].joystick_y_axis = 1
+        joy_ptr[0].joystick_y_invert = 0
+        joy_ptr[0].joystick_strafe_axis = 0 - 1
+        joy_ptr[0].joystick_strafe_invert = 0
+        for i in 0 to JOY_NUM_VIRTUAL_BUTTONS {
+            joy_ptr[0].buttons[i] = i
+        }
+    }
+    return joy_ptr
+}
+
+@flow_api
+function I_ShutdownJoystick() -> void {
+    # ORIGCODE off: SDL close path omitted.
+}
+
+@flow_api
+function I_InitJoystick() -> void {
+    # ORIGCODE off: entire SDL init body is compiled out in C.
+}
+
+@flow_api
+function I_UpdateJoystick() -> void {
+    # ORIGCODE off: no joystick device, no ev_joystick posts.
+}
+
+@flow_api
+function I_BindJoystickVariables() -> void {
+    let j: ptr<JoyState> = joy_state()
+    M_BindVariable("use_joystick", &j[0].usejoystick as ptr<void>)
+    M_BindVariable("joystick_index", &j[0].joystick_index as ptr<void>)
+    M_BindVariable("joystick_x_axis", &j[0].joystick_x_axis as ptr<void>)
+    M_BindVariable("joystick_y_axis", &j[0].joystick_y_axis as ptr<void>)
+    M_BindVariable("joystick_strafe_axis", &j[0].joystick_strafe_axis as ptr<void>)
+    M_BindVariable("joystick_x_invert", &j[0].joystick_x_invert as ptr<void>)
+    M_BindVariable("joystick_y_invert", &j[0].joystick_y_invert as ptr<void>)
+    M_BindVariable("joystick_strafe_invert", &j[0].joystick_strafe_invert as ptr<void>)
+    M_BindVariable("joystick_physical_button0", &j[0].buttons[0] as ptr<void>)
+    M_BindVariable("joystick_physical_button1", &j[0].buttons[1] as ptr<void>)
+    M_BindVariable("joystick_physical_button2", &j[0].buttons[2] as ptr<void>)
+    M_BindVariable("joystick_physical_button3", &j[0].buttons[3] as ptr<void>)
+    M_BindVariable("joystick_physical_button4", &j[0].buttons[4] as ptr<void>)
+    M_BindVariable("joystick_physical_button5", &j[0].buttons[5] as ptr<void>)
+    M_BindVariable("joystick_physical_button6", &j[0].buttons[6] as ptr<void>)
+    M_BindVariable("joystick_physical_button7", &j[0].buttons[7] as ptr<void>)
+    M_BindVariable("joystick_physical_button8", &j[0].buttons[8] as ptr<void>)
+    M_BindVariable("joystick_physical_button9", &j[0].buttons[9] as ptr<void>)
+}

@@ -1,0 +1,1388 @@
+# Moving objects / spawn, ported from p_mobj.c to Flow.
+#
+# mobj_t / mapthing_t / state_t / mobjinfo_t / player_t stay C-owned
+# (their storage is malloc'd/static in C), but mobj_t / mapthing_t /
+# mobjinfo_t FIELD access happens directly from Flow via explicit LP64
+# offsetof arithmetic (MOBJ_OFF_* / MOBJ_MTOFF_* / MOBJ_INFOOFF_* and the
+# mobj_i32/mobj_ptr/... helpers below), mirroring setup.flow's
+# GEOM_OFF_* / geom_i32 pattern. mapthing_t is exposed as shared MTHING_*.
+# Size constants (MOBJ_SIZEOF / MOBJ_SIZEOF_MAPTHING) are the Flow source
+# of truth; doom_layout.h mirrors them for the thin C shim.
+#
+# P_SubstNullMobj dummy sentinel is Flow-owned below. iquehead/iquetail
+# are Flow-owned (setup.flow resets via mobjshim_set_*).
+# itemrespawnque/itemrespawntime are Flow-owned (calloc'd) below.
+#
+# LP64 offsetof (verified against doomgeneric headers):
+#
+#   mobj_t (sizeof 224)
+#     thinker 0, x 24, y 28, z 32, snext 40, sprev 48, angle 56,
+#     sprite 60, frame 64, bnext 72, bprev 80, subsector 88,
+#     floorz 96, ceilingz 100, radius 104, height 108,
+#     momx 112, momy 116, momz 120, validcount 124, type 128, info 136,
+#     tics 144, state 152, flags 160, health 164, movedir 168,
+#     movecount 172, target 176, reactiontime 184, threshold 188,
+#     player 192, lastlook 200, spawnpoint 204, tracer 216
+#
+#   mapthing_t (sizeof 10): x 0, y 2, angle 4, type 6, options 8
+#
+#   mobjinfo_t (sizeof 92): doomednum 0, spawnstate 4, spawnhealth 8,
+#     seestate 12, seesound 16, reactiontime 20, attacksound 24,
+#     painstate 28, painchance 32, painsound 36, meleestate 40,
+#     missilestate 44, deathstate 48, xdeathstate 52, deathsound 56,
+#     speed 60, radius 64, height 68, mass 72, damage 76, activesound 80,
+#     flags 84, raisestate 88
+
+# ---- libc / fixed-point / engine --------------------------------------
+
+extern { function MAP_attackrange() -> i32 }
+extern { function MAP_ceilingline() -> ptr<void> }
+extern { function MAP_linetarget() -> ptr<void> }
+extern { function memset(dst: ptr<void>, c: i32, n: i64) -> ptr<void> }
+extern { function calloc(n: i64, sz: i64) -> ptr<void> }
+
+extern { function FixedMul(a: i32, b: i32) -> i32 }
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function P_Random() -> i32 }
+extern { function P_AddThinker(thinker: ptr<void>) -> void }
+extern { function P_RemoveThinker(thinker: ptr<void>) -> void }
+extern { function P_SetThingPosition(thing: ptr<void>) -> void }
+extern { function P_UnsetThingPosition(thing: ptr<void>) -> void }
+extern { function P_TryMove(thing: ptr<void>, x: i32, y: i32) -> i32 }
+extern { function P_CheckPosition(thing: ptr<void>, x: i32, y: i32) -> i32 }
+extern { function P_SlideMove(mo: ptr<void>) -> void }
+extern { function P_AproxDistance(dx: i32, dy: i32) -> i32 }
+extern { function P_AimLineAttack(t1: ptr<void>, angle: u32, distance: i32) -> i32 }
+extern { function R_PointInSubsector(x: i32, y: i32) -> ptr<void> }
+extern { function R_PointToAngle2(x1: i32, y1: i32, x2: i32, y2: i32) -> u32 }
+extern { function S_StartSound(origin: ptr<void>, sound_id: i32) -> void }
+extern { function S_StopSound(origin: ptr<void>) -> void }
+extern { function G_PlayerReborn(player: i32) -> void }
+extern { function P_SetupPsprites(player: ptr<void>) -> void }
+extern { function ST_Start() -> void }
+extern { function HU_Start() -> void }
+extern { function TABLES_finesine(idx: i32) -> i32 }
+extern { function TABLES_finecosine(idx: i32) -> i32 }
+extern { function TABLES_finetangent(idx: i32) -> i32 }
+extern { function SKY_skyflatnum() -> i32 }
+
+# ---- item-respawn queue head/tail (Flow-owned) -----------------------
+#
+# setup.flow's P_SetupLevel resets them via mobjshim_set_iquehead/tail.
+
+let mut mobj_iquehead: i32 = 0
+let mut mobj_iquetail: i32 = 0
+
+@flow_api
+function mobjshim_iquehead() -> i32 { return mobj_iquehead }
+
+@flow_api
+function mobjshim_set_iquehead(v: i32) -> void { mobj_iquehead = v }
+
+@flow_api
+function mobjshim_iquetail() -> i32 { return mobj_iquetail }
+
+@flow_api
+function mobjshim_set_iquetail(v: i32) -> void { mobj_iquetail = v }
+
+extern { function STAT_gameskill() -> i32 }
+
+extern { function STAT_nomonsters() -> i32 }
+extern { function STAT_respawnmonsters() -> i32 }
+
+extern { function STAT_inc_totalkills() -> void }
+extern { function STAT_inc_totalitems() -> void }
+
+extern { function STATE_at(i: i32) -> ptr<void> }
+extern { function STATE_index(st: ptr<void>) -> i32 }
+extern { function STATE_tics(st: ptr<void>) -> i32 }
+extern { function STATE_sprite(st: ptr<void>) -> i32 }
+extern { function STATE_frame(st: ptr<void>) -> i32 }
+extern { function STATE_nextstate(st: ptr<void>) -> i32 }
+extern { function STATE_call_acp1(st: ptr<void>, arg: ptr<void>) -> void }
+extern { function INFO_mobjinfo_at(idx: i32) -> ptr<void> }
+
+extern { function MOBJINFO_doomednum(typ: i32) -> i32 }
+extern { function MOBJINFO_spawnstate(typ: i32) -> i32 }
+extern { function MOBJINFO_spawnhealth(typ: i32) -> i32 }
+extern { function MOBJINFO_reactiontime(typ: i32) -> i32 }
+extern { function MOBJINFO_radius(typ: i32) -> i32 }
+extern { function MOBJINFO_height(typ: i32) -> i32 }
+extern { function MOBJINFO_flags(typ: i32) -> i32 }
+
+extern { function THINKER_set_mobj(m: ptr<void>) -> void }
+extern { function THINKER_is_removed(th: ptr<void>) -> i32 }
+
+# ---- P_SubstNullMobj dummy sentinel ------------------------------------
+
+let mut mobj_dummy_sentinel: ptr<void> = null
+
+function mobjshim_subst_null(m: ptr<void>) -> ptr<void> {
+    if (m as i64) != 0 {
+        return m
+    }
+    if (mobj_dummy_sentinel as i64) == 0 {
+        mobj_dummy_sentinel = calloc(1, MOBJ_SIZEOF as i64)
+    }
+    memset(mobj_dummy_sentinel, 0, MOBJ_SIZEOF as i64)
+    MOBJ_set_x(mobj_dummy_sentinel, 0)
+    MOBJ_set_y(mobj_dummy_sentinel, 0)
+    MOBJ_set_z(mobj_dummy_sentinel, 0)
+    MOBJ_set_flags(mobj_dummy_sentinel, 0)
+    return mobj_dummy_sentinel
+}
+
+extern { function GEOM_subsector_sector(ss: ptr<void>) -> ptr<void> }
+extern { function GEOM_sector_floorheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_ceilingheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_ceilingpic(s: ptr<void>) -> i32 }
+
+# ---- formerly mobj_shim.c: deathmatch/playerstarts + unknown-type -----
+#
+# The mapthing_t arrays are setup.flow-owned (P_SetupLevel fills them,
+# game_shim.c subtracts deathmatch_p - deathmatchstarts directly), so the
+# pointer-bumping stays there under the setupshim_ prefix.
+
+extern { function setupshim_deathmatch_p_room() -> i32 }
+extern { function setupshim_store_deathmatch_start(mthing: ptr<void>) -> void }
+extern { function setupshim_store_playerstart(i: i32, mthing: ptr<void>) -> void }
+extern { function snprintf(buf: string, n: i64, fmt: string, a: i32, b: i32, c: i32) -> i32 }
+extern { function I_Error(msg: string) -> void }
+
+let mut mobj_errbuf: array<u8, 128> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+@flow_api
+function mobjshim_error_unknown_type(typ: i32, x: i32, y: i32) -> void {
+    snprintf((&mobj_errbuf[0]) as string, 128,
+             "P_SpawnMapThing: Unknown type %i at (%i, %i)", typ, x, y)
+    I_Error((&mobj_errbuf[0]) as string)
+}
+extern { function GEOM_line_backsector(ld: ptr<void>) -> ptr<void> }
+extern { function PLAYER_at(i: i32) -> ptr<void> }
+extern { function PLAYER_cheats(p: ptr<void>) -> i32 }
+extern { function PLAYER_cmd_forwardmove(p: ptr<void>) -> i32 }
+extern { function PLAYER_cmd_sidemove(p: ptr<void>) -> i32 }
+extern { function PLAYER_health(p: ptr<void>) -> i32 }
+extern { function PLAYER_mo(p: ptr<void>) -> ptr<void> }
+extern { function PLAYER_playerstate(p: ptr<void>) -> i32 }
+extern { function PLAYER_set_bonuscount(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_card(p: ptr<void>, c: i32, v: i32) -> void }
+extern { function PLAYER_set_damagecount(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_deltaviewheight(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_extralight(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_fixedcolormap(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_message(p: ptr<void>, msg: string) -> void }
+extern { function PLAYER_set_mo(p: ptr<void>, m: ptr<void>) -> void }
+extern { function PLAYER_set_playerstate(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_refire(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_viewheight(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_viewheight(p: ptr<void>) -> i32 }
+
+# ---- constants (MOBJ_ prefix) -----------------------------------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+# p_mobj.c
+const MOBJ_STOPSPEED: i32 = 4096            # 0x1000
+const MOBJ_FRICTION: i32 = 59392            # 0xe800
+
+# m_fixed.h / p_local.h
+const MOBJ_FRACBITS: i32 = 16
+const MOBJ_FRACUNIT: i32 = 65536
+const MOBJ_FLOATSPEED: i32 = 262144         # 4*FRACUNIT
+const MOBJ_VIEWHEIGHT: i32 = 2686976        # 41*FRACUNIT
+const MOBJ_GRAVITY: i32 = 65536
+const MOBJ_MAXMOVE: i32 = 1966080           # 30*FRACUNIT
+const MOBJ_MELEERANGE: i32 = 4194304        # 64*FRACUNIT
+const MOBJ_ONFLOORZ: i32 = 0 - 2147483648   # INT_MIN
+const MOBJ_ONCEILINGZ: i32 = 2147483647     # INT_MAX
+const MOBJ_ITEMQUESIZE: i32 = 128
+const MOBJ_SIZEOF: i32 = 224                 # sizeof(mobj_t) LP64
+const MOBJ_SIZEOF_MOBJ: i32 = 224            # alias used by P_SpawnMobj
+const MOBJ_SIZEOF_MAPTHING: i32 = 10         # sizeof(mapthing_t) packed
+const MOBJ_SIZEOF_MOBJINFO: i32 = 92         # sizeof(mobjinfo_t) LP64
+
+# z_zone.h / doomdef.h / i_timer.h
+const MOBJ_PU_LEVEL: i32 = 5
+const MOBJ_MAXPLAYERS: i32 = 4
+const MOBJ_NUMCARDS: i32 = 6
+const MOBJ_TICRATE: i32 = 35
+
+# tables.h
+const MOBJ_ANG45: u32 = 536870912           # 0x20000000
+const MOBJ_ANGLETOFINESHIFT: u32 = 19
+
+# p_mobj.h mobjflag_t
+const MOBJ_MF_SPECIAL: i32 = 1
+const MOBJ_MF_AMBUSH: i32 = 32
+const MOBJ_MF_SPAWNCEILING: i32 = 256
+const MOBJ_MF_NOGRAVITY: i32 = 512
+const MOBJ_MF_NOCLIP: i32 = 4096
+const MOBJ_MF_FLOAT: i32 = 16384
+const MOBJ_MF_MISSILE: i32 = 65536
+const MOBJ_MF_DROPPED: i32 = 131072
+const MOBJ_MF_SHADOW: i32 = 262144
+const MOBJ_MF_CORPSE: i32 = 1048576
+const MOBJ_MF_INFLOAT: i32 = 2097152
+const MOBJ_MF_COUNTKILL: i32 = 4194304
+const MOBJ_MF_COUNTITEM: i32 = 8388608
+const MOBJ_MF_SKULLFLY: i32 = 16777216
+const MOBJ_MF_NOTDMATCH: i32 = 33554432
+const MOBJ_MF_TRANSSHIFT: i32 = 26
+
+# doomdata.h
+const MOBJ_MTF_AMBUSH: i32 = 8
+
+# info.h
+const MOBJ_S_NULL: i32 = 0
+const MOBJ_S_BLOOD2: i32 = 91
+const MOBJ_S_BLOOD3: i32 = 92
+const MOBJ_S_PUFF3: i32 = 95
+const MOBJ_S_PLAY: i32 = 149
+const MOBJ_S_PLAY_RUN1: i32 = 150
+const MOBJ_MT_PLAYER: i32 = 0
+const MOBJ_MT_SKULL: i32 = 18
+const MOBJ_MT_PUFF: i32 = 37
+const MOBJ_MT_BLOOD: i32 = 38
+const MOBJ_MT_TFOG: i32 = 39
+const MOBJ_MT_IFOG: i32 = 40
+const MOBJ_MT_INV: i32 = 56
+const MOBJ_MT_INS: i32 = 58
+const MOBJ_NUMMOBJTYPES: i32 = 137
+
+# sounds.h
+const MOBJ_SFX_OOF: i32 = 34
+const MOBJ_SFX_TELEPT: i32 = 35
+const MOBJ_SFX_ITMBK: i32 = 90
+
+# d_mode.h / d_player.h
+const MOBJ_EXE_ULTIMATE: i32 = 6
+const MOBJ_SK_BABY: i32 = 0
+const MOBJ_SK_NIGHTMARE: i32 = 4
+const MOBJ_PST_LIVE: i32 = 0
+const MOBJ_PST_REBORN: i32 = 2
+const MOBJ_CF_NOMOMENTUM: i32 = 4
+
+# ---- LP64 offsetof tables (verified against doomgeneric p_mobj.h) ----
+
+const MOBJ_OFF_X: i32 = 24
+const MOBJ_OFF_Y: i32 = 28
+const MOBJ_OFF_Z: i32 = 32
+const MOBJ_OFF_SNEXT: i32 = 40
+const MOBJ_OFF_SPREV: i32 = 48
+const MOBJ_OFF_ANGLE: i32 = 56
+const MOBJ_OFF_SPRITE: i32 = 60
+const MOBJ_OFF_FRAME: i32 = 64
+const MOBJ_OFF_BNEXT: i32 = 72
+const MOBJ_OFF_BPREV: i32 = 80
+const MOBJ_OFF_SUBSECTOR: i32 = 88
+const MOBJ_OFF_FLOORZ: i32 = 96
+const MOBJ_OFF_CEILINGZ: i32 = 100
+const MOBJ_OFF_RADIUS: i32 = 104
+const MOBJ_OFF_HEIGHT: i32 = 108
+const MOBJ_OFF_MOMX: i32 = 112
+const MOBJ_OFF_MOMY: i32 = 116
+const MOBJ_OFF_MOMZ: i32 = 120
+const MOBJ_OFF_TYPE: i32 = 128
+const MOBJ_OFF_INFO: i32 = 136
+const MOBJ_OFF_TICS: i32 = 144
+const MOBJ_OFF_STATE: i32 = 152
+const MOBJ_OFF_FLAGS: i32 = 160
+const MOBJ_OFF_HEALTH: i32 = 164
+const MOBJ_OFF_MOVEDIR: i32 = 168
+const MOBJ_OFF_MOVECOUNT: i32 = 172
+const MOBJ_OFF_TARGET: i32 = 176
+const MOBJ_OFF_REACTIONTIME: i32 = 184
+const MOBJ_OFF_THRESHOLD: i32 = 188
+const MOBJ_OFF_PLAYER: i32 = 192
+const MOBJ_OFF_LASTLOOK: i32 = 200
+const MOBJ_OFF_SPAWNPOINT: i32 = 204
+const MOBJ_OFF_TRACER: i32 = 216
+
+const MOBJ_MTOFF_X: i32 = 0
+const MOBJ_MTOFF_Y: i32 = 2
+const MOBJ_MTOFF_ANGLE: i32 = 4
+const MOBJ_MTOFF_TYPE: i32 = 6
+const MOBJ_MTOFF_OPTIONS: i32 = 8
+
+const MOBJ_INFOOFF_SPAWNSTATE: i32 = 4
+const MOBJ_INFOOFF_SPAWNHEALTH: i32 = 8
+const MOBJ_INFOOFF_SEESTATE: i32 = 12
+const MOBJ_INFOOFF_SEESOUND: i32 = 16
+const MOBJ_INFOOFF_ATTACKSOUND: i32 = 24
+const MOBJ_INFOOFF_PAINSTATE: i32 = 28
+const MOBJ_INFOOFF_PAINCHANCE: i32 = 32
+const MOBJ_INFOOFF_PAINSOUND: i32 = 36
+const MOBJ_INFOOFF_MELEESTATE: i32 = 40
+const MOBJ_INFOOFF_MISSILESTATE: i32 = 44
+const MOBJ_INFOOFF_DEATHSTATE: i32 = 48
+const MOBJ_INFOOFF_XDEATHSTATE: i32 = 52
+const MOBJ_INFOOFF_DEATHSOUND: i32 = 56
+const MOBJ_INFOOFF_SPEED: i32 = 60
+const MOBJ_INFOOFF_RADIUS: i32 = 64
+const MOBJ_INFOOFF_HEIGHT: i32 = 68
+const MOBJ_INFOOFF_MASS: i32 = 72
+const MOBJ_INFOOFF_DAMAGE: i32 = 76
+const MOBJ_INFOOFF_ACTIVESOUND: i32 = 80
+const MOBJ_INFOOFF_FLAGS: i32 = 84
+const MOBJ_INFOOFF_RAISESTATE: i32 = 88
+
+# ---- offset helpers (mirrors setup.flow's geom_i32/geom_ptr) ----------
+
+function mobj_i16(base: i64, off: i32) -> i32 {
+    let p: ptr<i16> = (base + off as i64) as ptr<i16>
+    return p[0] as i32
+}
+
+function mobj_set_i16(base: i64, off: i32, v: i32) -> void {
+    let p: ptr<i16> = (base + off as i64) as ptr<i16>
+    p[0] = v as i16
+}
+
+function mobj_i32(base: i64, off: i32) -> i32 {
+    let p: ptr<i32> = (base + off as i64) as ptr<i32>
+    return p[0]
+}
+
+function mobj_set_i32(base: i64, off: i32, v: i32) -> void {
+    let p: ptr<i32> = (base + off as i64) as ptr<i32>
+    p[0] = v
+}
+
+function mobj_u32(base: i64, off: i32) -> u32 {
+    let p: ptr<u32> = (base + off as i64) as ptr<u32>
+    return p[0]
+}
+
+function mobj_set_u32(base: i64, off: i32, v: u32) -> void {
+    let p: ptr<u32> = (base + off as i64) as ptr<u32>
+    p[0] = v
+}
+
+function mobj_ptr(base: i64, off: i32) -> ptr<void> {
+    let p: ptr<i64> = (base + off as i64) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+function mobj_set_ptr(base: i64, off: i32, v: ptr<void>) -> void {
+    let p: ptr<i64> = (base + off as i64) as ptr<i64>
+    p[0] = v as i64
+}
+
+# ---- item-respawn queue (Flow-owned; only Flow ever touched these) ---
+# iquehead/iquetail are Flow-owned above; setup.flow resets them via
+# mobjshim_set_iquehead/iquetail.
+
+let mut mobj_itemrespawnque: ptr<i16> = null
+let mut mobj_itemrespawntime: ptr<i32> = null
+
+function mobj_ensure_respawn_storage() -> void {
+    if (mobj_itemrespawnque as i64) == 0 {
+        mobj_itemrespawnque = calloc((MOBJ_ITEMQUESIZE * 5) as i64, 2) as ptr<i16>
+        mobj_itemrespawntime = calloc(MOBJ_ITEMQUESIZE as i64, 4) as ptr<i32>
+    }
+}
+
+# &mobj_itemrespawnque[i*5]: each queue slot is 5 packed i16 fields
+# (x,y,angle,type,options), matching mapthing_t's layout exactly.
+function mobj_itemrespawnque_at(i: i32) -> ptr<void> {
+    mobj_ensure_respawn_storage()
+    return (&mobj_itemrespawnque[i * 5]) as ptr<void>
+}
+
+# ---- private helpers --------------------------------------------------
+
+function mobj_clear_flag(flags: i32, bit: i32) -> i32 {
+    return flags & ((0 - 1) - bit)
+}
+
+function mobj_info_ptr(m: ptr<void>) -> ptr<void> {
+    return mobj_ptr(m as i64, MOBJ_OFF_INFO)
+}
+
+function mobj_set_info(m: ptr<void>, typ: i32) -> void {
+    mobj_set_ptr(m as i64, MOBJ_OFF_INFO, INFO_mobjinfo_at(typ))
+}
+
+function mobj_spawnpoint(m: ptr<void>) -> ptr<void> {
+    return ((m as i64) + MOBJ_OFF_SPAWNPOINT as i64) as ptr<void>
+}
+
+# Generic mapthing_t -> mapthing_t copy (mobj<->mobj spawnpoint, and
+# mobj spawnpoint <-> item-respawn queue slot).
+function mobj_copy_mthing(dst: ptr<void>, src: ptr<void>) -> void {
+    MTHING_set_x(dst, MTHING_x(src))
+    MTHING_set_y(dst, MTHING_y(src))
+    MTHING_set_angle(dst, MTHING_angle(src))
+    MTHING_set_type(dst, MTHING_type(src))
+    MTHING_set_options(dst, MTHING_options(src))
+}
+
+# Shared mapthing_t field accessors. Prefer these over *shim_mthing_* clones.
+
+@flow_api
+function MTHING_x(mt: ptr<void>) -> i32 { return mobj_i16(mt as i64, MOBJ_MTOFF_X) }
+@flow_api
+function MTHING_y(mt: ptr<void>) -> i32 { return mobj_i16(mt as i64, MOBJ_MTOFF_Y) }
+@flow_api
+function MTHING_angle(mt: ptr<void>) -> i32 { return mobj_i16(mt as i64, MOBJ_MTOFF_ANGLE) }
+@flow_api
+function MTHING_type(mt: ptr<void>) -> i32 { return mobj_i16(mt as i64, MOBJ_MTOFF_TYPE) }
+@flow_api
+function MTHING_options(mt: ptr<void>) -> i32 { return mobj_i16(mt as i64, MOBJ_MTOFF_OPTIONS) }
+@flow_api
+function MTHING_set_x(mt: ptr<void>, v: i32) -> void { mobj_set_i16(mt as i64, MOBJ_MTOFF_X, v) }
+@flow_api
+function MTHING_set_y(mt: ptr<void>, v: i32) -> void { mobj_set_i16(mt as i64, MOBJ_MTOFF_Y, v) }
+@flow_api
+function MTHING_set_angle(mt: ptr<void>, v: i32) -> void { mobj_set_i16(mt as i64, MOBJ_MTOFF_ANGLE, v) }
+@flow_api
+function MTHING_set_type(mt: ptr<void>, v: i32) -> void { mobj_set_i16(mt as i64, MOBJ_MTOFF_TYPE, v) }
+@flow_api
+function MTHING_set_options(mt: ptr<void>, v: i32) -> void { mobj_set_i16(mt as i64, MOBJ_MTOFF_OPTIONS, v) }
+
+function mobj_angle_from_thing(mt: ptr<void>) -> u32 {
+    return MOBJ_ANG45 * ((MTHING_angle(mt) / 45) as u32)
+}
+
+# Shared mobj_t field accessors. Prefer these over per-module *shim_mobj_* clones.
+
+@flow_api
+function MOBJ_x(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_X) }
+@flow_api
+function MOBJ_set_x(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_X, v) }
+@flow_api
+function MOBJ_y(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_Y) }
+@flow_api
+function MOBJ_set_y(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_Y, v) }
+@flow_api
+function MOBJ_z(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_Z) }
+@flow_api
+function MOBJ_set_z(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_Z, v) }
+@flow_api
+function MOBJ_angle(m: ptr<void>) -> u32 { return mobj_u32(m as i64, MOBJ_OFF_ANGLE) }
+@flow_api
+function MOBJ_set_angle(m: ptr<void>, v: u32) -> void { mobj_set_u32(m as i64, MOBJ_OFF_ANGLE, v) }
+@flow_api
+function MOBJ_momx(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_MOMX) }
+@flow_api
+function MOBJ_set_momx(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_MOMX, v) }
+@flow_api
+function MOBJ_momy(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_MOMY) }
+@flow_api
+function MOBJ_set_momy(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_MOMY, v) }
+@flow_api
+function MOBJ_momz(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_MOMZ) }
+@flow_api
+function MOBJ_set_momz(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_MOMZ, v) }
+@flow_api
+function MOBJ_flags(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_FLAGS) }
+@flow_api
+function MOBJ_set_flags(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_FLAGS, v) }
+@flow_api
+function MOBJ_health(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_HEALTH) }
+@flow_api
+function MOBJ_set_health(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_HEALTH, v) }
+@flow_api
+function MOBJ_type(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_TYPE) }
+@flow_api
+function MOBJ_set_type(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_TYPE, v) }
+@flow_api
+function MOBJ_radius(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_RADIUS) }
+@flow_api
+function MOBJ_set_radius(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_RADIUS, v) }
+@flow_api
+function MOBJ_height(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_HEIGHT) }
+@flow_api
+function MOBJ_set_height(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_HEIGHT, v) }
+@flow_api
+function MOBJ_floorz(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_FLOORZ) }
+@flow_api
+function MOBJ_set_floorz(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_FLOORZ, v) }
+@flow_api
+function MOBJ_ceilingz(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_CEILINGZ) }
+@flow_api
+function MOBJ_set_ceilingz(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_CEILINGZ, v) }
+@flow_api
+function MOBJ_sprite(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_SPRITE) }
+@flow_api
+function MOBJ_set_sprite(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_SPRITE, v) }
+@flow_api
+function MOBJ_frame(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_FRAME) }
+@flow_api
+function MOBJ_set_frame(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_FRAME, v) }
+@flow_api
+function MOBJ_target(m: ptr<void>) -> ptr<void> { return mobj_ptr(m as i64, MOBJ_OFF_TARGET) }
+@flow_api
+function MOBJ_set_target(m: ptr<void>, t: ptr<void>) -> void { mobj_set_ptr(m as i64, MOBJ_OFF_TARGET, t) }
+@flow_api
+function MOBJ_tics(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_TICS) }
+@flow_api
+function MOBJ_set_tics(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_TICS, v) }
+@flow_api
+function MOBJ_state(m: ptr<void>) -> ptr<void> { return mobj_ptr(m as i64, MOBJ_OFF_STATE) }
+@flow_api
+function MOBJ_set_state(m: ptr<void>, st: ptr<void>) -> void { mobj_set_ptr(m as i64, MOBJ_OFF_STATE, st) }
+@flow_api
+function MOBJ_player(m: ptr<void>) -> ptr<void> { return mobj_ptr(m as i64, MOBJ_OFF_PLAYER) }
+@flow_api
+function MOBJ_set_player(m: ptr<void>, p: ptr<void>) -> void { mobj_set_ptr(m as i64, MOBJ_OFF_PLAYER, p) }
+@flow_api
+function MOBJ_subsector(m: ptr<void>) -> ptr<void> { return mobj_ptr(m as i64, MOBJ_OFF_SUBSECTOR) }
+@flow_api
+function MOBJ_set_subsector(m: ptr<void>, ss: ptr<void>) -> void { mobj_set_ptr(m as i64, MOBJ_OFF_SUBSECTOR, ss) }
+@flow_api
+function MOBJ_sector(m: ptr<void>) -> ptr<void> { return GEOM_subsector_sector(MOBJ_subsector(m)) }
+@flow_api
+function MOBJ_reactiontime(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_REACTIONTIME) }
+@flow_api
+function MOBJ_set_reactiontime(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_REACTIONTIME, v) }
+@flow_api
+function MOBJ_zero_mom(m: ptr<void>) -> void {
+    let base: i64 = m as i64
+    mobj_set_i32(base, MOBJ_OFF_MOMX, 0)
+    mobj_set_i32(base, MOBJ_OFF_MOMY, 0)
+    mobj_set_i32(base, MOBJ_OFF_MOMZ, 0)
+}
+@flow_api
+function MOBJ_movedir(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_MOVEDIR) }
+@flow_api
+function MOBJ_set_movedir(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_MOVEDIR, v) }
+@flow_api
+function MOBJ_movecount(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_MOVECOUNT) }
+@flow_api
+function MOBJ_set_movecount(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_MOVECOUNT, v) }
+@flow_api
+function MOBJ_tracer(m: ptr<void>) -> ptr<void> { return mobj_ptr(m as i64, MOBJ_OFF_TRACER) }
+@flow_api
+function MOBJ_set_tracer(m: ptr<void>, t: ptr<void>) -> void { mobj_set_ptr(m as i64, MOBJ_OFF_TRACER, t) }
+@flow_api
+function MOBJ_snext(m: ptr<void>) -> ptr<void> { return mobj_ptr(m as i64, MOBJ_OFF_SNEXT) }
+@flow_api
+function MOBJ_sprev(m: ptr<void>) -> ptr<void> { return mobj_ptr(m as i64, MOBJ_OFF_SPREV) }
+@flow_api
+function MOBJ_bnext(m: ptr<void>) -> ptr<void> { return mobj_ptr(m as i64, MOBJ_OFF_BNEXT) }
+@flow_api
+function MOBJ_bprev(m: ptr<void>) -> ptr<void> { return mobj_ptr(m as i64, MOBJ_OFF_BPREV) }
+@flow_api
+function MOBJ_set_snext(m: ptr<void>, v: ptr<void>) -> void { mobj_set_ptr(m as i64, MOBJ_OFF_SNEXT, v) }
+@flow_api
+function MOBJ_set_sprev(m: ptr<void>, v: ptr<void>) -> void { mobj_set_ptr(m as i64, MOBJ_OFF_SPREV, v) }
+@flow_api
+function MOBJ_set_bnext(m: ptr<void>, v: ptr<void>) -> void { mobj_set_ptr(m as i64, MOBJ_OFF_BNEXT, v) }
+@flow_api
+function MOBJ_set_bprev(m: ptr<void>, v: ptr<void>) -> void { mobj_set_ptr(m as i64, MOBJ_OFF_BPREV, v) }
+@flow_api
+function MOBJ_lastlook(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_LASTLOOK) }
+@flow_api
+function MOBJ_set_lastlook(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_LASTLOOK, v) }
+@flow_api
+function MOBJ_threshold(m: ptr<void>) -> i32 { return mobj_i32(m as i64, MOBJ_OFF_THRESHOLD) }
+@flow_api
+function MOBJ_set_threshold(m: ptr<void>, v: i32) -> void { mobj_set_i32(m as i64, MOBJ_OFF_THRESHOLD, v) }
+
+# Shared mobj->info field accessors. Prefer these over per-module
+# *shim_mobj_info_* clones.
+
+@flow_api
+function MOBJ_info_spawnstate(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_SPAWNSTATE) }
+@flow_api
+function MOBJ_info_seestate(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_SEESTATE) }
+@flow_api
+function MOBJ_info_seesound(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_SEESOUND) }
+@flow_api
+function MOBJ_info_attacksound(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_ATTACKSOUND) }
+@flow_api
+function MOBJ_info_painstate(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_PAINSTATE) }
+@flow_api
+function MOBJ_info_painchance(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_PAINCHANCE) }
+@flow_api
+function MOBJ_info_painsound(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_PAINSOUND) }
+@flow_api
+function MOBJ_info_meleestate(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_MELEESTATE) }
+@flow_api
+function MOBJ_info_missilestate(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_MISSILESTATE) }
+@flow_api
+function MOBJ_info_deathstate(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_DEATHSTATE) }
+@flow_api
+function MOBJ_info_xdeathstate(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_XDEATHSTATE) }
+@flow_api
+function MOBJ_info_deathsound(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_DEATHSOUND) }
+@flow_api
+function MOBJ_info_speed(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_SPEED) }
+@flow_api
+function MOBJ_info_radius(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_RADIUS) }
+@flow_api
+function MOBJ_info_height(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_HEIGHT) }
+@flow_api
+function MOBJ_info_mass(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_MASS) }
+@flow_api
+function MOBJ_info_damage(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_DAMAGE) }
+@flow_api
+function MOBJ_info_activesound(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_ACTIVESOUND) }
+@flow_api
+function MOBJ_info_flags(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_FLAGS) }
+@flow_api
+function MOBJ_info_raisestate(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_RAISESTATE) }
+@flow_api
+function MOBJ_info_spawnhealth(m: ptr<void>) -> i32 { return mobj_i32(mobj_info_ptr(m) as i64, MOBJ_INFOOFF_SPAWNHEALTH) }
+
+# ---- P_SetMobjState ---------------------------------------------------
+
+@flow_api
+function P_SetMobjState(mobj: ptr<void>, state_in: i32) -> i32 {
+    let mut state: i32 = state_in
+
+    while 1 != 0 {
+        if state == MOBJ_S_NULL {
+            mobj_set_ptr(mobj as i64, MOBJ_OFF_STATE, null)
+            P_RemoveMobj(mobj)
+            return 0
+        }
+
+        let st: ptr<void> = STATE_at(state)
+        MOBJ_set_state(mobj, st)
+        MOBJ_set_tics(mobj, STATE_tics(st))
+        MOBJ_set_sprite(mobj, STATE_sprite(st))
+        MOBJ_set_frame(mobj, STATE_frame(st))
+
+        STATE_call_acp1(st, mobj)
+
+        state = STATE_nextstate(st)
+        if MOBJ_tics(mobj) != 0 {
+            break
+        }
+    }
+
+    return 1
+}
+
+# ---- P_ExplodeMissile -------------------------------------------------
+
+function P_ExplodeMissile(mo: ptr<void>) -> void {
+    MOBJ_zero_mom(mo)
+    P_SetMobjState(mo, MOBJ_info_deathstate(mo))
+    MOBJ_set_tics(mo, MOBJ_tics(mo) - (P_Random() & 3))
+    if MOBJ_tics(mo) < 1 {
+        MOBJ_set_tics(mo, 1)
+    }
+    MOBJ_set_flags(mo, mobj_clear_flag(MOBJ_flags(mo), MOBJ_MF_MISSILE))
+    if MOBJ_info_deathsound(mo) != 0 {
+        S_StartSound(mo, MOBJ_info_deathsound(mo))
+    }
+}
+
+# ---- P_XYMovement -----------------------------------------------------
+
+function P_XYMovement(mo: ptr<void>) -> void {
+    if MOBJ_momx(mo) == 0 and MOBJ_momy(mo) == 0 {
+        if (MOBJ_flags(mo) & MOBJ_MF_SKULLFLY) != 0 {
+            MOBJ_set_flags(mo, mobj_clear_flag(MOBJ_flags(mo), MOBJ_MF_SKULLFLY))
+            MOBJ_zero_mom(mo)
+            P_SetMobjState(mo, MOBJ_info_spawnstate(mo))
+        }
+        return
+    }
+
+    let player: ptr<void> = MOBJ_player(mo)
+
+    if MOBJ_momx(mo) > MOBJ_MAXMOVE {
+        MOBJ_set_momx(mo, MOBJ_MAXMOVE)
+    } elif MOBJ_momx(mo) < 0 - MOBJ_MAXMOVE {
+        MOBJ_set_momx(mo, 0 - MOBJ_MAXMOVE)
+    }
+
+    if MOBJ_momy(mo) > MOBJ_MAXMOVE {
+        MOBJ_set_momy(mo, MOBJ_MAXMOVE)
+    } elif MOBJ_momy(mo) < 0 - MOBJ_MAXMOVE {
+        MOBJ_set_momy(mo, 0 - MOBJ_MAXMOVE)
+    }
+
+    let mut xmove: i32 = MOBJ_momx(mo)
+    let mut ymove: i32 = MOBJ_momy(mo)
+
+    while 1 != 0 {
+        let mut ptryx: i32 = 0
+        let mut ptryy: i32 = 0
+        if xmove > MOBJ_MAXMOVE / 2 or ymove > MOBJ_MAXMOVE / 2 {
+            ptryx = MOBJ_x(mo) + xmove / 2
+            ptryy = MOBJ_y(mo) + ymove / 2
+            xmove = xmove >> 1
+            ymove = ymove >> 1
+        } else {
+            ptryx = MOBJ_x(mo) + xmove
+            ptryy = MOBJ_y(mo) + ymove
+            xmove = 0
+            ymove = 0
+        }
+
+        if P_TryMove(mo, ptryx, ptryy) == 0 {
+            if (MOBJ_player(mo) as i64) != 0 {
+                P_SlideMove(mo)
+            } elif (MOBJ_flags(mo) & MOBJ_MF_MISSILE) != 0 {
+                let cl: ptr<void> = MAP_ceilingline()
+                if (cl as i64) != 0 {
+                    let back: ptr<void> = GEOM_line_backsector(cl)
+                    if (back as i64) != 0 and GEOM_sector_ceilingpic(back) == SKY_skyflatnum() {
+                        P_RemoveMobj(mo)
+                        return
+                    }
+                }
+                P_ExplodeMissile(mo)
+            } else {
+                MOBJ_set_momx(mo, 0)
+                MOBJ_set_momy(mo, 0)
+            }
+        }
+
+        if xmove == 0 and ymove == 0 {
+            break
+        }
+    }
+
+    if (player as i64) != 0 and (PLAYER_cheats(player) & MOBJ_CF_NOMOMENTUM) != 0 {
+        MOBJ_set_momx(mo, 0)
+        MOBJ_set_momy(mo, 0)
+        return
+    }
+
+    if (MOBJ_flags(mo) & (MOBJ_MF_MISSILE | MOBJ_MF_SKULLFLY)) != 0 {
+        return
+    }
+
+    if MOBJ_z(mo) > MOBJ_floorz(mo) {
+        return
+    }
+
+    if (MOBJ_flags(mo) & MOBJ_MF_CORPSE) != 0 {
+        if MOBJ_momx(mo) > MOBJ_FRACUNIT / 4
+            or MOBJ_momx(mo) < 0 - MOBJ_FRACUNIT / 4
+            or MOBJ_momy(mo) > MOBJ_FRACUNIT / 4
+            or MOBJ_momy(mo) < 0 - MOBJ_FRACUNIT / 4 {
+            let ss: ptr<void> = MOBJ_subsector(mo)
+            let sec: ptr<void> = GEOM_subsector_sector(ss)
+            if MOBJ_floorz(mo) != GEOM_sector_floorheight(sec) {
+                return
+            }
+        }
+    }
+
+    if MOBJ_momx(mo) > 0 - MOBJ_STOPSPEED
+        and MOBJ_momx(mo) < MOBJ_STOPSPEED
+        and MOBJ_momy(mo) > 0 - MOBJ_STOPSPEED
+        and MOBJ_momy(mo) < MOBJ_STOPSPEED
+        and ((player as i64) == 0
+            or (PLAYER_cmd_forwardmove(player) == 0 and PLAYER_cmd_sidemove(player) == 0)) {
+        if (player as i64) != 0 {
+            let pmo: ptr<void> = PLAYER_mo(player)
+            let st_off: i32 = STATE_index(MOBJ_state(pmo)) - MOBJ_S_PLAY_RUN1
+            if (st_off as u32) < 4 as u32 {
+                P_SetMobjState(pmo, MOBJ_S_PLAY)
+            }
+        }
+        MOBJ_set_momx(mo, 0)
+        MOBJ_set_momy(mo, 0)
+    } else {
+        MOBJ_set_momx(mo, FixedMul(MOBJ_momx(mo), MOBJ_FRICTION))
+        MOBJ_set_momy(mo, FixedMul(MOBJ_momy(mo), MOBJ_FRICTION))
+    }
+}
+
+# ---- P_ZMovement ------------------------------------------------------
+
+function P_ZMovement(mo: ptr<void>) -> void {
+    let player: ptr<void> = MOBJ_player(mo)
+
+    if (player as i64) != 0 and MOBJ_z(mo) < MOBJ_floorz(mo) {
+        PLAYER_set_viewheight(
+            player,
+            PLAYER_viewheight(player) - (MOBJ_floorz(mo) - MOBJ_z(mo)))
+        PLAYER_set_deltaviewheight(
+            player,
+            (MOBJ_VIEWHEIGHT - PLAYER_viewheight(player)) >> 3)
+    }
+
+    MOBJ_set_z(mo, MOBJ_z(mo) + MOBJ_momz(mo))
+
+    if (MOBJ_flags(mo) & MOBJ_MF_FLOAT) != 0 and (MOBJ_target(mo) as i64) != 0 {
+        if (MOBJ_flags(mo) & MOBJ_MF_SKULLFLY) == 0
+            and (MOBJ_flags(mo) & MOBJ_MF_INFLOAT) == 0 {
+            let tgt: ptr<void> = MOBJ_target(mo)
+            let dist: i32 = P_AproxDistance(
+                MOBJ_x(mo) - MOBJ_x(tgt),
+                MOBJ_y(mo) - MOBJ_y(tgt))
+            let delta: i32 = (MOBJ_z(tgt) + (MOBJ_height(mo) >> 1)) - MOBJ_z(mo)
+            if delta < 0 and dist < 0 - (delta * 3) {
+                MOBJ_set_z(mo, MOBJ_z(mo) - MOBJ_FLOATSPEED)
+            } elif delta > 0 and dist < (delta * 3) {
+                MOBJ_set_z(mo, MOBJ_z(mo) + MOBJ_FLOATSPEED)
+            }
+        }
+    }
+
+    if MOBJ_z(mo) <= MOBJ_floorz(mo) {
+        let correct_lost_soul_bounce: i32 = 0
+        if STAT_gameversion() >= MOBJ_EXE_ULTIMATE {
+            correct_lost_soul_bounce = 1
+        }
+
+        if correct_lost_soul_bounce != 0 and (MOBJ_flags(mo) & MOBJ_MF_SKULLFLY) != 0 {
+            MOBJ_set_momz(mo, 0 - MOBJ_momz(mo))
+        }
+
+        if MOBJ_momz(mo) < 0 {
+            if (player as i64) != 0 and MOBJ_momz(mo) < 0 - MOBJ_GRAVITY * 8 {
+                PLAYER_set_deltaviewheight(player, MOBJ_momz(mo) >> 3)
+                S_StartSound(mo, MOBJ_SFX_OOF)
+            }
+            MOBJ_set_momz(mo, 0)
+        }
+        MOBJ_set_z(mo, MOBJ_floorz(mo))
+
+        if correct_lost_soul_bounce == 0 and (MOBJ_flags(mo) & MOBJ_MF_SKULLFLY) != 0 {
+            MOBJ_set_momz(mo, 0 - MOBJ_momz(mo))
+        }
+
+        if (MOBJ_flags(mo) & MOBJ_MF_MISSILE) != 0
+            and (MOBJ_flags(mo) & MOBJ_MF_NOCLIP) == 0 {
+            P_ExplodeMissile(mo)
+            return
+        }
+    } elif (MOBJ_flags(mo) & MOBJ_MF_NOGRAVITY) == 0 {
+        if MOBJ_momz(mo) == 0 {
+            MOBJ_set_momz(mo, 0 - MOBJ_GRAVITY * 2)
+        } else {
+            MOBJ_set_momz(mo, MOBJ_momz(mo) - MOBJ_GRAVITY)
+        }
+    }
+
+    if MOBJ_z(mo) + MOBJ_height(mo) > MOBJ_ceilingz(mo) {
+        if MOBJ_momz(mo) > 0 {
+            MOBJ_set_momz(mo, 0)
+        }
+        MOBJ_set_z(mo, MOBJ_ceilingz(mo) - MOBJ_height(mo))
+
+        if (MOBJ_flags(mo) & MOBJ_MF_SKULLFLY) != 0 {
+            MOBJ_set_momz(mo, 0 - MOBJ_momz(mo))
+        }
+
+        if (MOBJ_flags(mo) & MOBJ_MF_MISSILE) != 0
+            and (MOBJ_flags(mo) & MOBJ_MF_NOCLIP) == 0 {
+            P_ExplodeMissile(mo)
+            return
+        }
+    }
+}
+
+# ---- P_NightmareRespawn -----------------------------------------------
+
+function P_NightmareRespawn(mobj: ptr<void>) -> void {
+    let sp: ptr<void> = mobj_spawnpoint(mobj)
+    let x: i32 = MTHING_x(sp) << MOBJ_FRACBITS
+    let y: i32 = MTHING_y(sp) << MOBJ_FRACBITS
+
+    if P_CheckPosition(mobj, x, y) == 0 {
+        return
+    }
+
+    let ss0: ptr<void> = MOBJ_subsector(mobj)
+    let sec0: ptr<void> = GEOM_subsector_sector(ss0)
+    let mut mo: ptr<void> = P_SpawnMobj(
+        MOBJ_x(mobj),
+        MOBJ_y(mobj),
+        GEOM_sector_floorheight(sec0),
+        MOBJ_MT_TFOG)
+    S_StartSound(mo, MOBJ_SFX_TELEPT)
+
+    let ss: ptr<void> = R_PointInSubsector(x, y)
+    mo = P_SpawnMobj(x, y, GEOM_sector_floorheight(GEOM_subsector_sector(ss)), MOBJ_MT_TFOG)
+    S_StartSound(mo, MOBJ_SFX_TELEPT)
+
+    let mut z: i32 = MOBJ_ONFLOORZ
+    if (MOBJ_info_flags(mobj) & MOBJ_MF_SPAWNCEILING) != 0 {
+        z = MOBJ_ONCEILINGZ
+    }
+
+    mo = P_SpawnMobj(x, y, z, MOBJ_type(mobj))
+    mobj_copy_mthing(mobj_spawnpoint(mo), mobj_spawnpoint(mobj))
+    MOBJ_set_angle(mo, mobj_angle_from_thing(sp))
+    if (MTHING_options(sp) & MOBJ_MTF_AMBUSH) != 0 {
+        MOBJ_set_flags(mo, MOBJ_flags(mo) | MOBJ_MF_AMBUSH)
+    }
+    MOBJ_set_reactiontime(mo, 18)
+    P_RemoveMobj(mobj)
+}
+
+# ---- P_MobjThinker ----------------------------------------------------
+
+@flow_api
+function P_MobjThinker(mobj: ptr<void>) -> void {
+    if MOBJ_momx(mobj) != 0
+        or MOBJ_momy(mobj) != 0
+        or (MOBJ_flags(mobj) & MOBJ_MF_SKULLFLY) != 0 {
+        P_XYMovement(mobj)
+        if THINKER_is_removed(mobj) != 0 {
+            return
+        }
+    }
+
+    if MOBJ_z(mobj) != MOBJ_floorz(mobj) or MOBJ_momz(mobj) != 0 {
+        P_ZMovement(mobj)
+        if THINKER_is_removed(mobj) != 0 {
+            return
+        }
+    }
+
+    if MOBJ_tics(mobj) != 0 - 1 {
+        MOBJ_set_tics(mobj, MOBJ_tics(mobj) - 1)
+        if MOBJ_tics(mobj) == 0 {
+            if P_SetMobjState(mobj, STATE_nextstate(MOBJ_state(mobj))) == 0 {
+                return
+            }
+        }
+    } else {
+        if (MOBJ_flags(mobj) & MOBJ_MF_COUNTKILL) == 0 {
+            return
+        }
+        if STAT_respawnmonsters() == 0 {
+            return
+        }
+        MOBJ_set_movecount(mobj, MOBJ_movecount(mobj) + 1)
+        if MOBJ_movecount(mobj) < 12 * MOBJ_TICRATE {
+            return
+        }
+        if (STAT_leveltime() & 31) != 0 {
+            return
+        }
+        if P_Random() > 4 {
+            return
+        }
+        P_NightmareRespawn(mobj)
+    }
+}
+
+# ---- P_SpawnMobj ------------------------------------------------------
+
+@flow_api
+function P_SpawnMobj(x: i32, y: i32, z: i32, typ: i32) -> ptr<void> {
+    let mobj: ptr<void> = Z_Malloc(MOBJ_SIZEOF_MOBJ, MOBJ_PU_LEVEL, null)
+    memset(mobj, 0, MOBJ_SIZEOF_MOBJ as i64)
+
+    MOBJ_set_type(mobj, typ)
+    mobj_set_info(mobj, typ)
+    MOBJ_set_x(mobj, x)
+    MOBJ_set_y(mobj, y)
+    MOBJ_set_radius(mobj, MOBJINFO_radius(typ))
+    MOBJ_set_height(mobj, MOBJINFO_height(typ))
+    MOBJ_set_flags(mobj, MOBJINFO_flags(typ))
+    MOBJ_set_health(mobj, MOBJINFO_spawnhealth(typ))
+
+    if STAT_gameskill() != MOBJ_SK_NIGHTMARE {
+        MOBJ_set_reactiontime(mobj, MOBJINFO_reactiontime(typ))
+    }
+
+    MOBJ_set_lastlook(mobj, P_Random() % MOBJ_MAXPLAYERS)
+
+    let st: ptr<void> = STATE_at(MOBJINFO_spawnstate(typ))
+    MOBJ_set_state(mobj, st)
+    MOBJ_set_tics(mobj, STATE_tics(st))
+    MOBJ_set_sprite(mobj, STATE_sprite(st))
+    MOBJ_set_frame(mobj, STATE_frame(st))
+
+    P_SetThingPosition(mobj)
+
+    let ss: ptr<void> = MOBJ_subsector(mobj)
+    let sec: ptr<void> = GEOM_subsector_sector(ss)
+    MOBJ_set_floorz(mobj, GEOM_sector_floorheight(sec))
+    MOBJ_set_ceilingz(mobj, GEOM_sector_ceilingheight(sec))
+
+    if z == MOBJ_ONFLOORZ {
+        MOBJ_set_z(mobj, MOBJ_floorz(mobj))
+    } elif z == MOBJ_ONCEILINGZ {
+        MOBJ_set_z(mobj, MOBJ_ceilingz(mobj) - MOBJ_info_height(mobj))
+    } else {
+        MOBJ_set_z(mobj, z)
+    }
+
+    THINKER_set_mobj(mobj)
+    P_AddThinker(mobj)
+    return mobj
+}
+
+# ---- P_RemoveMobj -----------------------------------------------------
+
+# Was mobjshim_que_store_spawnpoint (mobj_shim.c): stores the mobj's
+# spawnpoint into the item-respawn queue and bumps iquehead/iquetail.
+function mobj_que_store_spawnpoint(m: ptr<void>) -> void {
+    let head: i32 = mobjshim_iquehead()
+    mobj_copy_mthing(mobj_itemrespawnque_at(head), mobj_spawnpoint(m))
+    mobj_itemrespawntime[head] = STAT_leveltime()
+    let new_head: i32 = (head + 1) & (MOBJ_ITEMQUESIZE - 1)
+    mobjshim_set_iquehead(new_head)
+    if new_head == mobjshim_iquetail() {
+        mobjshim_set_iquetail((mobjshim_iquetail() + 1) & (MOBJ_ITEMQUESIZE - 1))
+    }
+}
+
+@flow_api
+function P_RemoveMobj(mobj: ptr<void>) -> void {
+    let flags: i32 = MOBJ_flags(mobj)
+    let typ: i32 = MOBJ_type(mobj)
+    if (flags & MOBJ_MF_SPECIAL) != 0
+        and (flags & MOBJ_MF_DROPPED) == 0
+        and typ != MOBJ_MT_INV
+        and typ != MOBJ_MT_INS {
+        mobj_que_store_spawnpoint(mobj)
+    }
+
+    P_UnsetThingPosition(mobj)
+    S_StopSound(mobj)
+    P_RemoveThinker(mobj)
+}
+
+# ---- P_RespawnSpecials ------------------------------------------------
+
+@flow_api
+function P_RespawnSpecials() -> void {
+    if STAT_deathmatch() != 2 {
+        return
+    }
+    if mobjshim_iquehead() == mobjshim_iquetail() {
+        return
+    }
+    let tail: i32 = mobjshim_iquetail()
+    mobj_ensure_respawn_storage()
+    if STAT_leveltime() - mobj_itemrespawntime[tail] < 30 * MOBJ_TICRATE {
+        return
+    }
+
+    let mthing: ptr<void> = mobj_itemrespawnque_at(tail)
+    let x: i32 = MTHING_x(mthing) << MOBJ_FRACBITS
+    let y: i32 = MTHING_y(mthing) << MOBJ_FRACBITS
+
+    let ss: ptr<void> = R_PointInSubsector(x, y)
+    let mo_fog: ptr<void> = P_SpawnMobj(
+        x, y, GEOM_sector_floorheight(GEOM_subsector_sector(ss)), MOBJ_MT_IFOG)
+    S_StartSound(mo_fog, MOBJ_SFX_ITMBK)
+
+    let mut i: i32 = 0
+    while i < MOBJ_NUMMOBJTYPES {
+        if MTHING_type(mthing) == MOBJINFO_doomednum(i) {
+            break
+        }
+        i = i + 1
+    }
+
+    let mut z: i32 = MOBJ_ONFLOORZ
+    if (MOBJINFO_flags(i) & MOBJ_MF_SPAWNCEILING) != 0 {
+        z = MOBJ_ONCEILINGZ
+    }
+
+    let mo: ptr<void> = P_SpawnMobj(x, y, z, i)
+    mobj_copy_mthing(mobj_spawnpoint(mo), mthing)
+    MOBJ_set_angle(mo, mobj_angle_from_thing(mthing))
+    mobjshim_set_iquetail((tail + 1) & (MOBJ_ITEMQUESIZE - 1))
+}
+
+# ---- P_SpawnPlayer ----------------------------------------------------
+
+@flow_api
+function P_SpawnPlayer(mthing: ptr<void>) -> void {
+    let mtype: i32 = MTHING_type(mthing)
+    if mtype == 0 {
+        return
+    }
+    if STAT_playeringame(mtype - 1) == 0 {
+        return
+    }
+
+    let p: ptr<void> = PLAYER_at(mtype - 1)
+    if PLAYER_playerstate(p) == MOBJ_PST_REBORN {
+        G_PlayerReborn(mtype - 1)
+    }
+
+    let x: i32 = MTHING_x(mthing) << MOBJ_FRACBITS
+    let y: i32 = MTHING_y(mthing) << MOBJ_FRACBITS
+    let mobj: ptr<void> = P_SpawnMobj(x, y, MOBJ_ONFLOORZ, MOBJ_MT_PLAYER)
+
+    if mtype > 1 {
+        MOBJ_set_flags(
+            mobj,
+            MOBJ_flags(mobj) | ((mtype - 1) << MOBJ_MF_TRANSSHIFT))
+    }
+
+    MOBJ_set_angle(mobj, mobj_angle_from_thing(mthing))
+    MOBJ_set_player(mobj, p)
+    MOBJ_set_health(mobj, PLAYER_health(p))
+
+    PLAYER_set_mo(p, mobj)
+    PLAYER_set_playerstate(p, MOBJ_PST_LIVE)
+    PLAYER_set_refire(p, 0)
+    PLAYER_set_message(p, null)
+    PLAYER_set_damagecount(p, 0)
+    PLAYER_set_bonuscount(p, 0)
+    PLAYER_set_extralight(p, 0)
+    PLAYER_set_fixedcolormap(p, 0)
+    PLAYER_set_viewheight(p, MOBJ_VIEWHEIGHT)
+
+    P_SetupPsprites(p)
+
+    if STAT_deathmatch() != 0 {
+        for i in 0 to MOBJ_NUMCARDS {
+            PLAYER_set_card(p, i, 1)
+        }
+    }
+
+    if mtype - 1 == STAT_consoleplayer() {
+        ST_Start()
+        HU_Start()
+    }
+}
+
+# ---- P_SpawnMapThing --------------------------------------------------
+
+@flow_api
+function P_SpawnMapThing(mthing: ptr<void>) -> void {
+    let mtype: i32 = MTHING_type(mthing)
+
+    if mtype == 11 {
+        if setupshim_deathmatch_p_room() != 0 {
+            setupshim_store_deathmatch_start(mthing)
+        }
+        return
+    }
+
+    if mtype <= 0 {
+        return
+    }
+
+    if mtype <= 4 {
+        setupshim_store_playerstart(mtype - 1, mthing)
+        if STAT_deathmatch() == 0 {
+            P_SpawnPlayer(mthing)
+        }
+        return
+    }
+
+    if STAT_netgame() == 0 and (MTHING_options(mthing) & 16) != 0 {
+        return
+    }
+
+    let mut bit: i32 = 0
+    if STAT_gameskill() == MOBJ_SK_BABY {
+        bit = 1
+    } elif STAT_gameskill() == MOBJ_SK_NIGHTMARE {
+        bit = 4
+    } else {
+        bit = 1 << (STAT_gameskill() - 1)
+    }
+
+    if (MTHING_options(mthing) & bit) == 0 {
+        return
+    }
+
+    let mut i: i32 = 0
+    while i < MOBJ_NUMMOBJTYPES {
+        if mtype == MOBJINFO_doomednum(i) {
+            break
+        }
+        i = i + 1
+    }
+
+    if i == MOBJ_NUMMOBJTYPES {
+        mobjshim_error_unknown_type(mtype, MTHING_x(mthing), MTHING_y(mthing))
+    }
+
+    if STAT_deathmatch() != 0 and (MOBJINFO_flags(i) & MOBJ_MF_NOTDMATCH) != 0 {
+        return
+    }
+
+    if STAT_nomonsters() != 0
+        and (i == MOBJ_MT_SKULL or (MOBJINFO_flags(i) & MOBJ_MF_COUNTKILL) != 0) {
+        return
+    }
+
+    let x: i32 = MTHING_x(mthing) << MOBJ_FRACBITS
+    let y: i32 = MTHING_y(mthing) << MOBJ_FRACBITS
+    let mut z: i32 = MOBJ_ONFLOORZ
+    if (MOBJINFO_flags(i) & MOBJ_MF_SPAWNCEILING) != 0 {
+        z = MOBJ_ONCEILINGZ
+    }
+
+    let mobj: ptr<void> = P_SpawnMobj(x, y, z, i)
+    mobj_copy_mthing(mobj_spawnpoint(mobj), mthing)
+
+    if MOBJ_tics(mobj) > 0 {
+        MOBJ_set_tics(mobj, 1 + (P_Random() % MOBJ_tics(mobj)))
+    }
+    if (MOBJ_flags(mobj) & MOBJ_MF_COUNTKILL) != 0 {
+        STAT_inc_totalkills()
+    }
+    if (MOBJ_flags(mobj) & MOBJ_MF_COUNTITEM) != 0 {
+        STAT_inc_totalitems()
+    }
+
+    MOBJ_set_angle(mobj, mobj_angle_from_thing(mthing))
+    if (MTHING_options(mthing) & MOBJ_MTF_AMBUSH) != 0 {
+        MOBJ_set_flags(mobj, MOBJ_flags(mobj) | MOBJ_MF_AMBUSH)
+    }
+}
+
+# ---- P_SpawnPuff ------------------------------------------------------
+
+@flow_api
+function P_SpawnPuff(x: i32, y: i32, z_in: i32) -> void {
+    let mut z: i32 = z_in + ((P_Random() - P_Random()) << 10)
+    let th: ptr<void> = P_SpawnMobj(x, y, z, MOBJ_MT_PUFF)
+    MOBJ_set_momz(th, MOBJ_FRACUNIT)
+    MOBJ_set_tics(th, MOBJ_tics(th) - (P_Random() & 3))
+    if MOBJ_tics(th) < 1 {
+        MOBJ_set_tics(th, 1)
+    }
+    if MAP_attackrange() == MOBJ_MELEERANGE {
+        P_SetMobjState(th, MOBJ_S_PUFF3)
+    }
+}
+
+# ---- P_SpawnBlood -----------------------------------------------------
+
+@flow_api
+function P_SpawnBlood(x: i32, y: i32, z_in: i32, damage: i32) -> void {
+    let mut z: i32 = z_in + ((P_Random() - P_Random()) << 10)
+    let th: ptr<void> = P_SpawnMobj(x, y, z, MOBJ_MT_BLOOD)
+    MOBJ_set_momz(th, MOBJ_FRACUNIT * 2)
+    MOBJ_set_tics(th, MOBJ_tics(th) - (P_Random() & 3))
+    if MOBJ_tics(th) < 1 {
+        MOBJ_set_tics(th, 1)
+    }
+    if damage <= 12 and damage >= 9 {
+        P_SetMobjState(th, MOBJ_S_BLOOD2)
+    } elif damage < 9 {
+        P_SetMobjState(th, MOBJ_S_BLOOD3)
+    }
+}
+
+# ---- P_CheckMissileSpawn ----------------------------------------------
+
+function P_CheckMissileSpawn(th: ptr<void>) -> void {
+    MOBJ_set_tics(th, MOBJ_tics(th) - (P_Random() & 3))
+    if MOBJ_tics(th) < 1 {
+        MOBJ_set_tics(th, 1)
+    }
+    MOBJ_set_x(th, MOBJ_x(th) + (MOBJ_momx(th) >> 1))
+    MOBJ_set_y(th, MOBJ_y(th) + (MOBJ_momy(th) >> 1))
+    MOBJ_set_z(th, MOBJ_z(th) + (MOBJ_momz(th) >> 1))
+    if P_TryMove(th, MOBJ_x(th), MOBJ_y(th)) == 0 {
+        P_ExplodeMissile(th)
+    }
+}
+
+# ---- P_SubstNullMobj --------------------------------------------------
+
+@flow_api
+function P_SubstNullMobj(mobj: ptr<void>) -> ptr<void> {
+    return mobjshim_subst_null(mobj)
+}
+
+# ---- P_SpawnMissile ---------------------------------------------------
+
+@flow_api
+function P_SpawnMissile(source: ptr<void>, dest: ptr<void>, typ: i32) -> ptr<void> {
+    let th: ptr<void> = P_SpawnMobj(
+        MOBJ_x(source),
+        MOBJ_y(source),
+        MOBJ_z(source) + 4 * 8 * MOBJ_FRACUNIT,
+        typ)
+
+    if MOBJ_info_seesound(th) != 0 {
+        S_StartSound(th, MOBJ_info_seesound(th))
+    }
+
+    MOBJ_set_target(th, source)
+    let mut an: u32 = R_PointToAngle2(
+        MOBJ_x(source), MOBJ_y(source),
+        MOBJ_x(dest), MOBJ_y(dest))
+
+    if (MOBJ_flags(dest) & MOBJ_MF_SHADOW) != 0 {
+        an = an + (((P_Random() - P_Random()) << 20) as u32)
+    }
+
+    MOBJ_set_angle(th, an)
+    let an_fine: u32 = an >> MOBJ_ANGLETOFINESHIFT
+    let speed: i32 = MOBJ_info_speed(th)
+    MOBJ_set_momx(th, FixedMul(speed, TABLES_finecosine(an_fine as i32)))
+    MOBJ_set_momy(th, FixedMul(speed, TABLES_finesine(an_fine as i32)))
+
+    let mut dist: i32 = P_AproxDistance(
+        MOBJ_x(dest) - MOBJ_x(source),
+        MOBJ_y(dest) - MOBJ_y(source))
+    dist = dist / speed
+    if dist < 1 {
+        dist = 1
+    }
+    MOBJ_set_momz(th, (MOBJ_z(dest) - MOBJ_z(source)) / dist)
+    P_CheckMissileSpawn(th)
+    return th
+}
+
+# ---- P_SpawnPlayerMissile ---------------------------------------------
+
+@flow_api
+function P_SpawnPlayerMissile(source: ptr<void>, typ: i32) -> void {
+    let mut an: u32 = MOBJ_angle(source)
+    let mut slope: i32 = P_AimLineAttack(source, an, 16 * 64 * MOBJ_FRACUNIT)
+
+    if (MAP_linetarget() as i64) == 0 {
+        an = an + ((1 << 26) as u32)
+        slope = P_AimLineAttack(source, an, 16 * 64 * MOBJ_FRACUNIT)
+        if (MAP_linetarget() as i64) == 0 {
+            an = an - ((2 << 26) as u32)
+            slope = P_AimLineAttack(source, an, 16 * 64 * MOBJ_FRACUNIT)
+        }
+        if (MAP_linetarget() as i64) == 0 {
+            an = MOBJ_angle(source)
+            slope = 0
+        }
+    }
+
+    let x: i32 = MOBJ_x(source)
+    let y: i32 = MOBJ_y(source)
+    let z: i32 = MOBJ_z(source) + 4 * 8 * MOBJ_FRACUNIT
+    let th: ptr<void> = P_SpawnMobj(x, y, z, typ)
+
+    if MOBJ_info_seesound(th) != 0 {
+        S_StartSound(th, MOBJ_info_seesound(th))
+    }
+
+    MOBJ_set_target(th, source)
+    MOBJ_set_angle(th, an)
+    let speed: i32 = MOBJ_info_speed(th)
+    let an_fine: u32 = an >> MOBJ_ANGLETOFINESHIFT
+    MOBJ_set_momx(th, FixedMul(speed, TABLES_finecosine(an_fine as i32)))
+    MOBJ_set_momy(th, FixedMul(speed, TABLES_finesine(an_fine as i32)))
+    MOBJ_set_momz(th, FixedMul(speed, slope))
+    P_CheckMissileSpawn(th)
+}

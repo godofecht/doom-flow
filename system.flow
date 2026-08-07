@@ -1,0 +1,273 @@
+# System interface, ported from i_system.c to Flow.
+#
+# atexit_listentry_t is module-private (Flow struct). Calling stored
+# function pointers goes through sysshim_call_void (platform_stub.c).
+# I_Error is the public fatal-error entry; I_ErrorPlain is the body.
+
+extern { function malloc(n: i64) -> ptr<void> }
+extern { function memset(dst: ptr<void>, c: i32, n: i64) -> ptr<void> }
+extern { function strlen(s: string) -> i64 }
+extern { function putchar(c: i32) -> i32 }
+extern { function puts(s: string) -> i32 }
+extern { function printf(fmt: string) -> i32 }
+extern { function printf(fmt: string, s: string) -> i32 }
+extern { function printf(fmt: string, p: ptr<void>, size: u32) -> i32 }
+extern { function exit(code: i32) -> void }
+
+extern { function M_CheckParmWithArgs(check: string, num_args: i32) -> i32 }
+extern { function M_ParmExists(check: string) -> i32 }
+extern { function M_StrToInt(str: ptr<u8>, result: ptr<i32>) -> i32 }
+extern { function argvflow_argc() -> i32 }
+extern { function argvflow_argv() -> ptr<i64> }
+
+extern { function sysshim_call_void(fn: ptr<void>) -> void }
+extern { function sysshim_error_popup(msg: string) -> void }
+
+function sysshim_eprint(msg: string) -> void {
+    printf("%s", msg)
+    printf("\n\n")
+}
+
+function sysshim_warn_recursive_error() -> void {
+    printf("Warning: recursive call to I_Error detected.\n")
+}
+
+function sysshim_print_zone(zonemem: ptr<void>, size: i32) -> void {
+    printf("zone memory: %p, %x allocated for zone\n", zonemem, size as u32)
+}
+
+# i_system.c
+const SYS_DEFAULT_RAM: i32 = 6
+const SYS_MIN_RAM: i32 = 6
+const SYS_DOS_MEM_DUMP_SIZE: i32 = 10
+const SYS_ATEXIT_SIZE: i64 = 24
+
+# atexit_listentry_t (LP64: func@0, run_on_error@8, next@16, sizeof 24)
+struct AtExitEntry {
+    func: ptr<void>,
+    run_on_error: i32,
+    next: ptr<AtExitEntry>
+}
+
+let mut exit_funcs: ptr<AtExitEntry> = null
+let mut already_quitting: i32 = 0
+
+# DOS NULL-deref dumps from i_system.c
+let mut mem_dump_dos622: array<u8, 10> = [
+    0x57, 0x92, 0x19, 0x00, 0xF4, 0x06, 0x70, 0x00, 0x16, 0x00
+]
+let mut mem_dump_win98: array<u8, 10> = [
+    0x9E, 0x0F, 0xC9, 0x00, 0x65, 0x04, 0x70, 0x00, 0x16, 0x00
+]
+let mut mem_dump_dosbox: array<u8, 10> = [
+    0x00, 0x00, 0x00, 0xF1, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00
+]
+let mut mem_dump_custom: array<u8, 10> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+# 0 = dos622 (default in C), 1 = win98/dos71, 2 = dosbox, 3 = custom
+let mut dos_mem_kind: i32 = 0
+let mut mem_firsttime: i32 = 1
+
+# argv_at / to_lower / str_iequal come from argv.flow (same Flow TU).
+
+function dos_byte(offset: u32) -> u8 {
+    let i: i32 = offset as i32
+    if dos_mem_kind == 1 {
+        return mem_dump_win98[i]
+    } elif dos_mem_kind == 2 {
+        return mem_dump_dosbox[i]
+    } elif dos_mem_kind == 3 {
+        return mem_dump_custom[i]
+    }
+    return mem_dump_dos622[i]
+}
+
+@flow_api
+function I_AtExit(func: ptr<void>, run_on_error: i32) -> void {
+    let entry: ptr<AtExitEntry> = malloc(SYS_ATEXIT_SIZE) as ptr<AtExitEntry>
+    entry[0].func = func
+    entry[0].run_on_error = run_on_error
+    entry[0].next = exit_funcs
+    exit_funcs = entry
+}
+
+@flow_api
+function I_Tactile(on: i32, off: i32, total: i32) -> void {
+}
+
+function AutoAllocMemory(size: ptr<i32>, default_ram: i32, min_ram: i32) -> ptr<u8> {
+    let mut zonemem: ptr<u8> = null
+    let mut ram: i32 = default_ram
+
+    while (zonemem as i64) == 0 {
+        if ram < min_ram {
+            I_ErrorPlain("Unable to allocate RAM for zone")
+        }
+        size[0] = ram * 1024 * 1024
+        zonemem = malloc(size[0] as i64) as ptr<u8>
+        if (zonemem as i64) == 0 {
+            ram = ram - 1
+        }
+    }
+    return zonemem
+}
+
+@flow_api
+function I_ZoneBase(size: ptr<i32>) -> ptr<u8> {
+    let mut min_ram: i32 = 0
+    let mut default_ram: i32 = 0
+    let p: i32 = M_CheckParmWithArgs("-mb", 1)
+
+    if p > 0 {
+        let mut mb: i32 = 0
+        M_StrToInt(argv_at(p + 1), &mb)
+        default_ram = mb
+        min_ram = default_ram
+    } else {
+        default_ram = SYS_DEFAULT_RAM
+        min_ram = SYS_MIN_RAM
+    }
+
+    let zonemem: ptr<u8> = AutoAllocMemory(size, default_ram, min_ram)
+    sysshim_print_zone(zonemem as ptr<void>, size[0])
+    return zonemem
+}
+
+@flow_api
+function I_PrintBanner(msg: string) -> void {
+    let spaces: i32 = 35 - ((strlen(msg) / 2) as i32)
+    for i in 0 to spaces {
+        putchar(32)
+    }
+    puts(msg)
+}
+
+@flow_api
+function I_PrintDivider() -> void {
+    for i in 0 to 75 {
+        putchar(61)
+    }
+    putchar(10)
+}
+
+@flow_api
+function I_PrintStartupBanner(gamedescription: string) -> void {
+    I_PrintDivider()
+    I_PrintBanner(gamedescription)
+    I_PrintDivider()
+    printf(" Doom Generic is free software, covered by the GNU General Public\n")
+    printf(" License.  There is NO warranty; not even for MERCHANTABILITY or FITNESS\n")
+    printf(" FOR A PARTICULAR PURPOSE. You are welcome to change and distribute\n")
+    printf(" copies under certain conditions. See the source for more information.\n")
+    I_PrintDivider()
+}
+
+# doomgeneric build: ORIGCODE off → always false (not a TTY).
+@flow_api
+function I_ConsoleStdout() -> i32 {
+    return 0
+}
+
+@flow_api
+function I_Quit() -> void {
+    let mut entry: ptr<AtExitEntry> = exit_funcs
+    while (entry as i64) != 0 {
+        sysshim_call_void(entry[0].func)
+        entry = entry[0].next
+    }
+}
+
+@flow_api
+function I_Error(msg: string) -> void {
+    I_ErrorPlain(msg)
+}
+
+@flow_api
+function I_ErrorPlain(msg: string) -> void {
+    if already_quitting != 0 {
+        sysshim_warn_recursive_error()
+    } else {
+        already_quitting = 1
+    }
+
+    sysshim_eprint(msg)
+
+    let mut entry: ptr<AtExitEntry> = exit_funcs
+    while (entry as i64) != 0 {
+        if entry[0].run_on_error != 0 {
+            sysshim_call_void(entry[0].func)
+        }
+        entry = entry[0].next
+    }
+
+    # I_ConsoleStdout is always 0 here, so the GUI popup runs unless -nogui.
+    if M_ParmExists("-nogui") == 0 {
+        sysshim_error_popup(msg)
+    }
+
+    exit(0 - 1)
+}
+
+@flow_api
+function I_GetMemoryValue(offset: u32, value: ptr<void>, size: i32) -> i32 {
+    if mem_firsttime != 0 {
+        mem_firsttime = 0
+        let p: i32 = M_CheckParmWithArgs("-setmem", 1)
+
+        if p > 0 {
+            let arg: ptr<u8> = argv_at(p + 1)
+            if str_iequal(arg, "dos622" as ptr<u8>) {
+                dos_mem_kind = 0
+            }
+            # C uses a bare if (not else-if) for dos71, then else-if dosbox.
+            if str_iequal(arg, "dos71" as ptr<u8>) {
+                dos_mem_kind = 1
+            } elif str_iequal(arg, "dosbox" as ptr<u8>) {
+                dos_mem_kind = 2
+            } else {
+                # Preserve the C double-increment quirk on i.
+                let mut i: i32 = 0
+                let mut pp: i32 = p
+                while i < SYS_DOS_MEM_DUMP_SIZE {
+                    pp = pp + 1
+                    if pp >= argvflow_argc() {
+                        break
+                    }
+                    let ch0: i32 = argv_at(pp)[0] as i32
+                    if ch0 == 45 {
+                        break
+                    }
+                    let mut val: i32 = 0
+                    M_StrToInt(argv_at(pp), &val)
+                    mem_dump_custom[i] = val as u8
+                    i = i + 1
+                    i = i + 1
+                }
+                dos_mem_kind = 3
+            }
+        }
+    }
+
+    if size == 1 {
+        let out: ptr<u8> = value as ptr<u8>
+        out[0] = dos_byte(offset)
+        return 1
+    } elif size == 2 {
+        let out: ptr<u16> = value as ptr<u16>
+        let b0: u32 = dos_byte(offset) as u32
+        let b1: u32 = dos_byte(offset + (1 as u32)) as u32
+        out[0] = (b0 | (b1 << 8)) as u16
+        return 1
+    } elif size == 4 {
+        let out: ptr<u32> = value as ptr<u32>
+        let b0: u32 = dos_byte(offset) as u32
+        let b1: u32 = dos_byte(offset + (1 as u32)) as u32
+        let b2: u32 = dos_byte(offset + (2 as u32)) as u32
+        let b3: u32 = dos_byte(offset + (3 as u32)) as u32
+        out[0] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        return 1
+    }
+    return 0
+}

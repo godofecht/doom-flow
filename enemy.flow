@@ -1,0 +1,1723 @@
+# Enemy thinking / AI / action routines, ported from p_enemy.c to Flow.
+#
+# Action pointers (A_*) and P_NoiseAlert / PIT_VileCheck keep exact C names
+# via @flow_api (info.c / P_BlockThingsIterator). Private helpers use the
+# enemy_* prefix. Engine structs stay C-owned; field access goes through
+# MOBJ_* / GEOM_* / spec APIs.
+#
+# Collision scratch: MAP_* (map.flow) and MAPUTL_openrange (maputl.flow).
+# ENEMY_* consts avoid colliding with MAP_* / MAPUTL_*.
+#
+# LP64 offsetof notes (same as sight.flow):
+#   mobj_t 224: x24 y28 z32 angle56 subsector88 floorz96 height108
+#     momx112 momy116 momz120 type128 info136 tics144 state152 flags160
+#     health164 movedir168 movecount172 target176 reactiontime184
+#     threshold188 lastlook200 tracer216
+#   sector_t 128: soundtraversed20 soundtarget24 validcount88 linecount112 lines120
+#   line_t 88: flags24 sidenum30 tag28
+
+# ---- engine / libc ----------------------------------------------------
+
+extern { function abs(x: i32) -> i32 }
+extern { function FixedMul(a: i32, b: i32) -> i32 }
+extern { function P_Random() -> i32 }
+extern { function I_Error(msg: string) -> void }
+extern { function R_PointToAngle2(x1: i32, y1: i32, x2: i32, y2: i32) -> u32 }
+extern { function S_StartSound(origin: ptr<void>, sound_id: i32) -> void }
+extern { function P_CheckSight(t1: ptr<void>, t2: ptr<void>) -> i32 }
+extern { function P_AproxDistance(dx: i32, dy: i32) -> i32 }
+extern { function P_LineOpening(linedef: ptr<void>) -> void }
+extern { function P_TryMove(thing: ptr<void>, x: i32, y: i32) -> i32 }
+extern { function P_CheckPosition(thing: ptr<void>, x: i32, y: i32) -> i32 }
+extern { function P_UseSpecialLine(thing: ptr<void>, line: ptr<void>, side: i32) -> i32 }
+extern { function P_SetMobjState(mobj: ptr<void>, state: i32) -> i32 }
+extern { function P_SpawnMobj(x: i32, y: i32, z: i32, typ: i32) -> ptr<void> }
+extern { function P_SpawnMissile(source: ptr<void>, dest: ptr<void>, typ: i32) -> ptr<void> }
+extern { function P_SpawnPuff(x: i32, y: i32, z: i32) -> void }
+extern { function P_RemoveMobj(th: ptr<void>) -> void }
+extern { function P_SubstNullMobj(th: ptr<void>) -> ptr<void> }
+extern { function P_UnsetThingPosition(thing: ptr<void>) -> void }
+extern { function P_SetThingPosition(thing: ptr<void>) -> void }
+extern { function P_AimLineAttack(t1: ptr<void>, angle: u32, distance: i32) -> i32 }
+extern { function P_LineAttack(t1: ptr<void>, angle: u32, distance: i32, slope: i32, damage: i32) -> void }
+extern { function P_RadiusAttack(spot: ptr<void>, source: ptr<void>, damage: i32) -> void }
+extern { function P_DamageMobj(target: ptr<void>, inflictor: ptr<void>, source: ptr<void>, damage: i32) -> void }
+extern { function P_BlockThingsIterator(x: i32, y: i32, func: ptr<void>) -> i32 }
+extern { function P_TeleportMove(thing: ptr<void>, x: i32, y: i32) -> i32 }
+extern { function G_ExitLevel() -> void }
+extern { function A_ReFire(player: ptr<void>, psp: ptr<void>) -> void }
+extern { function TABLES_finesine(idx: i32) -> i32 }
+extern { function TABLES_finecosine(idx: i32) -> i32 }
+
+extern { function getNextSector(line: ptr<void>, sec: ptr<void>) -> ptr<void> }
+extern { function SPEC_ev_do_door_tag(tag: i32, doortype: i32) -> void }
+extern { function SPEC_ev_do_floor_tag(tag: i32, floortype: i32) -> void }
+
+extern { function STAT_gameskill() -> i32 }
+extern { function STAT_fastparm() -> i32 }
+extern { function RMAIN_validcount() -> i32 }
+extern { function RMAIN_set_validcount(v: i32) -> void }
+
+extern { function MAPUTL_openrange() -> i32 }
+extern { function GEOM_bmaporgx() -> i32 }
+extern { function GEOM_bmaporgy() -> i32 }
+
+extern { function THINKER_cap() -> ptr<void> }
+extern { function THINKER_next(th: ptr<void>) -> ptr<void> }
+extern { function THINKER_is_mobj(th: ptr<void>) -> i32 }
+
+extern { function MOBJINFO_radius(typ: i32) -> i32 }
+
+extern { function GEOM_sector_validcount(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_set_validcount(s: ptr<void>, v: i32) -> void }
+extern { function GEOM_sector_soundtraversed(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_set_soundtraversed(s: ptr<void>, v: i32) -> void }
+extern { function GEOM_sector_soundtarget(s: ptr<void>) -> ptr<void> }
+extern { function GEOM_sector_set_soundtarget(s: ptr<void>, m: ptr<void>) -> void }
+extern { function GEOM_sector_linecount(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_line(s: ptr<void>, i: i32) -> ptr<void> }
+
+extern { function MOBJ_x(m: ptr<void>) -> i32 }
+extern { function MOBJ_y(m: ptr<void>) -> i32 }
+extern { function MOBJ_z(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_x(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_y(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_z(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_angle(m: ptr<void>) -> u32 }
+extern { function MOBJ_set_angle(m: ptr<void>, v: u32) -> void }
+extern { function MOBJ_floorz(m: ptr<void>) -> i32 }
+extern { function MOBJ_height(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_height(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_momx(m: ptr<void>) -> i32 }
+extern { function MOBJ_momy(m: ptr<void>) -> i32 }
+extern { function MOBJ_momz(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_momx(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_momy(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_momz(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_flags(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_flags(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_health(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_health(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_type(m: ptr<void>) -> i32 }
+extern { function MOBJ_tics(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_tics(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_movedir(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_movedir(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_target(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_set_target(m: ptr<void>, t: ptr<void>) -> void }
+extern { function MOBJ_tracer(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_set_tracer(m: ptr<void>, t: ptr<void>) -> void }
+extern { function MOBJ_sector(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_state(m: ptr<void>) -> ptr<void> }
+extern { function STATE_tics(st: ptr<void>) -> i32 }
+
+extern { function MOBJ_info_radius(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_speed(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_meleestate(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_missilestate(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_seesound(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_seestate(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_spawnstate(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_attacksound(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_activesound(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_deathsound(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_painsound(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_raisestate(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_spawnhealth(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_flags(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_mass(m: ptr<void>) -> i32 }
+extern { function GEOM_line_flags(ld: ptr<void>) -> i32 }
+extern { function MOBJ_lastlook(m: ptr<void>) -> i32 }
+extern { function MOBJ_movecount(m: ptr<void>) -> i32 }
+extern { function MOBJ_reactiontime(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_lastlook(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_movecount(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_reactiontime(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_threshold(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_threshold(m: ptr<void>) -> i32 }
+extern { function PLAYER_at(i: i32) -> ptr<void> }
+extern { function PLAYER_health(p: ptr<void>) -> i32 }
+extern { function PLAYER_mo(p: ptr<void>) -> ptr<void> }
+
+# ---- constants (ENEMY_ prefix) ----------------------------------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_gametic() -> i32 }
+extern { function MAP_floatok() -> i32 }
+extern { function MAP_tmfloorz() -> i32 }
+extern { function MAP_numspechit() -> i32 }
+extern { function MAP_set_numspechit(v: i32) -> void }
+extern { function MAP_spechit(i: i32) -> ptr<void> }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_playeringame(i: i32) -> i32 }
+
+# dirtype_t
+const ENEMY_DI_EAST: i32 = 0
+const ENEMY_DI_NORTHEAST: i32 = 1
+const ENEMY_DI_NORTH: i32 = 2
+const ENEMY_DI_NORTHWEST: i32 = 3
+const ENEMY_DI_WEST: i32 = 4
+const ENEMY_DI_SOUTHWEST: i32 = 5
+const ENEMY_DI_SOUTH: i32 = 6
+const ENEMY_DI_SOUTHEAST: i32 = 7
+const ENEMY_DI_NODIR: i32 = 8
+
+# m_fixed.h / tables.h / p_local.h
+const ENEMY_FRACUNIT: i32 = 65536
+const ENEMY_ANGLETOFINESHIFT: u32 = 19
+const ENEMY_ANG90: u32 = 1073741824
+const ENEMY_ANG180: u32 = 2147483648
+const ENEMY_ANG270: u32 = 3221225472
+const ENEMY_MELEERANGE: i32 = 4194304
+const ENEMY_MISSILERANGE: i32 = 134217728
+const ENEMY_FLOATSPEED: i32 = 262144
+const ENEMY_MAXRADIUS: i32 = 2097152
+const ENEMY_MAPBLOCKSHIFT: i32 = 23
+const ENEMY_MAXPLAYERS: i32 = 4
+
+# doomdata.h
+const ENEMY_ML_TWOSIDED: i32 = 4
+const ENEMY_ML_SOUNDBLOCK: i32 = 64
+
+# p_mobj.h
+const ENEMY_MF_SOLID: i32 = 2
+const ENEMY_MF_SHOOTABLE: i32 = 4
+const ENEMY_MF_AMBUSH: i32 = 32
+const ENEMY_MF_JUSTHIT: i32 = 64
+const ENEMY_MF_JUSTATTACKED: i32 = 128
+const ENEMY_MF_FLOAT: i32 = 16384
+const ENEMY_MF_SHADOW: i32 = 262144
+const ENEMY_MF_CORPSE: i32 = 1048576
+const ENEMY_MF_INFLOAT: i32 = 2097152
+const ENEMY_MF_SKULLFLY: i32 = 16777216
+
+# info.h mobjtype_t / statenum_t
+const ENEMY_MT_VILE: i32 = 3
+const ENEMY_MT_FIRE: i32 = 4
+const ENEMY_MT_UNDEAD: i32 = 5
+const ENEMY_MT_TRACER: i32 = 6
+const ENEMY_MT_SMOKE: i32 = 7
+const ENEMY_MT_FATSO: i32 = 8
+const ENEMY_MT_FATSHOT: i32 = 9
+const ENEMY_MT_TROOP: i32 = 11
+const ENEMY_MT_SERGEANT: i32 = 12
+const ENEMY_MT_SHADOWS: i32 = 13
+const ENEMY_MT_HEAD: i32 = 14
+const ENEMY_MT_BRUISER: i32 = 15
+const ENEMY_MT_BRUISERSHOT: i32 = 16
+const ENEMY_MT_KNIGHT: i32 = 17
+const ENEMY_MT_SKULL: i32 = 18
+const ENEMY_MT_SPIDER: i32 = 19
+const ENEMY_MT_BABY: i32 = 20
+const ENEMY_MT_CYBORG: i32 = 21
+const ENEMY_MT_PAIN: i32 = 22
+const ENEMY_MT_BOSSTARGET: i32 = 27
+const ENEMY_MT_SPAWNSHOT: i32 = 28
+const ENEMY_MT_SPAWNFIRE: i32 = 29
+const ENEMY_MT_TROOPSHOT: i32 = 31
+const ENEMY_MT_HEADSHOT: i32 = 32
+const ENEMY_MT_ROCKET: i32 = 33
+const ENEMY_MT_ARACHPLAZ: i32 = 36
+const ENEMY_S_NULL: i32 = 0
+const ENEMY_S_VILE_HEAL1: i32 = 266
+const ENEMY_S_BRAINEXPLODE1: i32 = 799
+
+# sounds.h
+const ENEMY_SFX_PISTOL: i32 = 1
+const ENEMY_SFX_SHOTGN: i32 = 2
+const ENEMY_SFX_DBOPN: i32 = 5
+const ENEMY_SFX_DBCLS: i32 = 6
+const ENEMY_SFX_DBLOAD: i32 = 7
+const ENEMY_SFX_SLOP: i32 = 31
+const ENEMY_SFX_TELEPT: i32 = 35
+const ENEMY_SFX_POSIT1: i32 = 36
+const ENEMY_SFX_POSIT2: i32 = 37
+const ENEMY_SFX_POSIT3: i32 = 38
+const ENEMY_SFX_BGSIT1: i32 = 39
+const ENEMY_SFX_BGSIT2: i32 = 40
+const ENEMY_SFX_SKEPCH: i32 = 53
+const ENEMY_SFX_VILATK: i32 = 54
+const ENEMY_SFX_CLAW: i32 = 55
+const ENEMY_SFX_SKESWG: i32 = 56
+const ENEMY_SFX_PLDETH: i32 = 57
+const ENEMY_SFX_PDIEHI: i32 = 58
+const ENEMY_SFX_PODTH1: i32 = 59
+const ENEMY_SFX_PODTH2: i32 = 60
+const ENEMY_SFX_PODTH3: i32 = 61
+const ENEMY_SFX_BGDTH1: i32 = 62
+const ENEMY_SFX_BGDTH2: i32 = 63
+const ENEMY_SFX_BSPWLK: i32 = 79
+const ENEMY_SFX_BAREXP: i32 = 82
+const ENEMY_SFX_HOOF: i32 = 84
+const ENEMY_SFX_METAL: i32 = 85
+const ENEMY_SFX_FLAME: i32 = 91
+const ENEMY_SFX_FLAMST: i32 = 92
+const ENEMY_SFX_BOSPIT: i32 = 94
+const ENEMY_SFX_BOSCUB: i32 = 95
+const ENEMY_SFX_BOSSIT: i32 = 96
+const ENEMY_SFX_BOSPN: i32 = 97
+const ENEMY_SFX_BOSDTH: i32 = 98
+const ENEMY_SFX_MANATK: i32 = 99
+
+# doomdef.h / d_mode.h
+const ENEMY_SK_EASY: i32 = 1
+const ENEMY_SK_NIGHTMARE: i32 = 4
+const ENEMY_COMMERCIAL: i32 = 2
+const ENEMY_EXE_ULTIMATE: i32 = 6
+
+# p_spec.h
+const ENEMY_VLD_OPEN: i32 = 3
+const ENEMY_VLD_BLAZEOPEN: i32 = 6
+const ENEMY_LOWERFLOORTOLOWEST: i32 = 1
+const ENEMY_RAISETOTEXTURE: i32 = 5
+
+# p_enemy.c macros
+const ENEMY_FATSPREAD: u32 = 134217728
+const ENEMY_SKULLSPEED: i32 = 1310720
+const ENEMY_TRACEANGLE_INIT: u32 = 201326592
+const ENEMY_ANGLE_HALF: u32 = 2147483648
+
+# ---- private module state ---------------------------------------------
+
+let mut soundtarget: ptr<void> = null
+let mut corpsehit: ptr<void> = null
+let mut viletryx: i32 = 0
+let mut viletryy: i32 = 0
+let mut TRACEANGLE: u32 = 201326592
+let mut enemy_brain_easy: i32 = 0
+
+# P_NewChaseDir LUTs (dirtype_t)
+let mut opposite: array<i32, 9> = [
+    4, 5, 6, 7, 0, 1, 2, 3, 8
+]
+let mut diags: array<i32, 4> = [
+    3, 1, 5, 7
+]
+
+# P_NewChaseDir direction LUTs (was enemy_shim.c)
+let mut enemy_xspeed: array<i32, 8> = [
+    65536, 47000, 0, 0 - 47000, 0 - 65536, 0 - 47000, 0, 47000
+]
+let mut enemy_yspeed: array<i32, 8> = [
+    0, 47000, 65536, 47000, 0, 0 - 47000, 0 - 65536, 0 - 47000
+]
+
+let mut enemy_braintargets: array<ptr<void>, 32> = [
+    null, null, null, null, null, null, null, null,
+    null, null, null, null, null, null, null, null,
+    null, null, null, null, null, null, null, null,
+    null, null, null, null, null, null, null, null
+]
+let mut enemy_numbraintargets: i32 = 0
+let mut enemy_braintargeton: i32 = 0
+
+# ---- enemy_RecursiveSound (was P_RecursiveSound) ----------------------
+
+function enemy_RecursiveSound(sec: ptr<void>, soundblocks: i32) -> void {
+    if GEOM_sector_validcount(sec) == RMAIN_validcount()
+        and GEOM_sector_soundtraversed(sec) <= soundblocks + 1 {
+        return
+    }
+
+    GEOM_sector_set_validcount(sec, RMAIN_validcount())
+    GEOM_sector_set_soundtraversed(sec, soundblocks + 1)
+    GEOM_sector_set_soundtarget(sec, soundtarget)
+
+    let n: i32 = GEOM_sector_linecount(sec)
+    for i in 0 to n {
+        let check: ptr<void> = GEOM_sector_line(sec, i)
+        if (GEOM_line_flags(check) & ENEMY_ML_TWOSIDED) == 0 {
+            continue
+        }
+
+        P_LineOpening(check)
+        if MAPUTL_openrange() <= 0 {
+            continue
+        }
+
+        let other: ptr<void> = getNextSector(check, sec)
+
+        if (GEOM_line_flags(check) & ENEMY_ML_SOUNDBLOCK) != 0 {
+            if soundblocks == 0 {
+                enemy_RecursiveSound(other, 1)
+            }
+        } else {
+            enemy_RecursiveSound(other, soundblocks)
+        }
+    }
+}
+
+# ---- P_NoiseAlert -----------------------------------------------------
+
+@flow_api
+function P_NoiseAlert(target: ptr<void>, emmiter: ptr<void>) -> void {
+    soundtarget = target
+    RMAIN_set_validcount(RMAIN_validcount() + 1)
+    enemy_RecursiveSound(MOBJ_sector(emmiter), 0)
+}
+
+# ---- enemy_CheckMeleeRange --------------------------------------------
+
+function enemy_CheckMeleeRange(actor: ptr<void>) -> i32 {
+    let pl: ptr<void> = MOBJ_target(actor)
+    if (pl as i64) == 0 {
+        return 0
+    }
+
+    let dist: i32 = P_AproxDistance(
+        MOBJ_x(pl) - MOBJ_x(actor),
+        MOBJ_y(pl) - MOBJ_y(actor))
+
+    if dist >= ENEMY_MELEERANGE - 20 * ENEMY_FRACUNIT + MOBJ_info_radius(pl) {
+        return 0
+    }
+    if P_CheckSight(actor, MOBJ_target(actor)) == 0 {
+        return 0
+    }
+    return 1
+}
+
+# ---- enemy_CheckMissileRange ------------------------------------------
+
+function enemy_CheckMissileRange(actor: ptr<void>) -> i32 {
+    if P_CheckSight(actor, MOBJ_target(actor)) == 0 {
+        return 0
+    }
+
+    if (MOBJ_flags(actor) & ENEMY_MF_JUSTHIT) != 0 {
+        MOBJ_set_flags(actor, MOBJ_flags(actor) & (0 - 1 - ENEMY_MF_JUSTHIT))
+        return 1
+    }
+
+    if MOBJ_reactiontime(actor) != 0 {
+        return 0
+    }
+
+    let targ: ptr<void> = MOBJ_target(actor)
+    let mut dist: i32 = P_AproxDistance(
+        MOBJ_x(actor) - MOBJ_x(targ),
+        MOBJ_y(actor) - MOBJ_y(targ)) - 64 * ENEMY_FRACUNIT
+
+    if MOBJ_info_meleestate(actor) == 0 {
+        dist = dist - 128 * ENEMY_FRACUNIT
+    }
+
+    dist = dist >> 16
+
+    if MOBJ_type(actor) == ENEMY_MT_VILE {
+        if dist > 14 * 64 {
+            return 0
+        }
+    }
+
+    if MOBJ_type(actor) == ENEMY_MT_UNDEAD {
+        if dist < 196 {
+            return 0
+        }
+        dist = dist >> 1
+    }
+
+    if MOBJ_type(actor) == ENEMY_MT_CYBORG
+        or MOBJ_type(actor) == ENEMY_MT_SPIDER
+        or MOBJ_type(actor) == ENEMY_MT_SKULL {
+        dist = dist >> 1
+    }
+
+    if dist > 200 {
+        dist = 200
+    }
+    if MOBJ_type(actor) == ENEMY_MT_CYBORG and dist > 160 {
+        dist = 160
+    }
+    if P_Random() < dist {
+        return 0
+    }
+    return 1
+}
+
+# ---- enemy_Move -------------------------------------------------------
+
+function enemy_Move(actor: ptr<void>) -> i32 {
+    if MOBJ_movedir(actor) == ENEMY_DI_NODIR {
+        return 0
+    }
+    if (MOBJ_movedir(actor) as u32) >= 8 as u32 {
+        I_Error("Weird actor->movedir!")
+    }
+
+    let md: i32 = MOBJ_movedir(actor)
+    let speed: i32 = MOBJ_info_speed(actor)
+    let tryx: i32 = MOBJ_x(actor) + speed * enemy_xspeed[md]
+    let tryy: i32 = MOBJ_y(actor) + speed * enemy_yspeed[md]
+
+    let try_ok: i32 = P_TryMove(actor, tryx, tryy)
+
+    if try_ok == 0 {
+        if (MOBJ_flags(actor) & ENEMY_MF_FLOAT) != 0 and MAP_floatok() != 0 {
+            if MOBJ_z(actor) < MAP_tmfloorz() {
+                MOBJ_set_z(actor, MOBJ_z(actor) + ENEMY_FLOATSPEED)
+            } else {
+                MOBJ_set_z(actor, MOBJ_z(actor) - ENEMY_FLOATSPEED)
+            }
+            MOBJ_set_flags(actor, MOBJ_flags(actor) | ENEMY_MF_INFLOAT)
+            return 1
+        }
+
+        if MAP_numspechit() == 0 {
+            return 0
+        }
+
+        MOBJ_set_movedir(actor, ENEMY_DI_NODIR)
+        let mut good: i32 = 0
+        while true {
+            let cur: i32 = MAP_numspechit()
+            MAP_set_numspechit(cur - 1)
+            if cur == 0 {
+                break
+            }
+            let ld: ptr<void> = MAP_spechit(MAP_numspechit())
+            if P_UseSpecialLine(actor, ld, 0) != 0 {
+                good = 1
+            }
+        }
+        return good
+    } else {
+        MOBJ_set_flags(actor, MOBJ_flags(actor) & (0 - 1 - ENEMY_MF_INFLOAT))
+    }
+
+    if (MOBJ_flags(actor) & ENEMY_MF_FLOAT) == 0 {
+        MOBJ_set_z(actor, MOBJ_floorz(actor))
+    }
+    return 1
+}
+
+# ---- enemy_TryWalk ----------------------------------------------------
+
+function enemy_TryWalk(actor: ptr<void>) -> i32 {
+    if enemy_Move(actor) == 0 {
+        return 0
+    }
+    MOBJ_set_movecount(actor, P_Random() & 15)
+    return 1
+}
+
+# ---- enemy_NewChaseDir ------------------------------------------------
+
+function enemy_NewChaseDir(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        I_Error("P_NewChaseDir: called with no target")
+    }
+
+    let olddir: i32 = MOBJ_movedir(actor)
+    let turnaround: i32 = opposite[olddir]
+
+    let targ: ptr<void> = MOBJ_target(actor)
+    let deltax: i32 = MOBJ_x(targ) - MOBJ_x(actor)
+    let deltay: i32 = MOBJ_y(targ) - MOBJ_y(actor)
+
+    let mut d1: i32 = ENEMY_DI_NODIR
+    let mut d2: i32 = ENEMY_DI_NODIR
+
+    if deltax > 10 * ENEMY_FRACUNIT {
+        d1 = ENEMY_DI_EAST
+    } elif deltax < 0 - 10 * ENEMY_FRACUNIT {
+        d1 = ENEMY_DI_WEST
+    } else {
+        d1 = ENEMY_DI_NODIR
+    }
+
+    if deltay < 0 - 10 * ENEMY_FRACUNIT {
+        d2 = ENEMY_DI_SOUTH
+    } elif deltay > 10 * ENEMY_FRACUNIT {
+        d2 = ENEMY_DI_NORTH
+    } else {
+        d2 = ENEMY_DI_NODIR
+    }
+
+    # try direct route
+    if d1 != ENEMY_DI_NODIR and d2 != ENEMY_DI_NODIR {
+        let mut diag_i: i32 = 0
+        if deltay < 0 {
+            diag_i = diag_i + 2
+        }
+        if deltax > 0 {
+            diag_i = diag_i + 1
+        }
+        MOBJ_set_movedir(actor, diags[diag_i])
+        if MOBJ_movedir(actor) != turnaround and enemy_TryWalk(actor) != 0 {
+            return
+        }
+    }
+
+    # try other directions
+    if P_Random() > 200 or abs(deltay) > abs(deltax) {
+        let tdir: i32 = d1
+        d1 = d2
+        d2 = tdir
+    }
+
+    if d1 == turnaround {
+        d1 = ENEMY_DI_NODIR
+    }
+    if d2 == turnaround {
+        d2 = ENEMY_DI_NODIR
+    }
+
+    if d1 != ENEMY_DI_NODIR {
+        MOBJ_set_movedir(actor, d1)
+        if enemy_TryWalk(actor) != 0 {
+            return
+        }
+    }
+
+    if d2 != ENEMY_DI_NODIR {
+        MOBJ_set_movedir(actor, d2)
+        if enemy_TryWalk(actor) != 0 {
+            return
+        }
+    }
+
+    if olddir != ENEMY_DI_NODIR {
+        MOBJ_set_movedir(actor, olddir)
+        if enemy_TryWalk(actor) != 0 {
+            return
+        }
+    }
+
+    # randomly determine direction of search
+    if (P_Random() & 1) != 0 {
+        let mut tdir2: i32 = ENEMY_DI_EAST
+        while tdir2 <= ENEMY_DI_SOUTHEAST {
+            if tdir2 != turnaround {
+                MOBJ_set_movedir(actor, tdir2)
+                if enemy_TryWalk(actor) != 0 {
+                    return
+                }
+            }
+            tdir2 = tdir2 + 1
+        }
+    } else {
+        let mut tdir3: i32 = ENEMY_DI_SOUTHEAST
+        while tdir3 != ENEMY_DI_EAST - 1 {
+            if tdir3 != turnaround {
+                MOBJ_set_movedir(actor, tdir3)
+                if enemy_TryWalk(actor) != 0 {
+                    return
+                }
+            }
+            tdir3 = tdir3 - 1
+        }
+    }
+
+    if turnaround != ENEMY_DI_NODIR {
+        MOBJ_set_movedir(actor, turnaround)
+        if enemy_TryWalk(actor) != 0 {
+            return
+        }
+    }
+
+    MOBJ_set_movedir(actor, ENEMY_DI_NODIR)
+}
+
+# ---- enemy_LookForPlayers ---------------------------------------------
+# Mirrors for (;; lastlook = (lastlook+1)&3): continue advances lastlook;
+# early return false/true does not.
+
+function enemy_LookForPlayers(actor: ptr<void>, allaround: i32) -> i32 {
+    let mut c: i32 = 0
+    let stop: i32 = (MOBJ_lastlook(actor) - 1) & 3
+
+    while true {
+        if STAT_playeringame(MOBJ_lastlook(actor)) != 0 {
+            # c++ == 2 || lastlook == stop
+            let look: i32 = MOBJ_lastlook(actor)
+            let oldc: i32 = c
+            c = c + 1
+            if oldc == 2 or look == stop {
+                return 0
+            }
+
+            let player: ptr<void> = PLAYER_at(look)
+
+            if PLAYER_health(player) > 0 {
+                let mo: ptr<void> = PLAYER_mo(player)
+                if P_CheckSight(actor, mo) != 0 {
+                    let mut ok: i32 = 1
+                    if allaround == 0 {
+                        let an: u32 = R_PointToAngle2(
+                            MOBJ_x(actor), MOBJ_y(actor),
+                            MOBJ_x(mo), MOBJ_y(mo)) - MOBJ_angle(actor)
+
+                        if an > ENEMY_ANG90 and an < ENEMY_ANG270 {
+                            let dist: i32 = P_AproxDistance(
+                                MOBJ_x(mo) - MOBJ_x(actor),
+                                MOBJ_y(mo) - MOBJ_y(actor))
+                            if dist > ENEMY_MELEERANGE {
+                                ok = 0
+                            }
+                        }
+                    }
+                    if ok != 0 {
+                        MOBJ_set_target(actor, mo)
+                        return 1
+                    }
+                }
+            }
+        }
+
+        # for-loop increment
+        MOBJ_set_lastlook(actor, (MOBJ_lastlook(actor) + 1) & 3)
+    }
+    return 0
+}
+
+# ---- A_Fall (needed early) --------------------------------------------
+
+@flow_api
+function A_Fall(actor: ptr<void>) -> void {
+    MOBJ_set_flags(actor, MOBJ_flags(actor) & (0 - 1 - ENEMY_MF_SOLID))
+}
+
+# ---- A_KeenDie --------------------------------------------------------
+
+@flow_api
+function A_KeenDie(mo: ptr<void>) -> void {
+    A_Fall(mo)
+
+    let cap: ptr<void> = THINKER_cap()
+    let mut th: ptr<void> = THINKER_next(cap)
+    while (th as i64) != (cap as i64) {
+        if THINKER_is_mobj(th) != 0 {
+            let mo2: ptr<void> = th
+            if (mo2 as i64) != (mo as i64)
+                and MOBJ_type(mo2) == MOBJ_type(mo)
+                and MOBJ_health(mo2) > 0 {
+                return
+            }
+        }
+        th = THINKER_next(th)
+    }
+
+    SPEC_ev_do_door_tag(666, ENEMY_VLD_OPEN)
+}
+
+# ---- A_Look -----------------------------------------------------------
+
+@flow_api
+function A_Look(actor: ptr<void>) -> void {
+    MOBJ_set_threshold(actor, 0)
+
+    let mut seeyou: i32 = 0
+    let targ: ptr<void> = GEOM_sector_soundtarget(MOBJ_sector(actor))
+
+    if (targ as i64) != 0 and (MOBJ_flags(targ) & ENEMY_MF_SHOOTABLE) != 0 {
+        MOBJ_set_target(actor, targ)
+        if (MOBJ_flags(actor) & ENEMY_MF_AMBUSH) != 0 {
+            if P_CheckSight(actor, MOBJ_target(actor)) != 0 {
+                seeyou = 1
+            }
+        } else {
+            seeyou = 1
+        }
+    }
+
+    if seeyou == 0 {
+        if enemy_LookForPlayers(actor, 0) == 0 {
+            return
+        }
+    }
+
+    # seeyou
+    if MOBJ_info_seesound(actor) != 0 {
+        let mut sound: i32 = 0
+        let ss: i32 = MOBJ_info_seesound(actor)
+        if ss == ENEMY_SFX_POSIT1 or ss == ENEMY_SFX_POSIT2 or ss == ENEMY_SFX_POSIT3 {
+            sound = ENEMY_SFX_POSIT1 + P_Random() % 3
+        } elif ss == ENEMY_SFX_BGSIT1 or ss == ENEMY_SFX_BGSIT2 {
+            sound = ENEMY_SFX_BGSIT1 + P_Random() % 2
+        } else {
+            sound = ss
+        }
+
+        if MOBJ_type(actor) == ENEMY_MT_SPIDER
+            or MOBJ_type(actor) == ENEMY_MT_CYBORG {
+            S_StartSound(null, sound)
+        } else {
+            S_StartSound(actor, sound)
+        }
+    }
+
+    P_SetMobjState(actor, MOBJ_info_seestate(actor))
+}
+
+# ---- A_Chase ----------------------------------------------------------
+
+@flow_api
+function A_Chase(actor: ptr<void>) -> void {
+    if MOBJ_reactiontime(actor) != 0 {
+        MOBJ_set_reactiontime(actor, MOBJ_reactiontime(actor) - 1)
+    }
+
+    if MOBJ_threshold(actor) != 0 {
+        let t: ptr<void> = MOBJ_target(actor)
+        if (t as i64) == 0 or MOBJ_health(t) <= 0 {
+            MOBJ_set_threshold(actor, 0)
+        } else {
+            MOBJ_set_threshold(actor, MOBJ_threshold(actor) - 1)
+        }
+    }
+
+    # turn towards movement direction if not there yet
+    if MOBJ_movedir(actor) < 8 {
+        let mut ang: u32 = MOBJ_angle(actor) & ((7 as u32) << 29)
+        MOBJ_set_angle(actor, ang)
+        let delta: i32 = (ang as i32) - (MOBJ_movedir(actor) << 29)
+        if delta > 0 {
+            MOBJ_set_angle(actor, MOBJ_angle(actor) - (ENEMY_ANG90 >> 1))
+        } elif delta < 0 {
+            MOBJ_set_angle(actor, MOBJ_angle(actor) + (ENEMY_ANG90 >> 1))
+        }
+    }
+
+    let targ: ptr<void> = MOBJ_target(actor)
+    if (targ as i64) == 0 or (MOBJ_flags(targ) & ENEMY_MF_SHOOTABLE) == 0 {
+        if enemy_LookForPlayers(actor, 1) != 0 {
+            return
+        }
+        P_SetMobjState(actor, MOBJ_info_spawnstate(actor))
+        return
+    }
+
+    if (MOBJ_flags(actor) & ENEMY_MF_JUSTATTACKED) != 0 {
+        MOBJ_set_flags(actor, MOBJ_flags(actor) & (0 - 1 - ENEMY_MF_JUSTATTACKED))
+        if STAT_gameskill() != ENEMY_SK_NIGHTMARE and STAT_fastparm() == 0 {
+            enemy_NewChaseDir(actor)
+        }
+        return
+    }
+
+    if MOBJ_info_meleestate(actor) != 0 and enemy_CheckMeleeRange(actor) != 0 {
+        if MOBJ_info_attacksound(actor) != 0 {
+            S_StartSound(actor, MOBJ_info_attacksound(actor))
+        }
+        P_SetMobjState(actor, MOBJ_info_meleestate(actor))
+        return
+    }
+
+    if MOBJ_info_missilestate(actor) != 0 {
+        let skip: i32 = 0
+        if STAT_gameskill() < ENEMY_SK_NIGHTMARE
+            and STAT_fastparm() == 0
+            and MOBJ_movecount(actor) != 0 {
+            skip = 1
+        }
+        if skip == 0 {
+            if enemy_CheckMissileRange(actor) != 0 {
+                P_SetMobjState(actor, MOBJ_info_missilestate(actor))
+                MOBJ_set_flags(actor, MOBJ_flags(actor) | ENEMY_MF_JUSTATTACKED)
+                return
+            }
+        }
+    }
+
+    # nomissile
+    if STAT_netgame() != 0
+        and MOBJ_threshold(actor) == 0
+        and P_CheckSight(actor, MOBJ_target(actor)) == 0 {
+        if enemy_LookForPlayers(actor, 1) != 0 {
+            return
+        }
+    }
+
+    let mc: i32 = MOBJ_movecount(actor) - 1
+    MOBJ_set_movecount(actor, mc)
+    if mc < 0 or enemy_Move(actor) == 0 {
+        enemy_NewChaseDir(actor)
+    }
+
+    if MOBJ_info_activesound(actor) != 0 and P_Random() < 3 {
+        S_StartSound(actor, MOBJ_info_activesound(actor))
+    }
+}
+
+# ---- A_FaceTarget -----------------------------------------------------
+
+@flow_api
+function A_FaceTarget(actor: ptr<void>) -> void {
+    let t: ptr<void> = MOBJ_target(actor)
+    if (t as i64) == 0 {
+        return
+    }
+
+    MOBJ_set_flags(actor, MOBJ_flags(actor) & (0 - 1 - ENEMY_MF_AMBUSH))
+    MOBJ_set_angle(actor, R_PointToAngle2(
+        MOBJ_x(actor), MOBJ_y(actor),
+        MOBJ_x(t), MOBJ_y(t)))
+
+    if (MOBJ_flags(t) & ENEMY_MF_SHADOW) != 0 {
+        let adj: i32 = (P_Random() - P_Random()) << 21
+        MOBJ_set_angle(actor, MOBJ_angle(actor) + (adj as u32))
+    }
+}
+
+# ---- projectile / melee attacks ---------------------------------------
+
+@flow_api
+function A_PosAttack(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        return
+    }
+    A_FaceTarget(actor)
+    let mut angle: u32 = MOBJ_angle(actor)
+    let slope: i32 = P_AimLineAttack(actor, angle, ENEMY_MISSILERANGE)
+    S_StartSound(actor, ENEMY_SFX_PISTOL)
+    let adj: i32 = (P_Random() - P_Random()) << 20
+    angle = angle + (adj as u32)
+    let damage: i32 = ((P_Random() % 5) + 1) * 3
+    P_LineAttack(actor, angle, ENEMY_MISSILERANGE, slope, damage)
+}
+
+@flow_api
+function A_SPosAttack(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        return
+    }
+    S_StartSound(actor, ENEMY_SFX_SHOTGN)
+    A_FaceTarget(actor)
+    let bangle: u32 = MOBJ_angle(actor)
+    let slope: i32 = P_AimLineAttack(actor, bangle, ENEMY_MISSILERANGE)
+    for i in 0 to 3 {
+        let adj: i32 = (P_Random() - P_Random()) << 20
+        let angle: u32 = bangle + (adj as u32)
+        let damage: i32 = ((P_Random() % 5) + 1) * 3
+        P_LineAttack(actor, angle, ENEMY_MISSILERANGE, slope, damage)
+    }
+}
+
+@flow_api
+function A_CPosAttack(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        return
+    }
+    S_StartSound(actor, ENEMY_SFX_SHOTGN)
+    A_FaceTarget(actor)
+    let bangle: u32 = MOBJ_angle(actor)
+    let slope: i32 = P_AimLineAttack(actor, bangle, ENEMY_MISSILERANGE)
+    let adj: i32 = (P_Random() - P_Random()) << 20
+    let angle: u32 = bangle + (adj as u32)
+    let damage: i32 = ((P_Random() % 5) + 1) * 3
+    P_LineAttack(actor, angle, ENEMY_MISSILERANGE, slope, damage)
+}
+
+@flow_api
+function A_CPosRefire(actor: ptr<void>) -> void {
+    A_FaceTarget(actor)
+    if P_Random() < 40 {
+        return
+    }
+    let t: ptr<void> = MOBJ_target(actor)
+    if (t as i64) == 0 or MOBJ_health(t) <= 0 or P_CheckSight(actor, t) == 0 {
+        P_SetMobjState(actor, MOBJ_info_seestate(actor))
+    }
+}
+
+@flow_api
+function A_SpidRefire(actor: ptr<void>) -> void {
+    A_FaceTarget(actor)
+    if P_Random() < 10 {
+        return
+    }
+    let t: ptr<void> = MOBJ_target(actor)
+    if (t as i64) == 0 or MOBJ_health(t) <= 0 or P_CheckSight(actor, t) == 0 {
+        P_SetMobjState(actor, MOBJ_info_seestate(actor))
+    }
+}
+
+@flow_api
+function A_BspiAttack(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        return
+    }
+    A_FaceTarget(actor)
+    P_SpawnMissile(actor, MOBJ_target(actor), ENEMY_MT_ARACHPLAZ)
+}
+
+@flow_api
+function A_TroopAttack(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        return
+    }
+    A_FaceTarget(actor)
+    if enemy_CheckMeleeRange(actor) != 0 {
+        S_StartSound(actor, ENEMY_SFX_CLAW)
+        let damage: i32 = (P_Random() % 8 + 1) * 3
+        P_DamageMobj(MOBJ_target(actor), actor, actor, damage)
+        return
+    }
+    P_SpawnMissile(actor, MOBJ_target(actor), ENEMY_MT_TROOPSHOT)
+}
+
+@flow_api
+function A_SargAttack(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        return
+    }
+    A_FaceTarget(actor)
+    if enemy_CheckMeleeRange(actor) != 0 {
+        let damage: i32 = ((P_Random() % 10) + 1) * 4
+        P_DamageMobj(MOBJ_target(actor), actor, actor, damage)
+    }
+}
+
+@flow_api
+function A_HeadAttack(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        return
+    }
+    A_FaceTarget(actor)
+    if enemy_CheckMeleeRange(actor) != 0 {
+        let damage: i32 = (P_Random() % 6 + 1) * 10
+        P_DamageMobj(MOBJ_target(actor), actor, actor, damage)
+        return
+    }
+    P_SpawnMissile(actor, MOBJ_target(actor), ENEMY_MT_HEADSHOT)
+}
+
+@flow_api
+function A_CyberAttack(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        return
+    }
+    A_FaceTarget(actor)
+    P_SpawnMissile(actor, MOBJ_target(actor), ENEMY_MT_ROCKET)
+}
+
+@flow_api
+function A_BruisAttack(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        return
+    }
+    if enemy_CheckMeleeRange(actor) != 0 {
+        S_StartSound(actor, ENEMY_SFX_CLAW)
+        let damage: i32 = (P_Random() % 8 + 1) * 10
+        P_DamageMobj(MOBJ_target(actor), actor, actor, damage)
+        return
+    }
+    P_SpawnMissile(actor, MOBJ_target(actor), ENEMY_MT_BRUISERSHOT)
+}
+
+@flow_api
+function A_SkelMissile(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        return
+    }
+    A_FaceTarget(actor)
+    MOBJ_set_z(actor, MOBJ_z(actor) + 16 * ENEMY_FRACUNIT)
+    let mo: ptr<void> = P_SpawnMissile(actor, MOBJ_target(actor), ENEMY_MT_TRACER)
+    MOBJ_set_z(actor, MOBJ_z(actor) - 16 * ENEMY_FRACUNIT)
+    MOBJ_set_x(mo, MOBJ_x(mo) + MOBJ_momx(mo))
+    MOBJ_set_y(mo, MOBJ_y(mo) + MOBJ_momy(mo))
+    MOBJ_set_tracer(mo, MOBJ_target(actor))
+}
+
+@flow_api
+function A_Tracer(actor: ptr<void>) -> void {
+    if (STAT_gametic() & 3) != 0 {
+        return
+    }
+
+    P_SpawnPuff(MOBJ_x(actor), MOBJ_y(actor), MOBJ_z(actor))
+
+    let th: ptr<void> = P_SpawnMobj(
+        MOBJ_x(actor) - MOBJ_momx(actor),
+        MOBJ_y(actor) - MOBJ_momy(actor),
+        MOBJ_z(actor), ENEMY_MT_SMOKE)
+    MOBJ_set_momz(th, ENEMY_FRACUNIT)
+    MOBJ_set_tics(th, MOBJ_tics(th) - (P_Random() & 3))
+    if MOBJ_tics(th) < 1 {
+        MOBJ_set_tics(th, 1)
+    }
+
+    let dest: ptr<void> = MOBJ_tracer(actor)
+    if (dest as i64) == 0 or MOBJ_health(dest) <= 0 {
+        return
+    }
+
+    let exact: u32 = R_PointToAngle2(
+        MOBJ_x(actor), MOBJ_y(actor),
+        MOBJ_x(dest), MOBJ_y(dest))
+
+    if exact != MOBJ_angle(actor) {
+        if exact - MOBJ_angle(actor) > ENEMY_ANGLE_HALF {
+            MOBJ_set_angle(actor, MOBJ_angle(actor) - TRACEANGLE)
+            if exact - MOBJ_angle(actor) < ENEMY_ANGLE_HALF {
+                MOBJ_set_angle(actor, exact)
+            }
+        } else {
+            MOBJ_set_angle(actor, MOBJ_angle(actor) + TRACEANGLE)
+            if exact - MOBJ_angle(actor) > ENEMY_ANGLE_HALF {
+                MOBJ_set_angle(actor, exact)
+            }
+        }
+    }
+
+    let an: u32 = MOBJ_angle(actor) >> ENEMY_ANGLETOFINESHIFT
+    MOBJ_set_momx(actor, FixedMul(MOBJ_info_speed(actor), TABLES_finecosine(an as i32)))
+    MOBJ_set_momy(actor, FixedMul(MOBJ_info_speed(actor), TABLES_finesine(an as i32)))
+
+    let mut dist: i32 = P_AproxDistance(
+        MOBJ_x(dest) - MOBJ_x(actor),
+        MOBJ_y(dest) - MOBJ_y(actor))
+    dist = dist / MOBJ_info_speed(actor)
+    if dist < 1 {
+        dist = 1
+    }
+    let slope: i32 = (MOBJ_z(dest) + 40 * ENEMY_FRACUNIT - MOBJ_z(actor)) / dist
+    if slope < MOBJ_momz(actor) {
+        MOBJ_set_momz(actor, MOBJ_momz(actor) - ENEMY_FRACUNIT / 8)
+    } else {
+        MOBJ_set_momz(actor, MOBJ_momz(actor) + ENEMY_FRACUNIT / 8)
+    }
+}
+
+@flow_api
+function A_SkelWhoosh(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        return
+    }
+    A_FaceTarget(actor)
+    S_StartSound(actor, ENEMY_SFX_SKESWG)
+}
+
+@flow_api
+function A_SkelFist(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        return
+    }
+    A_FaceTarget(actor)
+    if enemy_CheckMeleeRange(actor) != 0 {
+        let damage: i32 = ((P_Random() % 10) + 1) * 6
+        S_StartSound(actor, ENEMY_SFX_SKEPCH)
+        P_DamageMobj(MOBJ_target(actor), actor, actor, damage)
+    }
+}
+
+# ---- Arch-vile --------------------------------------------------------
+
+@flow_api
+function PIT_VileCheck(thing: ptr<void>) -> i32 {
+    if (MOBJ_flags(thing) & ENEMY_MF_CORPSE) == 0 {
+        return 1
+    }
+    if MOBJ_tics(thing) != 0 - 1 {
+        return 1
+    }
+    if MOBJ_info_raisestate(thing) == ENEMY_S_NULL {
+        return 1
+    }
+
+    let maxdist: i32 = MOBJ_info_radius(thing) + MOBJINFO_radius(ENEMY_MT_VILE)
+    if abs(MOBJ_x(thing) - viletryx) > maxdist
+        or abs(MOBJ_y(thing) - viletryy) > maxdist {
+        return 1
+    }
+
+    corpsehit = thing
+    MOBJ_set_momx(corpsehit, 0)
+    MOBJ_set_momy(corpsehit, 0)
+    MOBJ_set_height(corpsehit, MOBJ_height(corpsehit) << 2)
+    let check: i32 = P_CheckPosition(corpsehit, MOBJ_x(corpsehit), MOBJ_y(corpsehit))
+    MOBJ_set_height(corpsehit, MOBJ_height(corpsehit) >> 2)
+
+    if check == 0 {
+        return 1
+    }
+    return 0
+}
+
+@flow_api
+function A_VileChase(actor: ptr<void>) -> void {
+    if MOBJ_movedir(actor) != ENEMY_DI_NODIR {
+        let speed: i32 = MOBJ_info_speed(actor)
+        let md: i32 = MOBJ_movedir(actor)
+        viletryx = MOBJ_x(actor) + speed * enemy_xspeed[md]
+        viletryy = MOBJ_y(actor) + speed * enemy_yspeed[md]
+
+        let xl: i32 = (viletryx - GEOM_bmaporgx() - ENEMY_MAXRADIUS * 2) >> ENEMY_MAPBLOCKSHIFT
+        let xh: i32 = (viletryx - GEOM_bmaporgx() + ENEMY_MAXRADIUS * 2) >> ENEMY_MAPBLOCKSHIFT
+        let yl: i32 = (viletryy - GEOM_bmaporgy() - ENEMY_MAXRADIUS * 2) >> ENEMY_MAPBLOCKSHIFT
+        let yh: i32 = (viletryy - GEOM_bmaporgy() + ENEMY_MAXRADIUS * 2) >> ENEMY_MAPBLOCKSHIFT
+
+        let mut bx: i32 = xl
+        while bx <= xh {
+            let mut by: i32 = yl
+            while by <= yh {
+                if P_BlockThingsIterator(bx, by, PIT_VileCheck) == 0 {
+                    let temp: ptr<void> = MOBJ_target(actor)
+                    MOBJ_set_target(actor, corpsehit)
+                    A_FaceTarget(actor)
+                    MOBJ_set_target(actor, temp)
+
+                    P_SetMobjState(actor, ENEMY_S_VILE_HEAL1)
+                    S_StartSound(corpsehit, ENEMY_SFX_SLOP)
+
+                    P_SetMobjState(corpsehit, MOBJ_info_raisestate(corpsehit))
+                    MOBJ_set_height(corpsehit, MOBJ_height(corpsehit) << 2)
+                    MOBJ_set_flags(corpsehit, MOBJ_info_flags(corpsehit))
+                    MOBJ_set_health(corpsehit, MOBJ_info_spawnhealth(corpsehit))
+                    MOBJ_set_target(corpsehit, null)
+                    return
+                }
+                by = by + 1
+            }
+            bx = bx + 1
+        }
+    }
+
+    A_Chase(actor)
+}
+
+@flow_api
+function A_VileStart(actor: ptr<void>) -> void {
+    S_StartSound(actor, ENEMY_SFX_VILATK)
+}
+
+@flow_api
+function A_Fire(actor: ptr<void>) -> void {
+    let dest: ptr<void> = MOBJ_tracer(actor)
+    if (dest as i64) == 0 {
+        return
+    }
+
+    let target: ptr<void> = P_SubstNullMobj(MOBJ_target(actor))
+    if P_CheckSight(target, dest) == 0 {
+        return
+    }
+
+    let an: u32 = MOBJ_angle(dest) >> ENEMY_ANGLETOFINESHIFT
+    P_UnsetThingPosition(actor)
+    MOBJ_set_x(actor, MOBJ_x(dest) + FixedMul(24 * ENEMY_FRACUNIT, TABLES_finecosine(an as i32)))
+    MOBJ_set_y(actor, MOBJ_y(dest) + FixedMul(24 * ENEMY_FRACUNIT, TABLES_finesine(an as i32)))
+    MOBJ_set_z(actor, MOBJ_z(dest))
+    P_SetThingPosition(actor)
+}
+
+@flow_api
+function A_StartFire(actor: ptr<void>) -> void {
+    S_StartSound(actor, ENEMY_SFX_FLAMST)
+    A_Fire(actor)
+}
+
+@flow_api
+function A_FireCrackle(actor: ptr<void>) -> void {
+    S_StartSound(actor, ENEMY_SFX_FLAME)
+    A_Fire(actor)
+}
+
+@flow_api
+function A_VileTarget(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        return
+    }
+    A_FaceTarget(actor)
+    let t: ptr<void> = MOBJ_target(actor)
+    # Vanilla quirk: second spawn arg is target->x (not y).
+    let fog: ptr<void> = P_SpawnMobj(
+        MOBJ_x(t), MOBJ_x(t), MOBJ_z(t), ENEMY_MT_FIRE)
+    MOBJ_set_tracer(actor, fog)
+    MOBJ_set_target(fog, actor)
+    MOBJ_set_tracer(fog, t)
+    A_Fire(fog)
+}
+
+@flow_api
+function A_VileAttack(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        return
+    }
+    A_FaceTarget(actor)
+    if P_CheckSight(actor, MOBJ_target(actor)) == 0 {
+        return
+    }
+
+    S_StartSound(actor, ENEMY_SFX_BAREXP)
+    let t: ptr<void> = MOBJ_target(actor)
+    P_DamageMobj(t, actor, actor, 20)
+    MOBJ_set_momz(t, 1000 * ENEMY_FRACUNIT / MOBJ_info_mass(t))
+
+    let an: u32 = MOBJ_angle(actor) >> ENEMY_ANGLETOFINESHIFT
+    let fire: ptr<void> = MOBJ_tracer(actor)
+    if (fire as i64) == 0 {
+        return
+    }
+    MOBJ_set_x(fire, MOBJ_x(t) - FixedMul(24 * ENEMY_FRACUNIT, TABLES_finecosine(an as i32)))
+    MOBJ_set_y(fire, MOBJ_y(t) - FixedMul(24 * ENEMY_FRACUNIT, TABLES_finesine(an as i32)))
+    P_RadiusAttack(fire, actor, 70)
+}
+
+# ---- Mancubus ---------------------------------------------------------
+
+@flow_api
+function A_FatRaise(actor: ptr<void>) -> void {
+    A_FaceTarget(actor)
+    S_StartSound(actor, ENEMY_SFX_MANATK)
+}
+
+@flow_api
+function A_FatAttack1(actor: ptr<void>) -> void {
+    A_FaceTarget(actor)
+    MOBJ_set_angle(actor, MOBJ_angle(actor) + ENEMY_FATSPREAD)
+    let target: ptr<void> = P_SubstNullMobj(MOBJ_target(actor))
+    P_SpawnMissile(actor, target, ENEMY_MT_FATSHOT)
+    let mo: ptr<void> = P_SpawnMissile(actor, target, ENEMY_MT_FATSHOT)
+    MOBJ_set_angle(mo, MOBJ_angle(mo) + ENEMY_FATSPREAD)
+    let an: u32 = MOBJ_angle(mo) >> ENEMY_ANGLETOFINESHIFT
+    MOBJ_set_momx(mo, FixedMul(MOBJ_info_speed(mo), TABLES_finecosine(an as i32)))
+    MOBJ_set_momy(mo, FixedMul(MOBJ_info_speed(mo), TABLES_finesine(an as i32)))
+}
+
+@flow_api
+function A_FatAttack2(actor: ptr<void>) -> void {
+    A_FaceTarget(actor)
+    MOBJ_set_angle(actor, MOBJ_angle(actor) - ENEMY_FATSPREAD)
+    let target: ptr<void> = P_SubstNullMobj(MOBJ_target(actor))
+    P_SpawnMissile(actor, target, ENEMY_MT_FATSHOT)
+    let mo: ptr<void> = P_SpawnMissile(actor, target, ENEMY_MT_FATSHOT)
+    MOBJ_set_angle(mo, MOBJ_angle(mo) - (ENEMY_FATSPREAD * (2 as u32)))
+    let an: u32 = MOBJ_angle(mo) >> ENEMY_ANGLETOFINESHIFT
+    MOBJ_set_momx(mo, FixedMul(MOBJ_info_speed(mo), TABLES_finecosine(an as i32)))
+    MOBJ_set_momy(mo, FixedMul(MOBJ_info_speed(mo), TABLES_finesine(an as i32)))
+}
+
+@flow_api
+function A_FatAttack3(actor: ptr<void>) -> void {
+    A_FaceTarget(actor)
+    let target: ptr<void> = P_SubstNullMobj(MOBJ_target(actor))
+
+    let mut mo: ptr<void> = P_SpawnMissile(actor, target, ENEMY_MT_FATSHOT)
+    MOBJ_set_angle(mo, MOBJ_angle(mo) - (ENEMY_FATSPREAD >> 1))
+    let mut an: u32 = MOBJ_angle(mo) >> ENEMY_ANGLETOFINESHIFT
+    MOBJ_set_momx(mo, FixedMul(MOBJ_info_speed(mo), TABLES_finecosine(an as i32)))
+    MOBJ_set_momy(mo, FixedMul(MOBJ_info_speed(mo), TABLES_finesine(an as i32)))
+
+    mo = P_SpawnMissile(actor, target, ENEMY_MT_FATSHOT)
+    MOBJ_set_angle(mo, MOBJ_angle(mo) + (ENEMY_FATSPREAD >> 1))
+    an = MOBJ_angle(mo) >> ENEMY_ANGLETOFINESHIFT
+    MOBJ_set_momx(mo, FixedMul(MOBJ_info_speed(mo), TABLES_finecosine(an as i32)))
+    MOBJ_set_momy(mo, FixedMul(MOBJ_info_speed(mo), TABLES_finesine(an as i32)))
+}
+
+# ---- Lost soul / Pain elemental ---------------------------------------
+
+@flow_api
+function A_SkullAttack(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        return
+    }
+    let dest: ptr<void> = MOBJ_target(actor)
+    MOBJ_set_flags(actor, MOBJ_flags(actor) | ENEMY_MF_SKULLFLY)
+    S_StartSound(actor, MOBJ_info_attacksound(actor))
+    A_FaceTarget(actor)
+    let an: u32 = MOBJ_angle(actor) >> ENEMY_ANGLETOFINESHIFT
+    MOBJ_set_momx(actor, FixedMul(ENEMY_SKULLSPEED, TABLES_finecosine(an as i32)))
+    MOBJ_set_momy(actor, FixedMul(ENEMY_SKULLSPEED, TABLES_finesine(an as i32)))
+    let mut dist: i32 = P_AproxDistance(
+        MOBJ_x(dest) - MOBJ_x(actor),
+        MOBJ_y(dest) - MOBJ_y(actor))
+    dist = dist / ENEMY_SKULLSPEED
+    if dist < 1 {
+        dist = 1
+    }
+    MOBJ_set_momz(actor,
+        (MOBJ_z(dest) + (MOBJ_height(dest) >> 1) - MOBJ_z(actor)) / dist)
+}
+
+function enemy_PainShootSkull(actor: ptr<void>, angle: u32) -> void {
+    let mut count: i32 = 0
+    let cap: ptr<void> = THINKER_cap()
+    let mut currentthinker: ptr<void> = THINKER_next(cap)
+    while (currentthinker as i64) != (cap as i64) {
+        if THINKER_is_mobj(currentthinker) != 0
+            and MOBJ_type(currentthinker) == ENEMY_MT_SKULL {
+            count = count + 1
+        }
+        currentthinker = THINKER_next(currentthinker)
+    }
+    if count > 20 {
+        return
+    }
+
+    let an: u32 = angle >> ENEMY_ANGLETOFINESHIFT
+    let prestep: i32 = 4 * ENEMY_FRACUNIT + 3 * (
+        MOBJ_info_radius(actor) + MOBJINFO_radius(ENEMY_MT_SKULL)) / 2
+    let x: i32 = MOBJ_x(actor) + FixedMul(prestep, TABLES_finecosine(an as i32))
+    let y: i32 = MOBJ_y(actor) + FixedMul(prestep, TABLES_finesine(an as i32))
+    let z: i32 = MOBJ_z(actor) + 8 * ENEMY_FRACUNIT
+
+    let newmobj: ptr<void> = P_SpawnMobj(x, y, z, ENEMY_MT_SKULL)
+    if P_TryMove(newmobj, MOBJ_x(newmobj), MOBJ_y(newmobj)) == 0 {
+        P_DamageMobj(newmobj, actor, actor, 10000)
+        return
+    }
+    MOBJ_set_target(newmobj, MOBJ_target(actor))
+    A_SkullAttack(newmobj)
+}
+
+@flow_api
+function A_PainAttack(actor: ptr<void>) -> void {
+    if (MOBJ_target(actor) as i64) == 0 {
+        return
+    }
+    A_FaceTarget(actor)
+    enemy_PainShootSkull(actor, MOBJ_angle(actor))
+}
+
+@flow_api
+function A_PainDie(actor: ptr<void>) -> void {
+    A_Fall(actor)
+    enemy_PainShootSkull(actor, MOBJ_angle(actor) + ENEMY_ANG90)
+    enemy_PainShootSkull(actor, MOBJ_angle(actor) + ENEMY_ANG180)
+    enemy_PainShootSkull(actor, MOBJ_angle(actor) + ENEMY_ANG270)
+}
+
+# ---- death / pain sounds ----------------------------------------------
+
+@flow_api
+function A_Scream(actor: ptr<void>) -> void {
+    let mut sound: i32 = 0
+    let ds: i32 = MOBJ_info_deathsound(actor)
+    if ds == 0 {
+        return
+    }
+    if ds == ENEMY_SFX_PODTH1 or ds == ENEMY_SFX_PODTH2 or ds == ENEMY_SFX_PODTH3 {
+        sound = ENEMY_SFX_PODTH1 + P_Random() % 3
+    } elif ds == ENEMY_SFX_BGDTH1 or ds == ENEMY_SFX_BGDTH2 {
+        sound = ENEMY_SFX_BGDTH1 + P_Random() % 2
+    } else {
+        sound = ds
+    }
+
+    if MOBJ_type(actor) == ENEMY_MT_SPIDER
+        or MOBJ_type(actor) == ENEMY_MT_CYBORG {
+        S_StartSound(null, sound)
+    } else {
+        S_StartSound(actor, sound)
+    }
+}
+
+@flow_api
+function A_XScream(actor: ptr<void>) -> void {
+    S_StartSound(actor, ENEMY_SFX_SLOP)
+}
+
+@flow_api
+function A_Pain(actor: ptr<void>) -> void {
+    if MOBJ_info_painsound(actor) != 0 {
+        S_StartSound(actor, MOBJ_info_painsound(actor))
+    }
+}
+
+@flow_api
+function A_Explode(thingy: ptr<void>) -> void {
+    P_RadiusAttack(thingy, MOBJ_target(thingy), 128)
+}
+
+# ---- Boss death -------------------------------------------------------
+
+function enemy_CheckBossEnd(motype: i32) -> i32 {
+    if STAT_gameversion() < ENEMY_EXE_ULTIMATE {
+        if STAT_gamemap() != 8 {
+            return 0
+        }
+        if motype == ENEMY_MT_BRUISER and STAT_gameepisode() != 1 {
+            return 0
+        }
+        return 1
+    }
+
+    let ep: i32 = STAT_gameepisode()
+    if ep == 1 {
+        if STAT_gamemap() == 8 and motype == ENEMY_MT_BRUISER {
+            return 1
+        }
+        return 0
+    } elif ep == 2 {
+        if STAT_gamemap() == 8 and motype == ENEMY_MT_CYBORG {
+            return 1
+        }
+        return 0
+    } elif ep == 3 {
+        if STAT_gamemap() == 8 and motype == ENEMY_MT_SPIDER {
+            return 1
+        }
+        return 0
+    } elif ep == 4 {
+        if (STAT_gamemap() == 6 and motype == ENEMY_MT_CYBORG)
+            or (STAT_gamemap() == 8 and motype == ENEMY_MT_SPIDER) {
+            return 1
+        }
+        return 0
+    }
+    if STAT_gamemap() == 8 {
+        return 1
+    }
+    return 0
+}
+
+@flow_api
+function A_BossDeath(mo: ptr<void>) -> void {
+    if STAT_gamemode() == ENEMY_COMMERCIAL {
+        if STAT_gamemap() != 7 {
+            return
+        }
+        if MOBJ_type(mo) != ENEMY_MT_FATSO
+            and MOBJ_type(mo) != ENEMY_MT_BABY {
+            return
+        }
+    } else {
+        if enemy_CheckBossEnd(MOBJ_type(mo)) == 0 {
+            return
+        }
+    }
+
+    let mut i: i32 = 0
+    while i < ENEMY_MAXPLAYERS {
+        if STAT_playeringame(i) != 0 and PLAYER_health(PLAYER_at(i)) > 0 {
+            break
+        }
+        i = i + 1
+    }
+    if i == ENEMY_MAXPLAYERS {
+        return
+    }
+
+    let cap: ptr<void> = THINKER_cap()
+    let mut th: ptr<void> = THINKER_next(cap)
+    while (th as i64) != (cap as i64) {
+        if THINKER_is_mobj(th) != 0 {
+            let mo2: ptr<void> = th
+            if (mo2 as i64) != (mo as i64)
+                and MOBJ_type(mo2) == MOBJ_type(mo)
+                and MOBJ_health(mo2) > 0 {
+                return
+            }
+        }
+        th = THINKER_next(th)
+    }
+
+    if STAT_gamemode() == ENEMY_COMMERCIAL {
+        if STAT_gamemap() == 7 {
+            if MOBJ_type(mo) == ENEMY_MT_FATSO {
+                SPEC_ev_do_floor_tag(666, ENEMY_LOWERFLOORTOLOWEST)
+                return
+            }
+            if MOBJ_type(mo) == ENEMY_MT_BABY {
+                SPEC_ev_do_floor_tag(667, ENEMY_RAISETOTEXTURE)
+                return
+            }
+        }
+    } else {
+        let ep: i32 = STAT_gameepisode()
+        if ep == 1 {
+            SPEC_ev_do_floor_tag(666, ENEMY_LOWERFLOORTOLOWEST)
+            return
+        }
+        if ep == 4 {
+            if STAT_gamemap() == 6 {
+                SPEC_ev_do_door_tag(666, ENEMY_VLD_BLAZEOPEN)
+                return
+            }
+            if STAT_gamemap() == 8 {
+                SPEC_ev_do_floor_tag(666, ENEMY_LOWERFLOORTOLOWEST)
+                return
+            }
+        }
+    }
+
+    G_ExitLevel()
+}
+
+@flow_api
+function A_Hoof(mo: ptr<void>) -> void {
+    S_StartSound(mo, ENEMY_SFX_HOOF)
+    A_Chase(mo)
+}
+
+@flow_api
+function A_Metal(mo: ptr<void>) -> void {
+    S_StartSound(mo, ENEMY_SFX_METAL)
+    A_Chase(mo)
+}
+
+@flow_api
+function A_BabyMetal(mo: ptr<void>) -> void {
+    S_StartSound(mo, ENEMY_SFX_BSPWLK)
+    A_Chase(mo)
+}
+
+@flow_api
+function A_OpenShotgun2(player: ptr<void>, psp: ptr<void>) -> void {
+    S_StartSound(PLAYER_mo(player), ENEMY_SFX_DBOPN)
+}
+
+@flow_api
+function A_LoadShotgun2(player: ptr<void>, psp: ptr<void>) -> void {
+    S_StartSound(PLAYER_mo(player), ENEMY_SFX_DBLOAD)
+}
+
+@flow_api
+function A_CloseShotgun2(player: ptr<void>, psp: ptr<void>) -> void {
+    S_StartSound(PLAYER_mo(player), ENEMY_SFX_DBCLS)
+    A_ReFire(player, psp)
+}
+
+# ---- Boss brain -------------------------------------------------------
+
+@flow_api
+function A_BrainAwake(mo: ptr<void>) -> void {
+    enemy_numbraintargets = 0
+    enemy_braintargeton = 0
+
+    let cap: ptr<void> = THINKER_cap()
+    let mut thinker: ptr<void> = THINKER_next(cap)
+    while (thinker as i64) != (cap as i64) {
+        if THINKER_is_mobj(thinker) != 0 {
+            let m: ptr<void> = thinker
+            if MOBJ_type(m) == ENEMY_MT_BOSSTARGET {
+                let n: i32 = enemy_numbraintargets
+                enemy_braintargets[n] = m
+                enemy_numbraintargets = n + 1
+            }
+        }
+        thinker = THINKER_next(thinker)
+    }
+    S_StartSound(null, ENEMY_SFX_BOSSIT)
+}
+
+@flow_api
+function A_BrainPain(mo: ptr<void>) -> void {
+    S_StartSound(null, ENEMY_SFX_BOSPN)
+}
+
+@flow_api
+function A_BrainScream(mo: ptr<void>) -> void {
+    let mut x: i32 = MOBJ_x(mo) - 196 * ENEMY_FRACUNIT
+    while x < MOBJ_x(mo) + 320 * ENEMY_FRACUNIT {
+        let y: i32 = MOBJ_y(mo) - 320 * ENEMY_FRACUNIT
+        let z: i32 = 128 + P_Random() * 2 * ENEMY_FRACUNIT
+        let th: ptr<void> = P_SpawnMobj(x, y, z, ENEMY_MT_ROCKET)
+        MOBJ_set_momz(th, P_Random() * 512)
+        P_SetMobjState(th, ENEMY_S_BRAINEXPLODE1)
+        MOBJ_set_tics(th, MOBJ_tics(th) - (P_Random() & 7))
+        if MOBJ_tics(th) < 1 {
+            MOBJ_set_tics(th, 1)
+        }
+        x = x + ENEMY_FRACUNIT * 8
+    }
+    S_StartSound(null, ENEMY_SFX_BOSDTH)
+}
+
+@flow_api
+function A_BrainExplode(mo: ptr<void>) -> void {
+    let x: i32 = MOBJ_x(mo) + (P_Random() - P_Random()) * 2048
+    let y: i32 = MOBJ_y(mo)
+    let z: i32 = 128 + P_Random() * 2 * ENEMY_FRACUNIT
+    let th: ptr<void> = P_SpawnMobj(x, y, z, ENEMY_MT_ROCKET)
+    MOBJ_set_momz(th, P_Random() * 512)
+    P_SetMobjState(th, ENEMY_S_BRAINEXPLODE1)
+    MOBJ_set_tics(th, MOBJ_tics(th) - (P_Random() & 7))
+    if MOBJ_tics(th) < 1 {
+        MOBJ_set_tics(th, 1)
+    }
+}
+
+@flow_api
+function A_BrainDie(mo: ptr<void>) -> void {
+    G_ExitLevel()
+}
+
+@flow_api
+function A_BrainSpit(mo: ptr<void>) -> void {
+    enemy_brain_easy = enemy_brain_easy ^ 1
+    if STAT_gameskill() <= ENEMY_SK_EASY and enemy_brain_easy == 0 {
+        return
+    }
+
+    let targ: ptr<void> = enemy_braintargets[enemy_braintargeton]
+    let n: i32 = enemy_numbraintargets
+    enemy_braintargeton = (enemy_braintargeton + 1) % n
+
+    let newmobj: ptr<void> = P_SpawnMissile(mo, targ, ENEMY_MT_SPAWNSHOT)
+    MOBJ_set_target(newmobj, targ)
+    MOBJ_set_reactiontime(newmobj,
+        ((MOBJ_y(targ) - MOBJ_y(mo)) / MOBJ_momy(newmobj))
+        / STATE_tics(MOBJ_state(newmobj)))
+    S_StartSound(null, ENEMY_SFX_BOSPIT)
+}
+
+@flow_api
+function A_SpawnFly(mo: ptr<void>) -> void {
+    let rt: i32 = MOBJ_reactiontime(mo) - 1
+    MOBJ_set_reactiontime(mo, rt)
+    if rt != 0 {
+        return
+    }
+
+    let targ: ptr<void> = P_SubstNullMobj(MOBJ_target(mo))
+    let fog: ptr<void> = P_SpawnMobj(
+        MOBJ_x(targ), MOBJ_y(targ), MOBJ_z(targ), ENEMY_MT_SPAWNFIRE)
+    S_StartSound(fog, ENEMY_SFX_TELEPT)
+
+    let r: i32 = P_Random()
+    let mut typ: i32 = ENEMY_MT_BRUISER
+    if r < 50 {
+        typ = ENEMY_MT_TROOP
+    } elif r < 90 {
+        typ = ENEMY_MT_SERGEANT
+    } elif r < 120 {
+        typ = ENEMY_MT_SHADOWS
+    } elif r < 130 {
+        typ = ENEMY_MT_PAIN
+    } elif r < 160 {
+        typ = ENEMY_MT_HEAD
+    } elif r < 162 {
+        typ = ENEMY_MT_VILE
+    } elif r < 172 {
+        typ = ENEMY_MT_UNDEAD
+    } elif r < 192 {
+        typ = ENEMY_MT_BABY
+    } elif r < 222 {
+        typ = ENEMY_MT_FATSO
+    } elif r < 246 {
+        typ = ENEMY_MT_KNIGHT
+    } else {
+        typ = ENEMY_MT_BRUISER
+    }
+
+    let newmobj: ptr<void> = P_SpawnMobj(
+        MOBJ_x(targ), MOBJ_y(targ), MOBJ_z(targ), typ)
+    if enemy_LookForPlayers(newmobj, 1) != 0 {
+        P_SetMobjState(newmobj, MOBJ_info_seestate(newmobj))
+    }
+    P_TeleportMove(newmobj, MOBJ_x(newmobj), MOBJ_y(newmobj))
+    P_RemoveMobj(mo)
+}
+
+@flow_api
+function A_SpawnSound(mo: ptr<void>) -> void {
+    S_StartSound(mo, ENEMY_SFX_BOSCUB)
+    A_SpawnFly(mo)
+}
+
+@flow_api
+function A_PlayerScream(mo: ptr<void>) -> void {
+    let mut sound: i32 = ENEMY_SFX_PLDETH
+    if STAT_gamemode() == ENEMY_COMMERCIAL and MOBJ_health(mo) < 0 - 50 {
+        sound = ENEMY_SFX_PDIEHI
+    }
+    S_StartSound(mo, sound)
+}

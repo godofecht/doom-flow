@@ -1,0 +1,693 @@
+# BSP traversal for rendering, ported from r_bsp.c to Flow.
+#
+# drawsegs / ds_p and curline/sidedef/linedef/frontsector/backsector are
+# Flow-owned let mut state with @flow_api BSP_* accessors. drawseg_t fields
+# use explicit LP64 offsets. The private clip list uses a Flow Cliprange
+# struct (was cliprange_t) on a heap array.
+#
+# drawseg_t (LP64, sizeof 64):
+#   curline @0  x1 @8  x2 @12  scale1 @16  scale2 @20  scalestep @24
+#   silhouette @28  bsilheight @32  tsilheight @36
+#   sprtopclip @40  sprbottomclip @48  maskedtexturecol @56
+
+extern { function calloc(n: i64, sz: i64) -> ptr<void> }
+extern { function I_Error(msg: string) -> void }
+
+extern { function R_PointToAngle(x: i32, y: i32) -> u32 }
+extern { function R_PointOnSide(x: i32, y: i32, node: ptr<void>) -> i32 }
+extern { function R_StoreWallRange(start: i32, stop: i32) -> void }
+extern { function R_AddSprites(sec: ptr<void>) -> void }
+extern { function R_FindPlane(height: i32, picnum: i32, lightlevel: i32) -> ptr<void> }
+extern { function DRAW_viewwidth() -> i32 }
+extern { function RMAIN_viewx() -> i32 }
+extern { function RMAIN_viewy() -> i32 }
+extern { function RMAIN_viewz() -> i32 }
+extern { function RMAIN_viewangle() -> u32 }
+extern { function RMAIN_clipangle() -> u32 }
+extern { function RMAIN_viewangletox(angle: i32) -> i32 }
+extern { function SKY_skyflatnum() -> i32 }
+
+extern { function GEOM_numsubsectors() -> i32 }
+extern { function GEOM_seg(i: i32) -> ptr<void> }
+extern { function GEOM_subsector(num: i32) -> ptr<void> }
+extern { function GEOM_node(i: i32) -> ptr<void> }
+extern { function segshim_rw_angle1_addr() -> ptr<i32> }
+extern { function rmainshim_sscount_addr() -> ptr<i32> }
+extern { function GEOM_seg_v1(seg: ptr<void>) -> ptr<void> }
+extern { function GEOM_seg_v2(seg: ptr<void>) -> ptr<void> }
+extern { function GEOM_seg_backsector(seg: ptr<void>) -> ptr<void> }
+extern { function GEOM_seg_sidedef(seg: ptr<void>) -> ptr<void> }
+
+extern { function GEOM_sector_floorheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_ceilingheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_floorpic(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_ceilingpic(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_lightlevel(s: ptr<void>) -> i32 }
+
+extern { function GEOM_subsector_sector(ss: ptr<void>) -> ptr<void> }
+extern { function GEOM_subsector_numlines(ss: ptr<void>) -> i32 }
+extern { function GEOM_subsector_firstline(ss: ptr<void>) -> i32 }
+
+extern { function GEOM_node_i_child(i: i32, side: i32) -> i32 }
+extern { function GEOM_node_i_bbox(i: i32, side: i32) -> ptr<i32> }
+
+extern { function PLANES_set_floorplane(p: ptr<void>) -> void }
+extern { function PLANES_set_ceilingplane(p: ptr<void>) -> void }
+extern { function GEOM_side_midtexture(sd: ptr<void>) -> i32 }
+extern { function GEOM_vertex_x(v: ptr<void>) -> i32 }
+extern { function GEOM_vertex_y(v: ptr<void>) -> i32 }
+
+# ---- constants --------------------------------------------------------
+
+# tables.h / doomdata.h / m_bbox.h / r_bsp.c
+const BSP_ANGLETOFINESHIFT: i32 = 19
+const BSP_ANG90: u32 = 1073741824 as u32       # 0x40000000
+const BSP_ANG180: u32 = 2147483648 as u32      # 0x80000000
+const BSP_NF_SUBSECTOR: i32 = 32768            # 0x8000
+const BSP_MAXSEGS: i32 = 32
+const BSP_MAXDRAWSEGS: i32 = 256
+const BSP_SIZEOF_DRAWSEG: i32 = 64
+const BSP_SIZEOF_CLIPRANGE: i32 = 8
+const BSP_BOXLEFT: i32 = 2
+const BSP_BOXRIGHT: i32 = 3
+const BSP_BOXTOP: i32 = 0
+const BSP_BOXBOTTOM: i32 = 1
+
+# Private clip post (was cliprange_t in r_bsp.c).
+struct Cliprange {
+    first: i32,
+    last: i32
+}
+
+# checkcoord[12][4] flattened row-major.
+let mut bsp_checkcoord: array<i32, 48> = [
+    3, 0, 2, 1,
+    3, 0, 2, 0,
+    3, 1, 2, 0,
+    0, 0, 0, 0,
+    2, 0, 2, 1,
+    0, 0, 0, 0,
+    3, 1, 3, 0,
+    0, 0, 0, 0,
+    2, 0, 3, 1,
+    2, 1, 3, 1,
+    2, 1, 3, 0,
+    0, 0, 0, 0
+]
+
+let mut solidsegs: ptr<Cliprange> = null
+let mut newend: i32 = 0
+
+let mut bsp_drawsegs: ptr<u8> = null
+let mut bsp_ds_p: ptr<u8> = null
+let mut bsp_curline: ptr<void> = null
+let mut bsp_sidedef: ptr<void> = null
+let mut bsp_linedef: ptr<void> = null
+let mut bsp_frontsector: ptr<void> = null
+let mut bsp_backsector: ptr<void> = null
+
+function bsp_ensure_drawsegs() -> void {
+    if (bsp_drawsegs as i64) == 0 {
+        bsp_drawsegs = calloc(BSP_MAXDRAWSEGS as i64, BSP_SIZEOF_DRAWSEG as i64) as ptr<u8>
+    }
+}
+
+function bsp_drawseg_at(i: i32) -> ptr<void> {
+    return ((bsp_drawsegs as i64) + (i as i64) * (BSP_SIZEOF_DRAWSEG as i64)) as ptr<void>
+}
+
+function bsp_ds_i32(ds: ptr<void>, off: i32) -> i32 {
+    let p: ptr<i32> = ((ds as i64) + off as i64) as ptr<i32>
+    return p[0]
+}
+
+function bsp_ds_set_i32(ds: ptr<void>, off: i32, v: i32) -> void {
+    let p: ptr<i32> = ((ds as i64) + off as i64) as ptr<i32>
+    p[0] = v
+}
+
+function bsp_ds_ptr(ds: ptr<void>, off: i32) -> ptr<void> {
+    let p: ptr<i64> = ((ds as i64) + off as i64) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+function bsp_ds_set_ptr(ds: ptr<void>, off: i32, v: ptr<void>) -> void {
+    let p: ptr<i64> = ((ds as i64) + off as i64) as ptr<i64>
+    p[0] = v as i64
+}
+
+function bsp_ensure() -> void {
+    if (solidsegs as i64) == 0 {
+        solidsegs = calloc(BSP_MAXSEGS as i64, BSP_SIZEOF_CLIPRANGE as i64) as ptr<Cliprange>
+    }
+}
+
+function bsp_seg_at(i: i32) -> ptr<Cliprange> {
+    return ((solidsegs as i64) + (i as i64) * (BSP_SIZEOF_CLIPRANGE as i64)) as ptr<Cliprange>
+}
+
+
+# Shared drawsegs / ds_p / wall-pointer APIs (Flow-owned).
+
+@flow_api
+function BSP_set_ds_p_to_drawsegs() -> void {
+    bsp_ensure_drawsegs()
+    bsp_ds_p = bsp_drawsegs
+}
+
+@flow_api
+function BSP_drawsegs_overflow() -> i32 {
+    bsp_ensure_drawsegs()
+    if (bsp_ds_p as i64) == ((bsp_drawsegs as i64) + (BSP_MAXDRAWSEGS as i64) * (BSP_SIZEOF_DRAWSEG as i64)) {
+        return 1
+    }
+    return 0
+}
+
+@flow_api
+function BSP_ds_full() -> i32 {
+    return BSP_drawsegs_overflow()
+}
+
+@flow_api
+function BSP_ds_count() -> i32 {
+    return ((bsp_ds_p as i64) - (bsp_drawsegs as i64)) / (BSP_SIZEOF_DRAWSEG as i64) as i32
+}
+
+@flow_api
+function BSP_ds_p() -> ptr<void> {
+    return bsp_ds_p as ptr<void>
+}
+
+@flow_api
+function BSP_ds_advance() -> void {
+    bsp_ds_p = (bsp_ds_p as i64 + BSP_SIZEOF_DRAWSEG as i64) as ptr<u8>
+}
+
+@flow_api
+function BSP_drawseg(i: i32) -> ptr<void> {
+    return bsp_drawseg_at(i)
+}
+
+@flow_api
+function BSP_ds_x1(ds: ptr<void>) -> i32 { return bsp_ds_i32(ds, 8) }
+
+@flow_api
+function BSP_ds_set_x1(ds: ptr<void>, v: i32) -> void { bsp_ds_set_i32(ds, 8, v) }
+
+@flow_api
+function BSP_ds_x2(ds: ptr<void>) -> i32 { return bsp_ds_i32(ds, 12) }
+
+@flow_api
+function BSP_ds_set_x2(ds: ptr<void>, v: i32) -> void { bsp_ds_set_i32(ds, 12, v) }
+
+@flow_api
+function BSP_ds_scale1(ds: ptr<void>) -> i32 { return bsp_ds_i32(ds, 16) }
+
+@flow_api
+function BSP_ds_set_scale1(ds: ptr<void>, v: i32) -> void { bsp_ds_set_i32(ds, 16, v) }
+
+@flow_api
+function BSP_ds_scale2(ds: ptr<void>) -> i32 { return bsp_ds_i32(ds, 20) }
+
+@flow_api
+function BSP_ds_set_scale2(ds: ptr<void>, v: i32) -> void { bsp_ds_set_i32(ds, 20, v) }
+
+@flow_api
+function BSP_ds_scalestep(ds: ptr<void>) -> i32 { return bsp_ds_i32(ds, 24) }
+
+@flow_api
+function BSP_ds_set_scalestep(ds: ptr<void>, v: i32) -> void { bsp_ds_set_i32(ds, 24, v) }
+
+@flow_api
+function BSP_ds_curline(ds: ptr<void>) -> ptr<void> { return bsp_ds_ptr(ds, 0) }
+
+@flow_api
+function BSP_ds_set_curline(ds: ptr<void>, seg: ptr<void>) -> void { bsp_ds_set_ptr(ds, 0, seg) }
+
+@flow_api
+function BSP_ds_silhouette(ds: ptr<void>) -> i32 { return bsp_ds_i32(ds, 28) }
+
+@flow_api
+function BSP_ds_set_silhouette(ds: ptr<void>, v: i32) -> void { bsp_ds_set_i32(ds, 28, v) }
+
+@flow_api
+function BSP_ds_or_silhouette(ds: ptr<void>, bits: i32) -> void {
+    bsp_ds_set_i32(ds, 28, bsp_ds_i32(ds, 28) | bits)
+}
+
+@flow_api
+function BSP_ds_bsilheight(ds: ptr<void>) -> i32 { return bsp_ds_i32(ds, 32) }
+
+@flow_api
+function BSP_ds_set_bsilheight(ds: ptr<void>, v: i32) -> void { bsp_ds_set_i32(ds, 32, v) }
+
+@flow_api
+function BSP_ds_tsilheight(ds: ptr<void>) -> i32 { return bsp_ds_i32(ds, 36) }
+
+@flow_api
+function BSP_ds_set_tsilheight(ds: ptr<void>, v: i32) -> void { bsp_ds_set_i32(ds, 36, v) }
+
+@flow_api
+function BSP_ds_sprtopclip(ds: ptr<void>) -> ptr<void> { return bsp_ds_ptr(ds, 40) }
+
+@flow_api
+function BSP_ds_set_sprtopclip(ds: ptr<void>, p: ptr<void>) -> void { bsp_ds_set_ptr(ds, 40, p) }
+
+@flow_api
+function BSP_ds_sprbottomclip(ds: ptr<void>) -> ptr<void> { return bsp_ds_ptr(ds, 48) }
+
+@flow_api
+function BSP_ds_set_sprbottomclip(ds: ptr<void>, p: ptr<void>) -> void { bsp_ds_set_ptr(ds, 48, p) }
+
+@flow_api
+function BSP_ds_maskedtexturecol(ds: ptr<void>) -> ptr<void> { return bsp_ds_ptr(ds, 56) }
+
+@flow_api
+function BSP_ds_set_maskedtexturecol(ds: ptr<void>, p: ptr<void>) -> void { bsp_ds_set_ptr(ds, 56, p) }
+
+@flow_api
+function BSP_set_curline(p: ptr<void>) -> void { bsp_curline = p }
+
+@flow_api
+function BSP_curline() -> ptr<void> { return bsp_curline }
+
+@flow_api
+function BSP_set_sidedef(p: ptr<void>) -> void { bsp_sidedef = p }
+
+@flow_api
+function BSP_sidedef() -> ptr<void> { return bsp_sidedef }
+
+@flow_api
+function BSP_set_linedef(p: ptr<void>) -> void { bsp_linedef = p }
+
+@flow_api
+function BSP_linedef() -> ptr<void> { return bsp_linedef }
+
+@flow_api
+function BSP_set_frontsector(p: ptr<void>) -> void { bsp_frontsector = p }
+
+@flow_api
+function BSP_frontsector() -> ptr<void> { return bsp_frontsector }
+
+@flow_api
+function BSP_set_backsector(p: ptr<void>) -> void { bsp_backsector = p }
+
+@flow_api
+function BSP_backsector() -> ptr<void> { return bsp_backsector }
+
+@flow_api
+function BSP_bind_sidedef_linedef() -> void {
+    bsp_sidedef = GEOM_seg_sidedef(bsp_curline)
+    bsp_linedef = GEOM_seg_linedef(bsp_curline)
+}
+
+@flow_api
+function BSP_bind_from_drawseg(ds: ptr<void>) -> void {
+    bsp_curline = BSP_ds_curline(ds)
+    bsp_frontsector = GEOM_seg_frontsector(bsp_curline)
+    bsp_backsector = GEOM_seg_backsector(bsp_curline)
+}
+
+#
+# R_ClearDrawSegs
+#
+@flow_api
+function R_ClearDrawSegs() -> void {
+    BSP_set_ds_p_to_drawsegs()
+}
+
+#
+# R_ClipSolidWallSegment
+# Solid walls (single-sided / closed) — update the clip list.
+#
+function R_ClipSolidWallSegment(first: i32, last: i32) -> void {
+    bsp_ensure()
+
+    # Find the first range that touches the range (adjacent pixels count).
+    let mut start: i32 = 0
+    while bsp_seg_at(start)[0].last < first - 1 {
+        start = start + 1
+    }
+
+    if first < bsp_seg_at(start)[0].first {
+        if last < bsp_seg_at(start)[0].first - 1 {
+            # Entirely visible above start — insert a new clippost.
+            R_StoreWallRange(first, last)
+            let mut next: i32 = newend
+            newend = newend + 1
+            while next != start {
+                bsp_seg_at(next)[0] = bsp_seg_at(next - 1)[0]
+                next = next - 1
+            }
+            bsp_seg_at(next)[0].first = first
+            bsp_seg_at(next)[0].last = last
+            return
+        }
+
+        # Fragment above *start.
+        R_StoreWallRange(first, bsp_seg_at(start)[0].first - 1)
+        bsp_seg_at(start)[0].first = first
+    }
+
+    # Bottom contained in start?
+    if last <= bsp_seg_at(start)[0].last {
+        return
+    }
+
+    let mut next2: i32 = start
+    while last >= bsp_seg_at(next2 + 1)[0].first - 1 {
+        R_StoreWallRange(bsp_seg_at(next2)[0].last + 1, bsp_seg_at(next2 + 1)[0].first - 1)
+        next2 = next2 + 1
+
+        if last <= bsp_seg_at(next2)[0].last {
+            bsp_seg_at(start)[0].last = bsp_seg_at(next2)[0].last
+            # crunch: remove start+1 .. next2
+            if next2 == start {
+                return
+            }
+            let mut n: i32 = next2
+            while true {
+                let tmp: i32 = n
+                n = n + 1
+                if tmp == newend {
+                    break
+                }
+                start = start + 1
+                bsp_seg_at(start)[0] = bsp_seg_at(n)[0]
+            }
+            newend = start + 1
+            return
+        }
+    }
+
+    # Fragment after *next.
+    R_StoreWallRange(bsp_seg_at(next2)[0].last + 1, last)
+    bsp_seg_at(start)[0].last = last
+
+    # crunch
+    if next2 == start {
+        return
+    }
+    let mut n2: i32 = next2
+    while true {
+        let tmp2: i32 = n2
+        n2 = n2 + 1
+        if tmp2 == newend {
+            break
+        }
+        start = start + 1
+        bsp_seg_at(start)[0] = bsp_seg_at(n2)[0]
+    }
+    newend = start + 1
+}
+
+#
+# R_ClipPassWallSegment
+# Windows — do not add to the solid clip list.
+#
+function R_ClipPassWallSegment(first: i32, last: i32) -> void {
+    bsp_ensure()
+
+    let mut start: i32 = 0
+    while bsp_seg_at(start)[0].last < first - 1 {
+        start = start + 1
+    }
+
+    if first < bsp_seg_at(start)[0].first {
+        if last < bsp_seg_at(start)[0].first - 1 {
+            R_StoreWallRange(first, last)
+            return
+        }
+        R_StoreWallRange(first, bsp_seg_at(start)[0].first - 1)
+    }
+
+    if last <= bsp_seg_at(start)[0].last {
+        return
+    }
+
+    while last >= bsp_seg_at(start + 1)[0].first - 1 {
+        R_StoreWallRange(bsp_seg_at(start)[0].last + 1, bsp_seg_at(start + 1)[0].first - 1)
+        start = start + 1
+        if last <= bsp_seg_at(start)[0].last {
+            return
+        }
+    }
+
+    R_StoreWallRange(bsp_seg_at(start)[0].last + 1, last)
+}
+
+#
+# R_ClearClipSegs
+#
+@flow_api
+function R_ClearClipSegs() -> void {
+    bsp_ensure()
+    # C: solidsegs[0].first = -0x7fffffff;
+    bsp_seg_at(0)[0].first = 0 - 2147483647
+    bsp_seg_at(0)[0].last = 0 - 1
+    bsp_seg_at(1)[0].first = DRAW_viewwidth()
+    bsp_seg_at(1)[0].last = 2147483647             # 0x7fffffff
+    newend = 2
+}
+
+#
+# R_AddLine
+# Clip a segment and add visible pieces.
+#
+function R_AddLine(line: ptr<void>) -> void {
+    BSP_set_curline(line)
+
+    let v1: ptr<void> = GEOM_seg_v1(line)
+    let v2: ptr<void> = GEOM_seg_v2(line)
+    let mut angle1: u32 = R_PointToAngle(GEOM_vertex_x(v1), GEOM_vertex_y(v1))
+    let mut angle2: u32 = R_PointToAngle(GEOM_vertex_x(v2), GEOM_vertex_y(v2))
+
+    let span: u32 = angle1 - angle2
+
+    # Back side? backface cull
+    if span >= BSP_ANG180 {
+        return
+    }
+
+    segshim_rw_angle1_addr()[0] = angle1 as i32
+    angle1 = angle1 - RMAIN_viewangle()
+    angle2 = angle2 - RMAIN_viewangle()
+
+    let clip: u32 = RMAIN_clipangle()
+    let two_clip: u32 = clip + clip
+
+    let mut tspan: u32 = angle1 + clip
+    if tspan > two_clip {
+        tspan = tspan - two_clip
+        if tspan >= span {
+            return
+        }
+        angle1 = clip
+    }
+    tspan = clip - angle2
+    if tspan > two_clip {
+        tspan = tspan - two_clip
+        if tspan >= span {
+            return
+        }
+        angle2 = 0 as u32 - clip
+    }
+
+    let a1: i32 = ((angle1 + BSP_ANG90) >> (BSP_ANGLETOFINESHIFT as u32)) as i32
+    let a2: i32 = ((angle2 + BSP_ANG90) >> (BSP_ANGLETOFINESHIFT as u32)) as i32
+    let x1: i32 = RMAIN_viewangletox(a1)
+    let x2: i32 = RMAIN_viewangletox(a2)
+
+    if x1 == x2 {
+        return
+    }
+
+    let back: ptr<void> = GEOM_seg_backsector(line)
+    BSP_set_backsector(back)
+
+    let front: ptr<void> = BSP_frontsector()
+
+    if (back as i64) == 0 {
+        R_ClipSolidWallSegment(x1, x2 - 1)
+        return
+    }
+
+    # Closed door.
+    if GEOM_sector_ceilingheight(back) <= GEOM_sector_floorheight(front)
+        or GEOM_sector_floorheight(back) >= GEOM_sector_ceilingheight(front) {
+        R_ClipSolidWallSegment(x1, x2 - 1)
+        return
+    }
+
+    # Window.
+    if GEOM_sector_ceilingheight(back) != GEOM_sector_ceilingheight(front)
+        or GEOM_sector_floorheight(back) != GEOM_sector_floorheight(front) {
+        R_ClipPassWallSegment(x1, x2 - 1)
+        return
+    }
+
+    # Reject empty trigger lines.
+    if GEOM_sector_ceilingpic(back) == GEOM_sector_ceilingpic(front)
+        and GEOM_sector_floorpic(back) == GEOM_sector_floorpic(front)
+        and GEOM_sector_lightlevel(back) == GEOM_sector_lightlevel(front)
+        and GEOM_side_midtexture(GEOM_seg_sidedef(BSP_curline())) == 0 {
+        return
+    }
+
+    R_ClipPassWallSegment(x1, x2 - 1)
+}
+
+#
+# R_CheckBBox
+# Returns 1 if some part of the bbox might be visible.
+#
+function R_CheckBBox(bspcoord: ptr<i32>) -> i32 {
+    bsp_ensure()
+
+    let mut boxx: i32 = 0
+    let mut boxy: i32 = 0
+
+    if RMAIN_viewx() <= bspcoord[BSP_BOXLEFT] {
+        boxx = 0
+    } elif RMAIN_viewx() < bspcoord[BSP_BOXRIGHT] {
+        boxx = 1
+    } else {
+        boxx = 2
+    }
+
+    if RMAIN_viewy() >= bspcoord[BSP_BOXTOP] {
+        boxy = 0
+    } elif RMAIN_viewy() > bspcoord[BSP_BOXBOTTOM] {
+        boxy = 1
+    } else {
+        boxy = 2
+    }
+
+    let boxpos: i32 = (boxy << 2) + boxx
+    if boxpos == 5 {
+        return 1
+    }
+
+    let base: i32 = boxpos * 4
+    let x1: i32 = bspcoord[bsp_checkcoord[base + 0]]
+    let y1: i32 = bspcoord[bsp_checkcoord[base + 1]]
+    let x2: i32 = bspcoord[bsp_checkcoord[base + 2]]
+    let y2: i32 = bspcoord[bsp_checkcoord[base + 3]]
+
+    let mut angle1: u32 = R_PointToAngle(x1, y1) - RMAIN_viewangle()
+    let mut angle2: u32 = R_PointToAngle(x2, y2) - RMAIN_viewangle()
+
+    let span: u32 = angle1 - angle2
+    if span >= BSP_ANG180 {
+        return 1
+    }
+
+    let clip: u32 = RMAIN_clipangle()
+    let two_clip: u32 = clip + clip
+
+    let mut tspan: u32 = angle1 + clip
+    if tspan > two_clip {
+        tspan = tspan - two_clip
+        if tspan >= span {
+            return 0
+        }
+        angle1 = clip
+    }
+    tspan = clip - angle2
+    if tspan > two_clip {
+        tspan = tspan - two_clip
+        if tspan >= span {
+            return 0
+        }
+        angle2 = 0 as u32 - clip
+    }
+
+    let a1: i32 = ((angle1 + BSP_ANG90) >> (BSP_ANGLETOFINESHIFT as u32)) as i32
+    let a2: i32 = ((angle2 + BSP_ANG90) >> (BSP_ANGLETOFINESHIFT as u32)) as i32
+    let sx1: i32 = RMAIN_viewangletox(a1)
+    let mut sx2: i32 = RMAIN_viewangletox(a2)
+
+    if sx1 == sx2 {
+        return 0
+    }
+    sx2 = sx2 - 1
+
+    let mut start: i32 = 0
+    while bsp_seg_at(start)[0].last < sx2 {
+        start = start + 1
+    }
+
+    if sx1 >= bsp_seg_at(start)[0].first and sx2 <= bsp_seg_at(start)[0].last {
+        return 0
+    }
+
+    return 1
+}
+
+#
+# R_Subsector
+#
+function R_Subsector(num: i32) -> void {
+    # RANGECHECK
+    if num >= GEOM_numsubsectors() {
+        I_Error("R_Subsector: bad num")
+    }
+
+    rmainshim_sscount_addr()[0] = rmainshim_sscount_addr()[0] + 1
+    let sub: ptr<void> = GEOM_subsector(num)
+    let front: ptr<void> = GEOM_subsector_sector(sub)
+    BSP_set_frontsector(front)
+
+    let mut count: i32 = GEOM_subsector_numlines(sub)
+    let mut segi: i32 = GEOM_subsector_firstline(sub)
+
+    if GEOM_sector_floorheight(front) < RMAIN_viewz() {
+        PLANES_set_floorplane(R_FindPlane(
+            GEOM_sector_floorheight(front),
+            GEOM_sector_floorpic(front),
+            GEOM_sector_lightlevel(front)))
+    } else {
+        PLANES_set_floorplane(null)
+    }
+
+    if GEOM_sector_ceilingheight(front) > RMAIN_viewz()
+        or GEOM_sector_ceilingpic(front) == SKY_skyflatnum() {
+        PLANES_set_ceilingplane(R_FindPlane(
+            GEOM_sector_ceilingheight(front),
+            GEOM_sector_ceilingpic(front),
+            GEOM_sector_lightlevel(front)))
+    } else {
+        PLANES_set_ceilingplane(null)
+    }
+
+    R_AddSprites(front)
+
+    while count != 0 {
+        R_AddLine(GEOM_seg(segi))
+        segi = segi + 1
+        count = count - 1
+    }
+}
+
+#
+# R_RenderBSPNode
+#
+@flow_api
+function R_RenderBSPNode(bspnum: i32) -> void {
+    if (bspnum & BSP_NF_SUBSECTOR) != 0 {
+        if bspnum == 0 - 1 {
+            R_Subsector(0)
+        } else {
+            R_Subsector(bspnum & (0 - 1 - BSP_NF_SUBSECTOR))
+        }
+        return
+    }
+
+    let side: i32 = R_PointOnSide(RMAIN_viewx(), RMAIN_viewy(), GEOM_node(bspnum))
+    R_RenderBSPNode(GEOM_node_i_child(bspnum, side))
+
+    if R_CheckBBox(GEOM_node_i_bbox(bspnum, side ^ 1)) != 0 {
+        R_RenderBSPNode(GEOM_node_i_child(bspnum, side ^ 1))
+    }
+}

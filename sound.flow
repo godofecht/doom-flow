@@ -1,0 +1,847 @@
+# High-level sound / music, ported from s_sound.c to Flow.
+#
+# channel_t is private to this module → Flow struct Channel with field
+# access (chan_handle; "handle" is a Flow keyword). C-visible globals
+# sfxVolume / musicVolume / snd_channels and S_sfx[] / S_music[] live here
+# (tables were sounds_data.c).
+
+# ---- libc / engine ----------------------------------------------------
+
+extern { function abs(x: i32) -> i32 }
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+extern { function snprintf(buf: string, n: i64, fmt: string, s: string) -> i32 }
+extern { function M_StringCopy(dest: ptr<u8>, src: ptr<u8>, dest_size: i64) -> i32 }
+
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function FixedMul(a: i32, b: i32) -> i32 }
+extern { function R_PointToAngle2(x1: i32, y1: i32, x2: i32, y2: i32) -> u32 }
+extern { function I_Error(msg: string) -> void }
+extern { function I_AtExit(func: ptr<void>, run_on_error: i32) -> void }
+
+extern { function I_PrecacheSounds(sounds: ptr<void>, num_sounds: i32) -> void }
+extern { function I_ShutdownSound() -> void }
+extern { function I_ShutdownMusic() -> void }
+extern { function I_UpdateSound() -> void }
+extern { function I_UpdateSoundParams(channel: i32, vol: i32, sep: i32) -> void }
+extern { function I_StartSound(sfxinfo: ptr<void>, channel: i32, vol: i32, sep: i32) -> i32 }
+extern { function I_StopSound(channel: i32) -> void }
+extern { function I_SoundIsPlaying(channel: i32) -> i32 }
+extern { function I_GetSfxLumpNum(sfxinfo: ptr<void>) -> i32 }
+extern { function I_SetMusicVolume(volume: i32) -> void }
+extern { function I_PauseSong() -> void }
+extern { function I_ResumeSong() -> void }
+extern { function I_RegisterSong(data: ptr<void>, len: i32) -> ptr<void> }
+extern { function I_UnRegisterSong(song: ptr<void>) -> void }
+extern { function I_PlaySong(song: ptr<void>, looping: i32) -> void }
+extern { function I_StopSong() -> void }
+extern { function I_MusicIsPlaying() -> i32 }
+
+extern { function W_GetNumForName(name: string) -> i32 }
+extern { function W_CacheLumpNum(lump: i32, tag: i32) -> ptr<void> }
+extern { function W_LumpLength(lump: u32) -> i32 }
+extern { function W_ReleaseLumpNum(lump: i32) -> void }
+extern { function TABLES_finesine(idx: i32) -> i32 }
+extern { function TABLES_finecosine(idx: i32) -> i32 }
+extern { function TABLES_finetangent(idx: i32) -> i32 }
+
+# ---- C-visible volume / channel count (s_sound.c definitions) ---------
+
+let mut sfxVolume: i32 = 8
+let mut musicVolume: i32 = 8
+let mut snd_channels: i32 = 8
+
+@flow_api
+function SOUND_sfxvolume_addr() -> ptr<i32> { return &sfxVolume }
+
+@flow_api
+function SOUND_musicvolume_addr() -> ptr<i32> { return &musicVolume }
+
+@flow_api
+function SOUND_snd_channels_addr() -> ptr<i32> { return &snd_channels }
+
+@flow_api
+function sound_stat_sfxvolume() -> i32 { return sfxVolume }
+
+@flow_api
+function sound_set_stat_sfxvolume(v: i32) -> void { sfxVolume = v }
+
+@flow_api
+function sound_stat_musicvolume() -> i32 { return musicVolume }
+
+@flow_api
+function sound_set_stat_musicvolume(v: i32) -> void { musicVolume = v }
+
+# ---- sfxinfo_t / musicinfo_t (i_sound.h, LP64) ------------------------
+# sizeof(sfxinfo_t) = 64, sizeof(musicinfo_t) = 32
+
+const SOUND_SIZEOF_SFXINFO: i32 = 64
+const SOUND_SIZEOF_MUSICINFO: i32 = 32
+
+const SFX_OFF_NAME: i32 = 8
+const SFX_OFF_PRIORITY: i32 = 20
+const SFX_OFF_LINK: i32 = 24
+const SFX_OFF_PITCH: i32 = 32
+const SFX_OFF_VOLUME: i32 = 36
+const SFX_OFF_USEFULNESS: i32 = 40
+const SFX_OFF_LUMPNUM: i32 = 44
+const SFX_OFF_NUMCHANNELS: i32 = 48
+
+const MUSIC_OFF_NAME: i32 = 0
+const MUSIC_OFF_LUMPNUM: i32 = 8
+const MUSIC_OFF_DATA: i32 = 16
+const MUSIC_OFF_HANDLE: i32 = 24
+
+function sound_addr(base: ptr<u8>, off: i32) -> ptr<u8> {
+    return ((base as i64) + off as i64) as ptr<u8>
+}
+
+function sound_sfx_table() -> ptr<u8> {
+    return sound_data_sfx() as ptr<u8>
+}
+
+function sound_sfx(id: i32) -> ptr<u8> {
+    let base: ptr<u8> = sound_sfx_table()
+    return ((base as i64) + (id * SOUND_SIZEOF_SFXINFO) as i64) as ptr<u8>
+}
+
+function sound_music(id: i32) -> ptr<u8> {
+    let base: ptr<u8> = sound_data_music() as ptr<u8>
+    return ((base as i64) + (id * SOUND_SIZEOF_MUSICINFO) as i64) as ptr<u8>
+}
+
+function sfx_priority(s: ptr<u8>) -> i32 {
+    let p: ptr<i32> = sound_addr(s, SFX_OFF_PRIORITY) as ptr<i32>
+    return p[0]
+}
+
+function sfx_link(s: ptr<u8>) -> ptr<u8> {
+    let p: ptr<i64> = sound_addr(s, SFX_OFF_LINK) as ptr<i64>
+    return p[0] as ptr<u8>
+}
+
+function sfx_volume(s: ptr<u8>) -> i32 {
+    let p: ptr<i32> = sound_addr(s, SFX_OFF_VOLUME) as ptr<i32>
+    return p[0]
+}
+
+function sfx_usefulness(s: ptr<u8>) -> i32 {
+    let p: ptr<i32> = sound_addr(s, SFX_OFF_USEFULNESS) as ptr<i32>
+    return p[0]
+}
+
+function sfx_set_usefulness(s: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = sound_addr(s, SFX_OFF_USEFULNESS) as ptr<i32>
+    p[0] = v
+}
+
+function sfx_lumpnum(s: ptr<u8>) -> i32 {
+    let p: ptr<i32> = sound_addr(s, SFX_OFF_LUMPNUM) as ptr<i32>
+    return p[0]
+}
+
+function sfx_set_lumpnum(s: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = sound_addr(s, SFX_OFF_LUMPNUM) as ptr<i32>
+    p[0] = v
+}
+
+function music_name(m: ptr<u8>) -> ptr<u8> {
+    let p: ptr<i64> = sound_addr(m, MUSIC_OFF_NAME) as ptr<i64>
+    return p[0] as ptr<u8>
+}
+
+function music_lumpnum(m: ptr<u8>) -> i32 {
+    let p: ptr<i32> = sound_addr(m, MUSIC_OFF_LUMPNUM) as ptr<i32>
+    return p[0]
+}
+
+function music_set_lumpnum(m: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = sound_addr(m, MUSIC_OFF_LUMPNUM) as ptr<i32>
+    p[0] = v
+}
+
+function music_data(m: ptr<u8>) -> ptr<u8> {
+    let p: ptr<i64> = sound_addr(m, MUSIC_OFF_DATA) as ptr<i64>
+    return p[0] as ptr<u8>
+}
+
+function music_set_data(m: ptr<u8>, v: ptr<u8>) -> void {
+    let p: ptr<i64> = sound_addr(m, MUSIC_OFF_DATA) as ptr<i64>
+    p[0] = v as i64
+}
+
+function music_song(m: ptr<u8>) -> ptr<u8> {
+    let p: ptr<i64> = sound_addr(m, MUSIC_OFF_HANDLE) as ptr<i64>
+    return p[0] as ptr<u8>
+}
+
+function music_set_song(m: ptr<u8>, v: ptr<u8>) -> void {
+    let p: ptr<i64> = sound_addr(m, MUSIC_OFF_HANDLE) as ptr<i64>
+    p[0] = v as i64
+}
+
+extern { function MOBJ_x(m: ptr<void>) -> i32 }
+extern { function MOBJ_y(m: ptr<void>) -> i32 }
+extern { function MOBJ_angle(m: ptr<void>) -> u32 }
+extern { function PLAYER_at(i: i32) -> ptr<void> }
+extern { function PLAYER_mo(p: ptr<void>) -> ptr<void> }
+extern { function isoundshim_int_addr(id: i32) -> ptr<i32> }
+
+# ---- constants (prefixed SOUND_: one Flow TU) -------------------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+# m_fixed.h / tables.h
+const SOUND_FRACUNIT: i32 = 65536
+const SOUND_FRACBITS: i32 = 16
+const SOUND_ANGLETOFINESHIFT: i32 = 19
+
+# s_sound.c distance / stereo
+const SOUND_CLIPPING_DIST: i32 = 1200 * SOUND_FRACUNIT
+const SOUND_CLOSE_DIST: i32 = 200 * SOUND_FRACUNIT
+const SOUND_ATTENUATOR: i32 = (SOUND_CLIPPING_DIST - SOUND_CLOSE_DIST) >> SOUND_FRACBITS
+const SOUND_STEREO_SWING: i32 = 96 * SOUND_FRACUNIT
+
+const SOUND_NORM_PITCH: i32 = 128
+const SOUND_NORM_PRIORITY: i32 = 64
+const SOUND_NORM_SEP: i32 = 128
+
+# sounds.h
+const SOUND_NUMSFX: i32 = 109
+const SOUND_NUMMUSIC: i32 = 68
+const SOUND_MUS_NONE: i32 = 0
+const SOUND_MUS_E1M1: i32 = 1
+const SOUND_MUS_INTRO: i32 = 29
+const SOUND_MUS_INTROA: i32 = 32
+const SOUND_MUS_RUNNIN: i32 = 33
+
+# ---- S_sfx[] / S_music[] (was sounds_data.c) -----------------------
+# sizeof(sfxinfo_t)=64, sizeof(musicinfo_t)=32 on LP64.
+# Sfx rows are built on first use; chgun link = &S_sfx[sfx_pistol].
+
+struct MusicInfo {
+    name: string,
+    lumpnum: i32,
+    data: ptr<void>,
+    song: ptr<void>
+}
+
+const SOUND_SFX_PISTOL: i32 = 1
+const SOUND_SFX_CHGUN: i32 = 86
+
+let mut sfx_name_tab: array<string, 109> = [
+    "none", "pistol", "shotgn", "sgcock", "dshtgn", "dbopn", "dbcls", "dbload",
+    "plasma", "bfg", "sawup", "sawidl", "sawful", "sawhit", "rlaunc", "rxplod",
+    "firsht", "firxpl", "pstart", "pstop", "doropn", "dorcls", "stnmov", "swtchn",
+    "swtchx", "plpain", "dmpain", "popain", "vipain", "mnpain", "pepain", "slop",
+    "itemup", "wpnup", "oof", "telept", "posit1", "posit2", "posit3", "bgsit1",
+    "bgsit2", "sgtsit", "cacsit", "brssit", "cybsit", "spisit", "bspsit", "kntsit",
+    "vilsit", "mansit", "pesit", "sklatk", "sgtatk", "skepch", "vilatk", "claw",
+    "skeswg", "pldeth", "pdiehi", "podth1", "podth2", "podth3", "bgdth1", "bgdth2",
+    "sgtdth", "cacdth", "skldth", "brsdth", "cybdth", "spidth", "bspdth", "vildth",
+    "kntdth", "pedth", "skedth", "posact", "bgact", "dmact", "bspact", "bspwlk",
+    "vilact", "noway", "barexp", "punch", "hoof", "metal", "chgun", "tink",
+    "bdopn", "bdcls", "itmbk", "flame", "flamst", "getpow", "bospit", "boscub",
+    "bossit", "bospn", "bosdth", "manatk", "mandth", "sssit", "ssdth", "keenpn",
+    "keendt", "skeact", "skesit", "skeatk", "radio"
+]
+
+let mut sfx_prio_tab: array<i32, 109> = [
+    0, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 118, 64, 64, 64, 70,
+    70, 70, 100, 100, 100, 100, 119, 78, 78, 96, 96, 96, 96, 96, 96, 78,
+    78, 78, 96, 32, 98, 98, 98, 98, 98, 98, 98, 94, 92, 90, 90, 90,
+    90, 90, 90, 70, 70, 70, 70, 70, 70, 32, 32, 70, 70, 70, 70, 70,
+    70, 70, 70, 32, 32, 32, 32, 32, 32, 32, 32, 120, 120, 120, 100, 100,
+    100, 78, 60, 64, 70, 70, 64, 60, 100, 100, 100, 32, 32, 60, 70, 70,
+    70, 70, 70, 70, 70, 70, 70, 70, 70, 70, 70, 70, 60
+]
+
+let mut S_music_tab: array<MusicInfo, 68> = [
+    MusicInfo { name: null as string, lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e1m1", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e1m2", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e1m3", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e1m4", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e1m5", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e1m6", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e1m7", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e1m8", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e1m9", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e2m1", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e2m2", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e2m3", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e2m4", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e2m5", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e2m6", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e2m7", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e2m8", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e2m9", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e3m1", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e3m2", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e3m3", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e3m4", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e3m5", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e3m6", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e3m7", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e3m8", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "e3m9", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "inter", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "intro", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "bunny", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "victor", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "introa", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "runnin", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "stalks", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "countd", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "betwee", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "doom", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "the_da", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "shawn", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "ddtblu", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "in_cit", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "dead", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "stlks2", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "theda2", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "doom2", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "ddtbl2", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "runni2", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "dead2", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "stlks3", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "romero", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "shawn2", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "messag", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "count2", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "ddtbl3", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "ampie", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "theda3", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "adrian", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "messg2", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "romer2", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "tense", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "shawn3", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "openin", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "evil", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "ultima", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "read_m", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "dm2ttl", lumpnum: 0, data: null, song: null },
+    MusicInfo { name: "dm2int", lumpnum: 0, data: null, song: null }
+]
+
+let mut S_sfx_storage: ptr<u8> = null
+let mut sounds_tables_ready: i32 = 0
+
+function sound_sfx_write_i32(base: ptr<u8>, off: i32, v: i32) -> void {
+    let p: ptr<i32> = sound_addr(base, off) as ptr<i32>
+    p[0] = v
+}
+
+function sounds_ensure_tables() -> void {
+    if sounds_tables_ready != 0 {
+        return
+    }
+    sounds_tables_ready = 1
+    S_sfx_storage = calloc(SOUND_NUMSFX as i64, SOUND_SIZEOF_SFXINFO as i64) as ptr<u8>
+    for i in 0 to SOUND_NUMSFX {
+        let base: ptr<u8> = ((S_sfx_storage as i64) + (i * SOUND_SIZEOF_SFXINFO) as i64) as ptr<u8>
+        M_StringCopy(sound_addr(base, SFX_OFF_NAME), sfx_name_tab[i] as ptr<u8>, 9)
+        sound_sfx_write_i32(base, SFX_OFF_PRIORITY, sfx_prio_tab[i])
+        sound_sfx_write_i32(base, SFX_OFF_PITCH, 0 - 1)
+        sound_sfx_write_i32(base, SFX_OFF_VOLUME, 0 - 1)
+        sound_sfx_write_i32(base, SFX_OFF_NUMCHANNELS, 0 - 1)
+    }
+    # SOUND_LINK("chgun", 64, sfx_pistol, 150, 0)
+    let chgun: ptr<u8> = ((S_sfx_storage as i64) + (SOUND_SFX_CHGUN * SOUND_SIZEOF_SFXINFO) as i64) as ptr<u8>
+    let pistol: ptr<u8> = ((S_sfx_storage as i64) + (SOUND_SFX_PISTOL * SOUND_SIZEOF_SFXINFO) as i64) as ptr<u8>
+    let link_p: ptr<i64> = sound_addr(chgun, SFX_OFF_LINK) as ptr<i64>
+    link_p[0] = pistol as i64
+    sound_sfx_write_i32(chgun, SFX_OFF_PITCH, 150)
+    sound_sfx_write_i32(chgun, SFX_OFF_VOLUME, 0)
+}
+
+@flow_api
+function sound_data_sfx() -> ptr<void> {
+    sounds_ensure_tables()
+    return S_sfx_storage as ptr<void>
+}
+
+@flow_api
+function sound_data_music() -> ptr<void> {
+    return &S_music_tab[0] as ptr<void>
+}
+
+
+# d_mode.h GameMode_t
+const SOUND_COMMERCIAL: i32 = 2
+
+# i_sound.h snddevice_t
+const SOUND_SNDDEVICE_ADLIB: i32 = 2
+const SOUND_SNDDEVICE_SB: i32 = 3
+
+# z_zone.h
+const SOUND_PU_STATIC: i32 = 1
+
+# sizeof(Channel) on LP64 (two pointers + i32 + pad)
+const SOUND_SIZEOF_CHANNEL: i32 = 24
+
+# ---- private channel_t ------------------------------------------------
+
+struct Channel {
+    sfxinfo: ptr<void>,
+    origin: ptr<void>,
+    chan_handle: i32
+}
+
+let mut channels: ptr<Channel> = null
+
+# Internal volume level 0-127 (C: static snd_SfxVolume)
+let mut snd_SfxVolume: i32 = 0
+
+# Whether songs are mus_paused
+let mut mus_paused: i32 = 0
+
+# Music currently being played (musicinfo_t *)
+let mut mus_playing: ptr<void> = null
+
+# Episode-4 music remap (s_sound.c spmus[])
+let mut spmus: array<i32, 9> = [
+    22,  # mus_e3m4  e4m1
+    20,  # mus_e3m2  e4m2
+    21,  # mus_e3m3  e4m3
+    5,   # mus_e1m5  e4m4
+    16,  # mus_e2m7  e4m5
+    13,  # mus_e2m4  e4m6
+    15,  # mus_e2m6  e4m7
+    14,  # mus_e2m5  e4m8
+    9    # mus_e1m9  e4m9
+]
+
+function num_channels() -> i32 {
+    return SOUND_snd_channels_addr()[0]
+}
+
+# ---- channel helpers --------------------------------------------------
+
+function S_StopChannel(cnum: i32) -> void {
+    let c: Channel = channels[cnum]
+
+    if (c.sfxinfo as i64) != 0 {
+        if I_SoundIsPlaying(c.chan_handle) != 0 {
+            I_StopSound(c.chan_handle)
+        }
+
+        # check to see if other channels are playing the sound
+        let nch: i32 = num_channels()
+        for i in 0 to nch {
+            if cnum != i and (c.sfxinfo as i64) == (channels[i].sfxinfo as i64) {
+                break
+            }
+        }
+
+        # degrade usefulness of sound data
+        sfx_set_usefulness(c.sfxinfo as ptr<u8>, sfx_usefulness(c.sfxinfo as ptr<u8>) - 1)
+        channels[cnum].sfxinfo = null
+    }
+}
+
+function S_GetChannel(origin: ptr<void>, sfxinfo: ptr<void>) -> i32 {
+    let mut cnum: i32 = 0
+    let nch: i32 = num_channels()
+
+    # Find an open channel
+    for i in 0 to nch {
+        cnum = i
+        if (channels[i].sfxinfo as i64) == 0 {
+            break
+        } elif (origin as i64) != 0 and (channels[i].origin as i64) == (origin as i64) {
+            S_StopChannel(i)
+            break
+        }
+        cnum = i + 1
+    }
+
+    # None available
+    if cnum == nch {
+        # Look for lower priority
+        for i in 0 to nch {
+            cnum = i
+            if sfx_priority(channels[i].sfxinfo as ptr<u8>) >= sfx_priority(sfxinfo as ptr<u8>) {
+                break
+            }
+            cnum = i + 1
+        }
+
+        if cnum == nch {
+            # FUCK!  No lower priority.  Sorry, Charlie.
+            return 0 - 1
+        } else {
+            # Otherwise, kick out lower priority.
+            S_StopChannel(cnum)
+        }
+    }
+
+    channels[cnum].sfxinfo = sfxinfo
+    channels[cnum].origin = origin
+    return cnum
+}
+
+# Changes volume and stereo-separation from the norm.
+# Returns 0 if not audible, else 1 (and writes vol/sep).
+function S_AdjustSoundParams(listener: ptr<void>, source: ptr<void>,
+                             vol: ptr<i32>, sep: ptr<i32>) -> i32 {
+    let adx: i32 = abs(MOBJ_x(listener) - MOBJ_x(source))
+    let ady: i32 = abs(MOBJ_y(listener) - MOBJ_y(source))
+
+    # From _GG1_ p.428. Approx. eucledian distance fast.
+    let mut approx_dist: i32 = 0
+    if adx < ady {
+        approx_dist = adx + ady - (adx >> 1)
+    } else {
+        approx_dist = adx + ady - (ady >> 1)
+    }
+
+    if STAT_gamemap() != 8 and approx_dist > SOUND_CLIPPING_DIST {
+        return 0
+    }
+
+    # angle of source to listener
+    let mut angle: u32 = R_PointToAngle2(
+        MOBJ_x(listener),
+        MOBJ_y(listener),
+        MOBJ_x(source),
+        MOBJ_y(source))
+
+    let listener_angle: u32 = MOBJ_angle(listener)
+    if angle > listener_angle {
+        angle = angle - listener_angle
+    } else {
+        angle = angle + (4294967295 as u32 - listener_angle)
+    }
+
+    angle = angle >> (SOUND_ANGLETOFINESHIFT as u32)
+
+    # stereo separation
+    sep[0] = 128 - (FixedMul(SOUND_STEREO_SWING, TABLES_finesine(angle as i32)) >> SOUND_FRACBITS)
+
+    # volume calculation
+    if approx_dist < SOUND_CLOSE_DIST {
+        vol[0] = snd_SfxVolume
+    } elif STAT_gamemap() == 8 {
+        if approx_dist > SOUND_CLIPPING_DIST {
+            approx_dist = SOUND_CLIPPING_DIST
+        }
+        vol[0] = 15 + ((snd_SfxVolume - 15)
+            * ((SOUND_CLIPPING_DIST - approx_dist) >> SOUND_FRACBITS))
+            / SOUND_ATTENUATOR
+    } else {
+        # distance effect
+        vol[0] = (snd_SfxVolume
+            * ((SOUND_CLIPPING_DIST - approx_dist) >> SOUND_FRACBITS))
+            / SOUND_ATTENUATOR
+    }
+
+    if vol[0] > 0 {
+        return 1
+    }
+    return 0
+}
+
+# ---- public API -------------------------------------------------------
+
+@flow_api
+function S_Init(sfx_vol: i32, music_vol: i32) -> void {
+    I_PrecacheSounds(sound_sfx_table() as ptr<void>, SOUND_NUMSFX)
+
+    S_SetSfxVolume(sfx_vol)
+    S_SetMusicVolume(music_vol)
+
+    # Allocating the internal channels for mixing
+    let nch: i32 = num_channels()
+    channels = Z_Malloc(nch * SOUND_SIZEOF_CHANNEL, SOUND_PU_STATIC, null) as ptr<Channel>
+
+    # Free all channels for use
+    for i in 0 to nch {
+        channels[i].sfxinfo = null
+    }
+
+    # no sounds are playing, and they are not mus_paused
+    mus_paused = 0
+
+    # Note that sounds have not been cached (yet).
+    for i in 1 to SOUND_NUMSFX {
+        let s: ptr<u8> = sound_sfx(i)
+        sfx_set_lumpnum(s, 0 - 1)
+        sfx_set_usefulness(s, 0 - 1)
+    }
+
+    I_AtExit(S_Shutdown as ptr<void>, 1)
+}
+
+@flow_api
+function S_Shutdown() -> void {
+    I_ShutdownSound()
+    I_ShutdownMusic()
+}
+
+@flow_api
+function S_Start() -> void {
+    let nch: i32 = num_channels()
+
+    # kill all playing sounds at start of level
+    for cnum in 0 to nch {
+        if (channels[cnum].sfxinfo as i64) != 0 {
+            S_StopChannel(cnum)
+        }
+    }
+
+    # start new music for the level
+    mus_paused = 0
+
+    let mut mnum: i32 = 0
+    if STAT_gamemode() == SOUND_COMMERCIAL {
+        mnum = SOUND_MUS_RUNNIN + STAT_gamemap() - 1
+    } else {
+        if STAT_gameepisode() < 4 {
+            mnum = SOUND_MUS_E1M1 + (STAT_gameepisode() - 1) * 9 + STAT_gamemap() - 1
+        } else {
+            mnum = spmus[STAT_gamemap() - 1]
+        }
+    }
+
+    S_ChangeMusic(mnum, 1)
+}
+
+@flow_api
+function S_StopSound(origin: ptr<void>) -> void {
+    let nch: i32 = num_channels()
+    for cnum in 0 to nch {
+        if (channels[cnum].sfxinfo as i64) != 0 and (channels[cnum].origin as i64) == (origin as i64) {
+            S_StopChannel(cnum)
+            break
+        }
+    }
+}
+
+@flow_api
+function S_StartSound(origin_p: ptr<void>, sfx_id: i32) -> void {
+    let origin: ptr<void> = origin_p
+    let mut volume: i32 = snd_SfxVolume
+    let mut sep: i32 = SOUND_NORM_SEP
+
+    # check for bogus sound #
+    if sfx_id < 1 or sfx_id > SOUND_NUMSFX {
+        I_Error("Bad sfx #")
+    }
+
+    let sfx: ptr<u8> = sound_sfx(sfx_id)
+
+    # Initialize sound parameters
+    if (sfx_link(sfx) as i64) != 0 {
+        volume = volume + sfx_volume(sfx)
+
+        if volume < 1 {
+            return
+        }
+
+        if volume > snd_SfxVolume {
+            volume = snd_SfxVolume
+        }
+    }
+
+    # Check to see if it is audible, and if not, modify the params
+    let listener: ptr<void> = PLAYER_mo(PLAYER_at(STAT_consoleplayer()))
+    if (origin as i64) != 0 and (origin as i64) != (listener as i64) {
+        let rc: i32 = S_AdjustSoundParams(listener, origin, &volume, &sep)
+
+        if MOBJ_x(origin) == MOBJ_x(listener) and MOBJ_y(origin) == MOBJ_y(listener) {
+            sep = SOUND_NORM_SEP
+        }
+
+        if rc == 0 {
+            return
+        }
+    } else {
+        sep = SOUND_NORM_SEP
+    }
+
+    # kill old sound
+    S_StopSound(origin)
+
+    # try to find a channel
+    let cnum: i32 = S_GetChannel(origin, sfx as ptr<void>)
+    if cnum < 0 {
+        return
+    }
+
+    # increase the usefulness (post-increment semantics)
+    let u: i32 = sfx_usefulness(sfx)
+    sfx_set_usefulness(sfx, u + 1)
+    if u < 0 {
+        sfx_set_usefulness(sfx, 1)
+    }
+
+    if sfx_lumpnum(sfx) < 0 {
+        sfx_set_lumpnum(sfx, I_GetSfxLumpNum(sfx as ptr<void>))
+    }
+
+    channels[cnum].chan_handle = I_StartSound(sfx as ptr<void>, cnum, volume, sep)
+}
+
+@flow_api
+function S_PauseSound() -> void {
+    if (mus_playing as i64) != 0 and mus_paused == 0 {
+        I_PauseSong()
+        mus_paused = 1
+    }
+}
+
+@flow_api
+function S_ResumeSound() -> void {
+    if (mus_playing as i64) != 0 and mus_paused != 0 {
+        I_ResumeSong()
+        mus_paused = 0
+    }
+}
+
+@flow_api
+function S_UpdateSounds(listener: ptr<void>) -> void {
+    I_UpdateSound()
+
+    let nch: i32 = num_channels()
+    for cnum in 0 to nch {
+        let sfx: ptr<void> = channels[cnum].sfxinfo
+
+        if (sfx as i64) != 0 {
+            if I_SoundIsPlaying(channels[cnum].chan_handle) != 0 {
+                # initialize parameters
+                let mut volume: i32 = snd_SfxVolume
+                let mut sep: i32 = SOUND_NORM_SEP
+
+                if (sfx_link(sfx as ptr<u8>) as i64) != 0 {
+                    volume = volume + sfx_volume(sfx as ptr<u8>)
+                    if volume < 1 {
+                        S_StopChannel(cnum)
+                        continue
+                    } elif volume > snd_SfxVolume {
+                        volume = snd_SfxVolume
+                    }
+                }
+
+                # check non-local sounds for distance clipping
+                let origin: ptr<void> = channels[cnum].origin
+                if (origin as i64) != 0 and (listener as i64) != (origin as i64) {
+                    let audible: i32 = S_AdjustSoundParams(listener, origin, &volume, &sep)
+
+                    if audible == 0 {
+                        S_StopChannel(cnum)
+                    } else {
+                        I_UpdateSoundParams(channels[cnum].chan_handle, volume, sep)
+                    }
+                }
+            } else {
+                # if channel is allocated but sound has stopped, free it
+                S_StopChannel(cnum)
+            }
+        }
+    }
+}
+
+@flow_api
+function S_SetMusicVolume(volume: i32) -> void {
+    if volume < 0 or volume > 127 {
+        I_Error("Attempt to set music volume")
+    }
+    I_SetMusicVolume(volume)
+}
+
+@flow_api
+function S_SetSfxVolume(volume: i32) -> void {
+    if volume < 0 or volume > 127 {
+        I_Error("Attempt to set sfx volume")
+    }
+    snd_SfxVolume = volume
+}
+
+@flow_api
+function S_StartMusic(m_id: i32) -> void {
+    S_ChangeMusic(m_id, 0)
+}
+
+@flow_api
+function S_ChangeMusic(musicnum: i32, looping: i32) -> void {
+    let mut mnum: i32 = musicnum
+
+    # The Doom IWAD file has two versions of the intro music: d_intro
+    # and d_introa.  The latter is used for OPL playback.
+    let dev: i32 = isoundshim_int_addr(0)[0]
+    if mnum == SOUND_MUS_INTRO and (dev == SOUND_SNDDEVICE_ADLIB or dev == SOUND_SNDDEVICE_SB) {
+        mnum = SOUND_MUS_INTROA
+    }
+
+    if mnum <= SOUND_MUS_NONE or mnum >= SOUND_NUMMUSIC {
+        I_Error("Bad music number")
+    }
+
+    let music: ptr<u8> = sound_music(mnum)
+
+    if (mus_playing as i64) == (music as i64) {
+        return
+    }
+
+    # shutdown old music
+    S_StopMusic()
+
+    # get lumpnum if neccessary
+    # DEH_String is identity without FEATURE_DEHACKED
+    if music_lumpnum(music) == 0 {
+        let mut namebuf: array<u8, 9> = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+        snprintf(namebuf as string, 9, "d_%s", music_name(music) as string)
+        music_set_lumpnum(music, W_GetNumForName(namebuf as string))
+    }
+
+    music_set_data(music, W_CacheLumpNum(music_lumpnum(music), SOUND_PU_STATIC) as ptr<u8>)
+
+    let song: ptr<void> = I_RegisterSong(
+        music_data(music) as ptr<void>,
+        W_LumpLength(music_lumpnum(music)))
+    music_set_song(music, song as ptr<u8>)
+    I_PlaySong(song, looping)
+
+    mus_playing = music as ptr<void>
+}
+
+@flow_api
+function S_MusicPlaying() -> i32 {
+    return I_MusicIsPlaying()
+}
+
+@flow_api
+function S_StopMusic() -> void {
+    if (mus_playing as i64) != 0 {
+        if mus_paused != 0 {
+            I_ResumeSong()
+        }
+
+        I_StopSong()
+        I_UnRegisterSong(music_song(mus_playing as ptr<u8>) as ptr<void>)
+        W_ReleaseLumpNum(music_lumpnum(mus_playing as ptr<u8>))
+        music_set_data(mus_playing as ptr<u8>, null)
+        mus_playing = null
+    }
+}

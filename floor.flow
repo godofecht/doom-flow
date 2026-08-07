@@ -1,0 +1,588 @@
+# Floors and plane motion, ported from p_floor.c to Flow.
+#
+# floormove_t layout on LP64 (verified with offsetof):
+#
+#   thinker_t thinker;           offset  0   (sizeof 24)
+#   floor_e   type;              offset 24
+#   boolean   crush;             offset 28   (boolean is 4 bytes)
+#   sector_t *sector;            offset 32
+#   int       direction;         offset 40
+#   int       newspecial;        offset 44
+#   short     texture;           offset 48
+#   (2 bytes padding)                   50
+#   fixed_t   floordestheight;   offset 52
+#   fixed_t   speed;             offset 56
+#                           sizeof = 64
+#
+# result_e: ok=0, crushed=1, pastdest=2.
+# Engine structs / globals via GEOM_* APIs.
+
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function P_AddThinker(thinker: ptr<void>) -> void }
+extern { function P_RemoveThinker(thinker: ptr<void>) -> void }
+extern { function P_ChangeSector(sector: ptr<void>, crunch: i32) -> i32 }
+extern { function P_FindSectorFromLineTag(line: ptr<void>, start: i32) -> i32 }
+extern { function P_FindLowestFloorSurrounding(sec: ptr<void>) -> i32 }
+extern { function P_FindHighestFloorSurrounding(sec: ptr<void>) -> i32 }
+extern { function P_FindNextHighestFloor(sec: ptr<void>, currentheight: i32) -> i32 }
+extern { function P_FindLowestCeilingSurrounding(sec: ptr<void>) -> i32 }
+extern { function twoSided(sector: i32, line: i32) -> i32 }
+extern { function getSide(currentSector: i32, line: i32, side: i32) -> ptr<void> }
+extern { function getSector(currentSector: i32, line: i32, side: i32) -> ptr<void> }
+extern { function S_StartSound(origin: ptr<void>, sound_id: i32) -> void }
+
+extern { function GEOM_sector(secnum: i32) -> ptr<void> }
+extern { function GEOM_sector_floorheight(sec: ptr<void>) -> i32 }
+extern { function GEOM_sector_set_floorheight(sec: ptr<void>, v: i32) -> void }
+extern { function GEOM_sector_ceilingheight(sec: ptr<void>) -> i32 }
+extern { function GEOM_sector_set_ceilingheight(sec: ptr<void>, v: i32) -> void }
+extern { function GEOM_sector_floorpic(sec: ptr<void>) -> i32 }
+extern { function GEOM_sector_set_floorpic(sec: ptr<void>, v: i32) -> void }
+extern { function GEOM_sector_special(sec: ptr<void>) -> i32 }
+extern { function GEOM_sector_set_special(sec: ptr<void>, v: i32) -> void }
+extern { function GEOM_sector_specialdata(sec: ptr<void>) -> ptr<void> }
+extern { function GEOM_sector_set_specialdata(sec: ptr<void>, p: ptr<void>) -> void }
+extern { function GEOM_sector_soundorg(sec: ptr<void>) -> ptr<void> }
+extern { function GEOM_sector_linecount(sec: ptr<void>) -> i32 }
+extern { function GEOM_sector_line(sec: ptr<void>, i: i32) -> ptr<void> }
+extern { function GEOM_sector_index(sec: ptr<void>) -> i32 }
+extern { function GEOM_side_sector(side: ptr<void>) -> ptr<void> }
+extern { function RDATA_textureheight(tex: i32) -> i32 }
+
+extern { function THINKER_set_move_floor(floor: ptr<void>) -> void }
+extern { function GEOM_line_backsector(ld: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_flags(ld: ptr<void>) -> i32 }
+extern { function GEOM_line_frontsector(ld: ptr<void>) -> ptr<void> }
+extern { function GEOM_side_bottomtexture(sd: ptr<void>) -> i32 }
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+# Constants from p_spec.h / m_fixed.h / z_zone.h / sounds.h / doomdata.h.
+const FLOOR_SIZEOF_FLOORMOVE: i32 = 64
+const FLOOR_PU_LEVSPEC: i32 = 6
+const FLOOR_FRACUNIT: i32 = 65536
+const FLOOR_FLOORSPEED: i32 = 65536
+const FLOOR_INT_MAX: i32 = 2147483647
+const FLOOR_ML_TWOSIDED: i32 = 4
+
+# floor_e
+const FLOOR_LOWERFLOOR: i32 = 0
+const FLOOR_LOWERFLOORTOLOWEST: i32 = 1
+const FLOOR_TURBOLOWER: i32 = 2
+const FLOOR_RAISEFLOOR: i32 = 3
+const FLOOR_RAISEFLOORTONEAREST: i32 = 4
+const FLOOR_RAISETOTEXTURE: i32 = 5
+const FLOOR_LOWERANDCHANGE: i32 = 6
+const FLOOR_RAISEFLOOR24: i32 = 7
+const FLOOR_RAISEFLOOR24ANDCHANGE: i32 = 8
+const FLOOR_RAISEFLOORCRUSH: i32 = 9
+const FLOOR_RAISEFLOORTURBO: i32 = 10
+const FLOOR_DONUTRAISE: i32 = 11
+const FLOOR_RAISEFLOOR512: i32 = 12
+
+# stair_e
+const FLOOR_BUILD8: i32 = 0
+const FLOOR_TURBO16: i32 = 1
+
+# result_e
+const FLOOR_RES_OK: i32 = 0
+const FLOOR_RES_CRUSHED: i32 = 1
+const FLOOR_RES_PASTDEST: i32 = 2
+
+# sfxenum_t
+const FLOOR_SFX_PSTOP: i32 = 19
+const FLOOR_SFX_STNMOV: i32 = 22
+
+# ---- floormove_t field access by explicit layout ----------------------
+
+function fl_type(f: ptr<u8>) -> i32 {
+    let p: ptr<i32> = ((f as i64) + 24) as ptr<i32>
+    return p[0]
+}
+
+function fl_set_type(f: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((f as i64) + 24) as ptr<i32>
+    p[0] = v
+}
+
+function fl_crush(f: ptr<u8>) -> i32 {
+    let p: ptr<i32> = ((f as i64) + 28) as ptr<i32>
+    return p[0]
+}
+
+function fl_set_crush(f: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((f as i64) + 28) as ptr<i32>
+    p[0] = v
+}
+
+function fl_sector(f: ptr<u8>) -> ptr<void> {
+    let p: ptr<i64> = ((f as i64) + 32) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+function fl_set_sector(f: ptr<u8>, sec: ptr<void>) -> void {
+    let p: ptr<i64> = ((f as i64) + 32) as ptr<i64>
+    p[0] = sec as i64
+}
+
+function fl_direction(f: ptr<u8>) -> i32 {
+    let p: ptr<i32> = ((f as i64) + 40) as ptr<i32>
+    return p[0]
+}
+
+function fl_set_direction(f: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((f as i64) + 40) as ptr<i32>
+    p[0] = v
+}
+
+function fl_newspecial(f: ptr<u8>) -> i32 {
+    let p: ptr<i32> = ((f as i64) + 44) as ptr<i32>
+    return p[0]
+}
+
+function fl_set_newspecial(f: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((f as i64) + 44) as ptr<i32>
+    p[0] = v
+}
+
+function fl_texture(f: ptr<u8>) -> i32 {
+    # short at offset 48, little-endian, sign-extended
+    let mut v: i32 = (f[48] as i32) | ((f[49] as i32) << 8)
+    if v >= 32768 {
+        v = v - 65536
+    }
+    return v
+}
+
+function fl_set_texture(f: ptr<u8>, v: i32) -> void {
+    f[48] = (v & 255) as u8
+    f[49] = ((v >> 8) & 255) as u8
+}
+
+function fl_floordestheight(f: ptr<u8>) -> i32 {
+    let p: ptr<i32> = ((f as i64) + 52) as ptr<i32>
+    return p[0]
+}
+
+function fl_set_floordestheight(f: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((f as i64) + 52) as ptr<i32>
+    p[0] = v
+}
+
+function fl_speed(f: ptr<u8>) -> i32 {
+    let p: ptr<i32> = ((f as i64) + 56) as ptr<i32>
+    return p[0]
+}
+
+function fl_set_speed(f: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((f as i64) + 56) as ptr<i32>
+    p[0] = v
+}
+
+# ---- T_MovePlane ------------------------------------------------------
+
+@flow_api
+function T_MovePlane(sector: ptr<void>, speed: i32, dest: i32, crush: i32, floorOrCeiling: i32, direction: i32) -> i32 {
+    let mut flag: i32 = 0
+    let mut lastpos: i32 = 0
+
+    if floorOrCeiling == 0 {
+        # FLOOR
+        if direction == 0 - 1 {
+            # DOWN
+            if GEOM_sector_floorheight(sector) - speed < dest {
+                lastpos = GEOM_sector_floorheight(sector)
+                GEOM_sector_set_floorheight(sector, dest)
+                flag = P_ChangeSector(sector, crush)
+                if flag != 0 {
+                    GEOM_sector_set_floorheight(sector, lastpos)
+                    P_ChangeSector(sector, crush)
+                }
+                return FLOOR_RES_PASTDEST
+            } else {
+                lastpos = GEOM_sector_floorheight(sector)
+                GEOM_sector_set_floorheight(sector, GEOM_sector_floorheight(sector) - speed)
+                flag = P_ChangeSector(sector, crush)
+                if flag != 0 {
+                    GEOM_sector_set_floorheight(sector, lastpos)
+                    P_ChangeSector(sector, crush)
+                    return FLOOR_RES_CRUSHED
+                }
+            }
+        } else {
+            if direction == 1 {
+                # UP
+                if GEOM_sector_floorheight(sector) + speed > dest {
+                    lastpos = GEOM_sector_floorheight(sector)
+                    GEOM_sector_set_floorheight(sector, dest)
+                    flag = P_ChangeSector(sector, crush)
+                    if flag != 0 {
+                        GEOM_sector_set_floorheight(sector, lastpos)
+                        P_ChangeSector(sector, crush)
+                    }
+                    return FLOOR_RES_PASTDEST
+                } else {
+                    lastpos = GEOM_sector_floorheight(sector)
+                    GEOM_sector_set_floorheight(sector, GEOM_sector_floorheight(sector) + speed)
+                    flag = P_ChangeSector(sector, crush)
+                    if flag != 0 {
+                        if crush != 0 {
+                            return FLOOR_RES_CRUSHED
+                        }
+                        GEOM_sector_set_floorheight(sector, lastpos)
+                        P_ChangeSector(sector, crush)
+                        return FLOOR_RES_CRUSHED
+                    }
+                }
+            }
+        }
+    } else {
+        if floorOrCeiling == 1 {
+            # CEILING
+            if direction == 0 - 1 {
+                # DOWN
+                if GEOM_sector_ceilingheight(sector) - speed < dest {
+                    lastpos = GEOM_sector_ceilingheight(sector)
+                    GEOM_sector_set_ceilingheight(sector, dest)
+                    flag = P_ChangeSector(sector, crush)
+                    if flag != 0 {
+                        GEOM_sector_set_ceilingheight(sector, lastpos)
+                        P_ChangeSector(sector, crush)
+                    }
+                    return FLOOR_RES_PASTDEST
+                } else {
+                    lastpos = GEOM_sector_ceilingheight(sector)
+                    GEOM_sector_set_ceilingheight(sector, GEOM_sector_ceilingheight(sector) - speed)
+                    flag = P_ChangeSector(sector, crush)
+                    if flag != 0 {
+                        if crush != 0 {
+                            return FLOOR_RES_CRUSHED
+                        }
+                        GEOM_sector_set_ceilingheight(sector, lastpos)
+                        P_ChangeSector(sector, crush)
+                        return FLOOR_RES_CRUSHED
+                    }
+                }
+            } else {
+                if direction == 1 {
+                    # UP
+                    if GEOM_sector_ceilingheight(sector) + speed > dest {
+                        lastpos = GEOM_sector_ceilingheight(sector)
+                        GEOM_sector_set_ceilingheight(sector, dest)
+                        flag = P_ChangeSector(sector, crush)
+                        if flag != 0 {
+                            GEOM_sector_set_ceilingheight(sector, lastpos)
+                            P_ChangeSector(sector, crush)
+                        }
+                        return FLOOR_RES_PASTDEST
+                    } else {
+                        lastpos = GEOM_sector_ceilingheight(sector)
+                        GEOM_sector_set_ceilingheight(sector, GEOM_sector_ceilingheight(sector) + speed)
+                        flag = P_ChangeSector(sector, crush)
+                        # UNUSED crush check on ceiling-up omitted (#if 0 in C)
+                    }
+                }
+            }
+        }
+    }
+    return FLOOR_RES_OK
+}
+
+# ---- T_MoveFloor ------------------------------------------------------
+
+@flow_api
+function T_MoveFloor(floor: ptr<void>) -> void {
+    let f: ptr<u8> = floor as ptr<u8>
+    let sec: ptr<void> = fl_sector(f)
+    let res: i32 = T_MovePlane(sec, fl_speed(f), fl_floordestheight(f), fl_crush(f), 0, fl_direction(f))
+
+    if (STAT_leveltime() & 7) == 0 {
+        S_StartSound(GEOM_sector_soundorg(sec), FLOOR_SFX_STNMOV)
+    }
+
+    if res == FLOOR_RES_PASTDEST {
+        GEOM_sector_set_specialdata(sec, null)
+
+        if fl_direction(f) == 1 {
+            if fl_type(f) == FLOOR_DONUTRAISE {
+                GEOM_sector_set_special(sec, fl_newspecial(f))
+                GEOM_sector_set_floorpic(sec, fl_texture(f))
+            }
+        } else {
+            if fl_direction(f) == 0 - 1 {
+                if fl_type(f) == FLOOR_LOWERANDCHANGE {
+                    GEOM_sector_set_special(sec, fl_newspecial(f))
+                    GEOM_sector_set_floorpic(sec, fl_texture(f))
+                }
+            }
+        }
+
+        P_RemoveThinker(floor)
+        S_StartSound(GEOM_sector_soundorg(sec), FLOOR_SFX_PSTOP)
+    }
+}
+
+# ---- EV_DoFloor -------------------------------------------------------
+
+@flow_api
+function EV_DoFloor(line: ptr<void>, floortype: i32) -> i32 {
+    let mut secnum: i32 = 0 - 1
+    let mut rtn: i32 = 0
+
+    secnum = P_FindSectorFromLineTag(line, secnum)
+    while secnum >= 0 {
+        let mut sec: ptr<void> = GEOM_sector(secnum)
+
+        if (GEOM_sector_specialdata(sec) as i64) == 0 {
+            rtn = 1
+            let floor: ptr<void> = Z_Malloc(FLOOR_SIZEOF_FLOORMOVE, FLOOR_PU_LEVSPEC, null)
+            let f: ptr<u8> = floor as ptr<u8>
+            P_AddThinker(floor)
+            GEOM_sector_set_specialdata(sec, floor)
+            THINKER_set_move_floor(floor)
+            fl_set_type(f, floortype)
+            fl_set_crush(f, 0)
+
+            if floortype == FLOOR_LOWERFLOOR {
+                fl_set_direction(f, 0 - 1)
+                fl_set_sector(f, sec)
+                fl_set_speed(f, FLOOR_FLOORSPEED)
+                fl_set_floordestheight(f, P_FindHighestFloorSurrounding(sec))
+            } else {
+                if floortype == FLOOR_LOWERFLOORTOLOWEST {
+                    fl_set_direction(f, 0 - 1)
+                    fl_set_sector(f, sec)
+                    fl_set_speed(f, FLOOR_FLOORSPEED)
+                    fl_set_floordestheight(f, P_FindLowestFloorSurrounding(sec))
+                } else {
+                    if floortype == FLOOR_TURBOLOWER {
+                        fl_set_direction(f, 0 - 1)
+                        fl_set_sector(f, sec)
+                        fl_set_speed(f, FLOOR_FLOORSPEED * 4)
+                        fl_set_floordestheight(f, P_FindHighestFloorSurrounding(sec))
+                        if fl_floordestheight(f) != GEOM_sector_floorheight(sec) {
+                            fl_set_floordestheight(f, fl_floordestheight(f) + 8 * FLOOR_FRACUNIT)
+                        }
+                    } else {
+                        if floortype == FLOOR_RAISEFLOORCRUSH or floortype == FLOOR_RAISEFLOOR {
+                            if floortype == FLOOR_RAISEFLOORCRUSH {
+                                fl_set_crush(f, 1)
+                            }
+                            fl_set_direction(f, 1)
+                            fl_set_sector(f, sec)
+                            fl_set_speed(f, FLOOR_FLOORSPEED)
+                            fl_set_floordestheight(f, P_FindLowestCeilingSurrounding(sec))
+                            if fl_floordestheight(f) > GEOM_sector_ceilingheight(sec) {
+                                fl_set_floordestheight(f, GEOM_sector_ceilingheight(sec))
+                            }
+                            if floortype == FLOOR_RAISEFLOORCRUSH {
+                                fl_set_floordestheight(f, fl_floordestheight(f) - 8 * FLOOR_FRACUNIT)
+                            }
+                        } else {
+                            if floortype == FLOOR_RAISEFLOORTURBO {
+                                fl_set_direction(f, 1)
+                                fl_set_sector(f, sec)
+                                fl_set_speed(f, FLOOR_FLOORSPEED * 4)
+                                fl_set_floordestheight(f, P_FindNextHighestFloor(sec, GEOM_sector_floorheight(sec)))
+                            } else {
+                                if floortype == FLOOR_RAISEFLOORTONEAREST {
+                                    fl_set_direction(f, 1)
+                                    fl_set_sector(f, sec)
+                                    fl_set_speed(f, FLOOR_FLOORSPEED)
+                                    fl_set_floordestheight(f, P_FindNextHighestFloor(sec, GEOM_sector_floorheight(sec)))
+                                } else {
+                                    if floortype == FLOOR_RAISEFLOOR24 {
+                                        fl_set_direction(f, 1)
+                                        fl_set_sector(f, sec)
+                                        fl_set_speed(f, FLOOR_FLOORSPEED)
+                                        fl_set_floordestheight(f, GEOM_sector_floorheight(sec) + 24 * FLOOR_FRACUNIT)
+                                    } else {
+                                        if floortype == FLOOR_RAISEFLOOR512 {
+                                            fl_set_direction(f, 1)
+                                            fl_set_sector(f, sec)
+                                            fl_set_speed(f, FLOOR_FLOORSPEED)
+                                            fl_set_floordestheight(f, GEOM_sector_floorheight(sec) + 512 * FLOOR_FRACUNIT)
+                                        } else {
+                                            if floortype == FLOOR_RAISEFLOOR24ANDCHANGE {
+                                                fl_set_direction(f, 1)
+                                                fl_set_sector(f, sec)
+                                                fl_set_speed(f, FLOOR_FLOORSPEED)
+                                                fl_set_floordestheight(f, GEOM_sector_floorheight(sec) + 24 * FLOOR_FRACUNIT)
+                                                GEOM_sector_set_floorpic(sec, GEOM_sector_floorpic(GEOM_line_frontsector(line)))
+                                                GEOM_sector_set_special(sec, GEOM_sector_special(GEOM_line_frontsector(line)))
+                                            } else {
+                                                if floortype == FLOOR_RAISETOTEXTURE {
+                                                    let mut minsize: i32 = FLOOR_INT_MAX
+                                                    fl_set_direction(f, 1)
+                                                    fl_set_sector(f, sec)
+                                                    fl_set_speed(f, FLOOR_FLOORSPEED)
+                                                    let mut i: i32 = 0
+                                                    while i < GEOM_sector_linecount(sec) {
+                                                        if twoSided(secnum, i) != 0 {
+                                                            let mut side: ptr<void> = getSide(secnum, i, 0)
+                                                            let mut bt: i32 = GEOM_side_bottomtexture(side)
+                                                            if bt >= 0 {
+                                                                if RDATA_textureheight(bt) < minsize {
+                                                                    minsize = RDATA_textureheight(bt)
+                                                                }
+                                                            }
+                                                            side = getSide(secnum, i, 1)
+                                                            bt = GEOM_side_bottomtexture(side)
+                                                            if bt >= 0 {
+                                                                if RDATA_textureheight(bt) < minsize {
+                                                                    minsize = RDATA_textureheight(bt)
+                                                                }
+                                                            }
+                                                        }
+                                                        i = i + 1
+                                                    }
+                                                    fl_set_floordestheight(f, GEOM_sector_floorheight(sec) + minsize)
+                                                } else {
+                                                    if floortype == FLOOR_LOWERANDCHANGE {
+                                                        fl_set_direction(f, 0 - 1)
+                                                        fl_set_sector(f, sec)
+                                                        fl_set_speed(f, FLOOR_FLOORSPEED)
+                                                        fl_set_floordestheight(f, P_FindLowestFloorSurrounding(sec))
+                                                        fl_set_texture(f, GEOM_sector_floorpic(sec))
+
+                                                        let mut i2: i32 = 0
+                                                        let mut found: bool = false
+                                                        while i2 < GEOM_sector_linecount(sec) and !found {
+                                                            if twoSided(secnum, i2) != 0 {
+                                                                if GEOM_sector_index(GEOM_side_sector(getSide(secnum, i2, 0))) == secnum {
+                                                                    sec = getSector(secnum, i2, 1)
+                                                                    if GEOM_sector_floorheight(sec) == fl_floordestheight(f) {
+                                                                        fl_set_texture(f, GEOM_sector_floorpic(sec))
+                                                                        fl_set_newspecial(f, GEOM_sector_special(sec))
+                                                                        found = true
+                                                                    }
+                                                                } else {
+                                                                    sec = getSector(secnum, i2, 0)
+                                                                    if GEOM_sector_floorheight(sec) == fl_floordestheight(f) {
+                                                                        fl_set_texture(f, GEOM_sector_floorpic(sec))
+                                                                        fl_set_newspecial(f, GEOM_sector_special(sec))
+                                                                        found = true
+                                                                    }
+                                                                }
+                                                            }
+                                                            i2 = i2 + 1
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        secnum = P_FindSectorFromLineTag(line, secnum)
+    }
+    return rtn
+}
+
+# ---- EV_BuildStairs ---------------------------------------------------
+
+@flow_api
+function EV_BuildStairs(line: ptr<void>, stairtype: i32) -> i32 {
+    let mut secnum: i32 = 0 - 1
+    let mut rtn: i32 = 0
+    let mut stairsize: i32 = 0
+    let mut speed: i32 = 0
+
+    secnum = P_FindSectorFromLineTag(line, secnum)
+    while secnum >= 0 {
+        let mut sec: ptr<void> = GEOM_sector(secnum)
+
+        if (GEOM_sector_specialdata(sec) as i64) == 0 {
+            rtn = 1
+            let mut floor: ptr<void> = Z_Malloc(FLOOR_SIZEOF_FLOORMOVE, FLOOR_PU_LEVSPEC, null)
+            let mut f: ptr<u8> = floor as ptr<u8>
+            P_AddThinker(floor)
+            GEOM_sector_set_specialdata(sec, floor)
+            THINKER_set_move_floor(floor)
+            fl_set_direction(f, 1)
+            fl_set_sector(f, sec)
+
+            if stairtype == FLOOR_BUILD8 {
+                speed = FLOOR_FLOORSPEED / 4
+                stairsize = 8 * FLOOR_FRACUNIT
+            } else {
+                if stairtype == FLOOR_TURBO16 {
+                    speed = FLOOR_FLOORSPEED * 4
+                    stairsize = 16 * FLOOR_FRACUNIT
+                }
+            }
+            fl_set_speed(f, speed)
+            let mut height: i32 = GEOM_sector_floorheight(sec) + stairsize
+            fl_set_floordestheight(f, height)
+
+            let texture: i32 = GEOM_sector_floorpic(sec)
+
+            # Find next sector to raise
+            let mut ok: i32 = 1
+            while ok != 0 {
+                ok = 0
+                let mut i: i32 = 0
+                let mut looping: bool = true
+                while i < GEOM_sector_linecount(sec) and looping {
+                    let li: ptr<void> = GEOM_sector_line(sec, i)
+                    if (GEOM_line_flags(li) & FLOOR_ML_TWOSIDED) != 0 {
+                        let mut tsec: ptr<void> = GEOM_line_frontsector(li)
+                        let mut newsecnum: i32 = GEOM_sector_index(tsec)
+
+                        if secnum == newsecnum {
+                            tsec = GEOM_line_backsector(li)
+                            newsecnum = GEOM_sector_index(tsec)
+
+                            if GEOM_sector_floorpic(tsec) == texture {
+                                # C increments height even when the next
+                                # sector already has specialdata.
+                                height = height + stairsize
+                                if (GEOM_sector_specialdata(tsec) as i64) == 0 {
+                                    sec = tsec
+                                    secnum = newsecnum
+                                    floor = Z_Malloc(FLOOR_SIZEOF_FLOORMOVE, FLOOR_PU_LEVSPEC, null)
+                                    f = floor as ptr<u8>
+                                    P_AddThinker(floor)
+                                    GEOM_sector_set_specialdata(sec, floor)
+                                    THINKER_set_move_floor(floor)
+                                    fl_set_direction(f, 1)
+                                    fl_set_sector(f, sec)
+                                    fl_set_speed(f, speed)
+                                    fl_set_floordestheight(f, height)
+                                    ok = 1
+                                    looping = false
+                                }
+                            }
+                        }
+                    }
+                    i = i + 1
+                }
+            }
+        }
+        secnum = P_FindSectorFromLineTag(line, secnum)
+    }
+    return rtn
+}

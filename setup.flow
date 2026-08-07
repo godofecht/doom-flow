@@ -1,0 +1,1834 @@
+# Map setup / WAD I/O, ported from p_setup.c to Flow.
+#
+# Loads VERTEXES, LINEDEFS, SIDEDEFS, SECTORS, SSECTORS, NODES, SEGS,
+# BLOCKMAP, REJECT and THINGS, then groups sector line lists. Public ABI
+# (p_setup.h): P_SetupLevel, P_Init. Load helpers stay module-private.
+#
+# Geometry counts/pointers/blockmap/REJECT are Flow-owned (`let mut` +
+# @flow_api). deathmatchstarts / deathmatch_p index / playerstarts also
+# live here (was setup_data.c). Geometry blobs use doom_layout.h
+# GEOM_*_SIZEOF; field writes go through GEOM_OFF_* so this file never
+# invents sector_t / line_t / seg_t C types.
+#
+# LP64 sizes (verified with sizeof against doomgeneric headers):
+#   mapvertex_t 4  mapseg_t 12  mapsector_t 26  mapsubsector_t 4
+#   mapnode_t 28  maplinedef_t 14  mapsidedef_t 30  mapthing_t 10
+#   vertex_t 8  seg_t 56  sector_t 128  subsector_t 16
+#   node_t 52  line_t 88  side_t 24
+#   → GEOM_*_SIZEOF / doom_layout.h
+
+extern { function memset(dest: ptr<void>, c: i32, n: i64) -> ptr<void> }
+extern { function memcpy(dest: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+extern { function printf(fmt: string, a: i32, b: i32) -> i32 }
+extern { function snprintf(buf: string, n: i64, fmt: string, v: i32) -> i32 }
+extern { function M_CheckParm(check: string) -> i32 }
+
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function Z_FreeTags(lowtag: i32, hightag: i32) -> void }
+extern { function W_LumpLength(lump: u32) -> i32 }
+extern { function W_CacheLumpNum(lumpnum: i32, tag: i32) -> ptr<void> }
+extern { function W_ReleaseLumpNum(lump: i32) -> void }
+extern { function W_ReadLump(lump: u32, dest: ptr<void>) -> void }
+extern { function W_GetNumForName(name: string) -> i32 }
+
+extern { function FixedDiv(a: i32, b: i32) -> i32 }
+extern { function M_ClearBox(box: ptr<i32>) -> void }
+extern { function M_AddToBox(box: ptr<i32>, x: i32, y: i32) -> void }
+
+extern { function P_InitThinkers() -> void }
+extern { function P_InitSwitchList() -> void }
+extern { function P_InitPicAnims() -> void }
+extern { function P_SpawnSpecials() -> void }
+extern { function S_Start() -> void }
+extern { function G_DeathMatchSpawnPlayer(playernum: i32) -> void }
+extern { function R_PrecacheLevel() -> void }
+extern { function R_InitSprites(namelist: ptr<ptr<u8> >) -> void }
+extern { function R_FlatNumForName(name: string) -> i32 }
+extern { function R_TextureNumForName(name: string) -> i32 }
+extern { function P_SpawnMapThing(mthing: ptr<void>) -> void }
+extern { function I_GetMemoryValue(offset: u32, value: ptr<void>, size: i32) -> i32 }
+extern { function info_sprnames_addr() -> ptr<string> }
+extern { function mobjshim_set_iquehead(v: i32) -> void }
+extern { function mobjshim_set_iquetail(v: i32) -> void }
+
+extern { function gameshim_clear_totals() -> void }
+extern { function gameshim_precache() -> i32 }
+extern { function gameshim_wminfo_set_maxfrags(v: i32) -> void }
+extern { function gameshim_wminfo_set_partime(v: i32) -> void }
+
+extern { function PLAYER_at(i: i32) -> ptr<void> }
+extern { function PLAYER_set_killcount(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_secretcount(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_itemcount(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_viewz(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_mo(p: ptr<void>, m: ptr<void>) -> void }
+extern { function gameshim_set_bodyqueslot(v: i32) -> void }
+
+# ---- Flow-owned map geometry (was setup_shim.c) -----------------------
+
+let mut numvertexes: i32 = 0
+let mut vertexes: ptr<void> = null
+let mut numsegs: i32 = 0
+let mut segs: ptr<void> = null
+let mut numsectors: i32 = 0
+let mut sectors: ptr<void> = null
+let mut numsubsectors: i32 = 0
+let mut subsectors: ptr<void> = null
+let mut numnodes: i32 = 0
+let mut nodes: ptr<void> = null
+let mut numlines: i32 = 0
+let mut lines: ptr<void> = null
+let mut numsides: i32 = 0
+let mut sides: ptr<void> = null
+
+let mut bmapwidth: i32 = 0
+let mut bmapheight: i32 = 0
+let mut bmaporgx: i32 = 0
+let mut bmaporgy: i32 = 0
+let mut blockmap: ptr<i16> = null
+let mut blockmaplump: ptr<i16> = null
+let mut blocklinks: ptr<ptr<void> > = null
+let mut rejectmatrix: ptr<void> = null
+
+let mut setup_null_sector: ptr<void> = null
+let mut setup_lumpname: array<u8, 9> = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+# Formerly setup_data.c — mapthing_t is 10 bytes; MAX_DM_STARTS=10, MAXPLAYERS=4
+const SETUP_MAX_DM_STARTS: i32 = 10
+const SETUP_MAXPLAYERS: i32 = 4
+const SETUP_MAPTHING_BYTES: i32 = 10
+let mut deathmatchstarts: array<u8, 100> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+let mut deathmatch_p_idx: i32 = 0
+let mut playerstarts: array<u8, 40> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+@flow_api
+function setupshim_reset_deathmatch_p() -> void { deathmatch_p_idx = 0 }
+
+@flow_api
+function setupshim_deathmatch_p_room() -> i32 {
+    if deathmatch_p_idx < SETUP_MAX_DM_STARTS { return 1 }
+    return 0
+}
+
+@flow_api
+function setupshim_store_deathmatch_start(mthing: ptr<void>) -> void {
+    let dst: ptr<void> = (&deathmatchstarts[deathmatch_p_idx * SETUP_MAPTHING_BYTES]) as ptr<void>
+    memcpy(dst, mthing, SETUP_MAPTHING_BYTES as i64)
+    deathmatch_p_idx = deathmatch_p_idx + 1
+}
+
+@flow_api
+function setupshim_store_playerstart(i: i32, mthing: ptr<void>) -> void {
+    let dst: ptr<void> = (&playerstarts[i * SETUP_MAPTHING_BYTES]) as ptr<void>
+    memcpy(dst, mthing, SETUP_MAPTHING_BYTES as i64)
+}
+
+@flow_api
+function setupshim_playerstarts_addr() -> ptr<void> {
+    return &playerstarts[0] as ptr<void>
+}
+
+@flow_api
+function gameshim_deathmatchstart(i: i32) -> ptr<void> {
+    return (&deathmatchstarts[i * SETUP_MAPTHING_BYTES]) as ptr<void>
+}
+
+@flow_api
+function gameshim_playerstart(i: i32) -> ptr<void> {
+    return (&playerstarts[i * SETUP_MAPTHING_BYTES]) as ptr<void>
+}
+
+@flow_api
+function gameshim_deathmatch_selections() -> i32 { return deathmatch_p_idx }
+
+@flow_api
+function setupshim_clear_totals() -> void {
+    gameshim_clear_totals()
+    gameshim_wminfo_set_maxfrags(0)
+    gameshim_wminfo_set_partime(180)
+}
+
+@flow_api
+function setupshim_precache() -> i32 { return gameshim_precache() }
+
+@flow_api
+function GEOM_bmaporgx() -> i32 { return bmaporgx }
+@flow_api
+function GEOM_set_bmaporgx(v: i32) -> void { bmaporgx = v }
+@flow_api
+function GEOM_bmaporgy() -> i32 { return bmaporgy }
+@flow_api
+function GEOM_set_bmaporgy(v: i32) -> void { bmaporgy = v }
+@flow_api
+function GEOM_bmapwidth() -> i32 { return bmapwidth }
+@flow_api
+function GEOM_set_bmapwidth(v: i32) -> void { bmapwidth = v }
+@flow_api
+function GEOM_bmapheight() -> i32 { return bmapheight }
+@flow_api
+function GEOM_set_bmapheight(v: i32) -> void { bmapheight = v }
+
+@flow_api
+function GEOM_numvertexes() -> i32 { return numvertexes }
+@flow_api
+function GEOM_set_numvertexes(n: i32) -> void { numvertexes = n }
+@flow_api
+function GEOM_numsegs() -> i32 { return numsegs }
+@flow_api
+function GEOM_set_numsegs(n: i32) -> void { numsegs = n }
+@flow_api
+function GEOM_numsectors() -> i32 { return numsectors }
+@flow_api
+function GEOM_set_numsectors(n: i32) -> void { numsectors = n }
+@flow_api
+function GEOM_numsubsectors() -> i32 { return numsubsectors }
+@flow_api
+function GEOM_set_numsubsectors(n: i32) -> void { numsubsectors = n }
+@flow_api
+function GEOM_numnodes() -> i32 { return numnodes }
+@flow_api
+function GEOM_set_numnodes(n: i32) -> void { numnodes = n }
+@flow_api
+function GEOM_numlines() -> i32 { return numlines }
+@flow_api
+function GEOM_set_numlines(n: i32) -> void { numlines = n }
+@flow_api
+function GEOM_numsides() -> i32 { return numsides }
+@flow_api
+function GEOM_set_numsides(n: i32) -> void { numsides = n }
+
+@flow_api
+function GEOM_set_vertexes(p: ptr<void>) -> void { vertexes = p }
+@flow_api
+function GEOM_set_segs(p: ptr<void>) -> void { segs = p }
+@flow_api
+function GEOM_set_sectors(p: ptr<void>) -> void { sectors = p }
+@flow_api
+function GEOM_set_subsectors(p: ptr<void>) -> void { subsectors = p }
+@flow_api
+function GEOM_set_nodes(p: ptr<void>) -> void { nodes = p }
+@flow_api
+function GEOM_set_lines(p: ptr<void>) -> void { lines = p }
+@flow_api
+function GEOM_set_sides(p: ptr<void>) -> void { sides = p }
+
+@flow_api
+function GEOM_set_blockmaplump(p: ptr<void>) -> void { blockmaplump = p as ptr<i16> }
+@flow_api
+function GEOM_set_blockmap(p: ptr<void>) -> void { blockmap = p as ptr<i16> }
+@flow_api
+function GEOM_set_blocklinks(p: ptr<void>) -> void { blocklinks = p as ptr<ptr<void> > }
+@flow_api
+function GEOM_set_rejectmatrix(p: ptr<void>) -> void { rejectmatrix = p }
+
+@flow_api
+function GEOM_blockmaplump_at(i: i32) -> i16 { return blockmaplump[i] }
+@flow_api
+function GEOM_set_blockmaplump_at(i: i32, v: i16) -> void { blockmaplump[i] = v }
+
+@flow_api
+function GEOM_rejectmatrix_user() -> ptr<ptr<void> > { return &rejectmatrix }
+
+# Blockmap helpers used by maputl.flow (keep setupshim_* names).
+@flow_api
+function setupshim_blockmap_list_start(x: i32, y: i32) -> i32 {
+    if x < 0 or y < 0 or x >= bmapwidth or y >= bmapheight {
+        return 0 - 1
+    }
+    return blockmap[y * bmapwidth + x] as i32
+}
+
+@flow_api
+function setupshim_blockmaplump_index(offset: i32) -> i32 {
+    return blockmaplump[offset] as i32
+}
+
+@flow_api
+function setupshim_blocklink(x: i32, y: i32) -> ptr<void> {
+    if x < 0 or y < 0 or x >= bmapwidth or y >= bmapheight {
+        return null
+    }
+    return blocklinks[y * bmapwidth + x]
+}
+
+@flow_api
+function setupshim_set_blocklink(x: i32, y: i32, m: ptr<void>) -> void {
+    if x >= 0 and x < bmapwidth and y >= 0 and y < bmapheight {
+        blocklinks[y * bmapwidth + x] = m
+    }
+}
+
+# ---- constants (prefixed: one Flow TU) --------------------------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+# m_fixed.h
+const SETUP_FRACBITS: i32 = 16
+
+# z_zone.h
+const SETUP_PU_STATIC: i32 = 1
+const SETUP_PU_LEVEL: i32 = 5
+const SETUP_PU_PURGELEVEL: i32 = 7
+
+# d_mode.h GameMode_t
+const SETUP_COMMERCIAL: i32 = 2
+
+# doomdata.h lump order
+const SETUP_ML_THINGS: i32 = 1
+const SETUP_ML_LINEDEFS: i32 = 2
+const SETUP_ML_SIDEDEFS: i32 = 3
+const SETUP_ML_VERTEXES: i32 = 4
+const SETUP_ML_SEGS: i32 = 5
+const SETUP_ML_SSECTORS: i32 = 6
+const SETUP_ML_NODES: i32 = 7
+const SETUP_ML_SECTORS: i32 = 8
+const SETUP_ML_REJECT: i32 = 9
+const SETUP_ML_BLOCKMAP: i32 = 10
+
+# doomdata.h
+const SETUP_ML_TWOSIDED: i32 = 4
+
+# m_bbox.h
+const SETUP_BOXTOP: i32 = 0
+const SETUP_BOXBOTTOM: i32 = 1
+const SETUP_BOXLEFT: i32 = 2
+const SETUP_BOXRIGHT: i32 = 3
+
+# r_defs.h slopetype_t
+const SETUP_ST_HORIZONTAL: i32 = 0
+const SETUP_ST_VERTICAL: i32 = 1
+const SETUP_ST_POSITIVE: i32 = 2
+const SETUP_ST_NEGATIVE: i32 = 3
+
+# p_local.h
+const SETUP_MAXRADIUS: i32 = 2097152   # 32*FRACUNIT
+const SETUP_MAPBLOCKSHIFT: i32 = 23    # FRACBITS+7
+
+# sizeof map / runtime records (LP64) — GEOM_*_SIZEOF mirror doom_layout.h
+const SETUP_SIZEOF_MAPVERTEX: i32 = 4
+const SETUP_SIZEOF_MAPSEG: i32 = 12
+const SETUP_SIZEOF_MAPSECTOR: i32 = 26
+const SETUP_SIZEOF_MAPSUBSECTOR: i32 = 4
+const SETUP_SIZEOF_MAPNODE: i32 = 28
+const SETUP_SIZEOF_MAPLINEDEF: i32 = 14
+const SETUP_SIZEOF_MAPSIDEDEF: i32 = 30
+const SETUP_SIZEOF_MAPTHING: i32 = 10
+const GEOM_VERTEX_SIZEOF: i32 = 8
+const GEOM_SEG_SIZEOF: i32 = 56
+const GEOM_SECTOR_SIZEOF: i32 = 128
+const GEOM_SUBSECTOR_SIZEOF: i32 = 16
+const GEOM_NODE_SIZEOF: i32 = 52
+const GEOM_LINE_SIZEOF: i32 = 88
+const GEOM_SIDE_SIZEOF: i32 = 24
+const GEOM_MAPTHING_SIZEOF: i32 = 10
+const GEOM_PTR_SIZEOF: i32 = 8
+# Aliases kept for any leftover SETUP_SIZEOF_* references
+const SETUP_SIZEOF_VERTEX: i32 = GEOM_VERTEX_SIZEOF
+const SETUP_SIZEOF_SEG: i32 = GEOM_SEG_SIZEOF
+const SETUP_SIZEOF_SECTOR: i32 = GEOM_SECTOR_SIZEOF
+const SETUP_SIZEOF_SUBSECTOR: i32 = GEOM_SUBSECTOR_SIZEOF
+const SETUP_SIZEOF_NODE: i32 = GEOM_NODE_SIZEOF
+const SETUP_SIZEOF_LINE: i32 = GEOM_LINE_SIZEOF
+const SETUP_SIZEOF_SIDE: i32 = GEOM_SIDE_SIZEOF
+const SETUP_SIZEOF_PTR: i32 = GEOM_PTR_SIZEOF
+
+# PadRejectArray rejectpad is 4 * uint32
+const SETUP_REJECTPAD_BYTES: i32 = 16
+
+# ---- LP64 offsetof tables (verified against doomgeneric r_defs.h) -----
+#
+#   sector_t (sizeof 128): floorheight 0, ceilingheight 4, floorpic 8,
+#     ceilingpic 10, lightlevel 12, special 14, tag 16, soundtraversed 20,
+#     soundtarget 24, blockbox 32, soundorg 48 (degenmobj_t: thinker_t 0-24,
+#     x 24, y 28, z 32 within it -> sector-relative x 72, y 76),
+#     validcount 88, thinglist 96, specialdata 104, linecount 112, lines 120
+#   line_t (sizeof 88): v1 0, v2 8, dx 16, dy 20, flags 24, special 26,
+#     tag 28, sidenum 30, bbox 36, slopetype 52, frontsector 56,
+#     backsector 64, validcount 72, specialdata 80
+#   side_t (sizeof 24): textureoffset 0, rowoffset 4, toptexture 8,
+#     bottomtexture 10, midtexture 12, sector 16
+#   seg_t (sizeof 56): v1 0, v2 8, offset 16, angle 20, sidedef 24,
+#     linedef 32, frontsector 40, backsector 48
+#   subsector_t (sizeof 16): sector 0, numlines 8, firstline 10
+#   node_t (sizeof 52): x 0, y 4, dx 8, dy 12, bbox 16 (2x4 i32), children 48
+#   vertex_t (sizeof 8): x 0, y 4
+
+const GEOM_OFF_SEC_FLOORHEIGHT: i32 = 0
+const GEOM_OFF_SEC_CEILINGHEIGHT: i32 = 4
+const GEOM_OFF_SEC_FLOORPIC: i32 = 8
+const GEOM_OFF_SEC_CEILINGPIC: i32 = 10
+const GEOM_OFF_SEC_LIGHTLEVEL: i32 = 12
+const GEOM_OFF_SEC_SPECIAL: i32 = 14
+const GEOM_OFF_SEC_TAG: i32 = 16
+const GEOM_OFF_SEC_SOUNDTRAVERSED: i32 = 20
+const GEOM_OFF_SEC_SOUNDTARGET: i32 = 24
+const GEOM_OFF_SEC_BLOCKBOX: i32 = 32
+const GEOM_OFF_SEC_SOUNDORG: i32 = 48
+const GEOM_OFF_SEC_SOUNDORG_X: i32 = 72
+const GEOM_OFF_SEC_SOUNDORG_Y: i32 = 76
+const GEOM_OFF_SEC_VALIDCOUNT: i32 = 88
+const GEOM_OFF_SEC_THINGLIST: i32 = 96
+const GEOM_OFF_SEC_SPECIALDATA: i32 = 104
+const GEOM_OFF_SEC_LINECOUNT: i32 = 112
+const GEOM_OFF_SEC_LINES: i32 = 120
+
+const GEOM_OFF_LINE_V1: i32 = 0
+const GEOM_OFF_LINE_V2: i32 = 8
+const GEOM_OFF_LINE_DX: i32 = 16
+const GEOM_OFF_LINE_DY: i32 = 20
+const GEOM_OFF_LINE_FLAGS: i32 = 24
+const GEOM_OFF_LINE_SPECIAL: i32 = 26
+const GEOM_OFF_LINE_TAG: i32 = 28
+const GEOM_OFF_LINE_SIDENUM: i32 = 30
+const GEOM_OFF_LINE_BBOX: i32 = 36
+const GEOM_OFF_LINE_SLOPETYPE: i32 = 52
+const GEOM_OFF_LINE_FRONTSECTOR: i32 = 56
+const GEOM_OFF_LINE_BACKSECTOR: i32 = 64
+const GEOM_OFF_LINE_VALIDCOUNT: i32 = 72
+const GEOM_OFF_LINE_SPECIALDATA: i32 = 80
+
+const GEOM_OFF_SIDE_TEXTUREOFFSET: i32 = 0
+const GEOM_OFF_SIDE_ROWOFFSET: i32 = 4
+const GEOM_OFF_SIDE_TOPTEXTURE: i32 = 8
+const GEOM_OFF_SIDE_BOTTOMTEXTURE: i32 = 10
+const GEOM_OFF_SIDE_MIDTEXTURE: i32 = 12
+const GEOM_OFF_SIDE_SECTOR: i32 = 16
+
+const GEOM_OFF_SEG_V1: i32 = 0
+const GEOM_OFF_SEG_V2: i32 = 8
+const GEOM_OFF_SEG_OFFSET: i32 = 16
+const GEOM_OFF_SEG_ANGLE: i32 = 20
+const GEOM_OFF_SEG_SIDEDEF: i32 = 24
+const GEOM_OFF_SEG_LINEDEF: i32 = 32
+const GEOM_OFF_SEG_FRONTSECTOR: i32 = 40
+const GEOM_OFF_SEG_BACKSECTOR: i32 = 48
+
+const GEOM_OFF_SUBSEC_SECTOR: i32 = 0
+const GEOM_OFF_SUBSEC_NUMLINES: i32 = 8
+const GEOM_OFF_SUBSEC_FIRSTLINE: i32 = 10
+
+const GEOM_OFF_NODE_X: i32 = 0
+const GEOM_OFF_NODE_Y: i32 = 4
+const GEOM_OFF_NODE_DX: i32 = 8
+const GEOM_OFF_NODE_DY: i32 = 12
+const GEOM_OFF_NODE_BBOX: i32 = 16
+const GEOM_OFF_NODE_CHILDREN: i32 = 48
+
+const GEOM_OFF_VERTEX_X: i32 = 0
+const GEOM_OFF_VERTEX_Y: i32 = 4
+
+# ---- offset helpers for C-owned engine structs (mirrors saveg.flow) ---
+
+function geom_i16(base: i64, off: i32) -> i32 {
+    let p: ptr<i16> = (base + off as i64) as ptr<i16>
+    return p[0] as i32
+}
+
+function geom_set_i16(base: i64, off: i32, v: i32) -> void {
+    let p: ptr<i16> = (base + off as i64) as ptr<i16>
+    p[0] = v as i16
+}
+
+function geom_u16(base: i64, off: i32) -> i32 {
+    let p: ptr<u16> = (base + off as i64) as ptr<u16>
+    return p[0] as i32
+}
+
+function geom_set_u16(base: i64, off: i32, v: i32) -> void {
+    let p: ptr<u16> = (base + off as i64) as ptr<u16>
+    p[0] = v as u16
+}
+
+function geom_i32(base: i64, off: i32) -> i32 {
+    let p: ptr<i32> = (base + off as i64) as ptr<i32>
+    return p[0]
+}
+
+function geom_set_i32(base: i64, off: i32, v: i32) -> void {
+    let p: ptr<i32> = (base + off as i64) as ptr<i32>
+    p[0] = v
+}
+
+function geom_u32(base: i64, off: i32) -> u32 {
+    let p: ptr<u32> = (base + off as i64) as ptr<u32>
+    return p[0]
+}
+
+function geom_set_u32(base: i64, off: i32, v: u32) -> void {
+    let p: ptr<u32> = (base + off as i64) as ptr<u32>
+    p[0] = v
+}
+
+function geom_ptr(base: i64, off: i32) -> ptr<void> {
+    let p: ptr<i64> = (base + off as i64) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+function geom_set_ptr(base: i64, off: i32, v: ptr<void>) -> void {
+    let p: ptr<i64> = (base + off as i64) as ptr<i64>
+    p[0] = v as i64
+}
+
+# Shared sector_t field accessors (map arrays Flow-owned above;
+# field offsets explicit here). Prefer these over per-module
+# *shim_sec_* / *shim_sector_* clones.
+
+@flow_api
+function GEOM_sector_floorheight(s: ptr<void>) -> i32 {
+    return geom_i32(s as i64, GEOM_OFF_SEC_FLOORHEIGHT)
+}
+
+@flow_api
+function GEOM_sector_ceilingheight(s: ptr<void>) -> i32 {
+    return geom_i32(s as i64, GEOM_OFF_SEC_CEILINGHEIGHT)
+}
+
+@flow_api
+function GEOM_sector_floorpic(s: ptr<void>) -> i32 {
+    return geom_i16(s as i64, GEOM_OFF_SEC_FLOORPIC)
+}
+
+@flow_api
+function GEOM_sector_ceilingpic(s: ptr<void>) -> i32 {
+    return geom_i16(s as i64, GEOM_OFF_SEC_CEILINGPIC)
+}
+
+@flow_api
+function GEOM_sector_lightlevel(s: ptr<void>) -> i32 {
+    return geom_i16(s as i64, GEOM_OFF_SEC_LIGHTLEVEL)
+}
+
+@flow_api
+function GEOM_sector_special(s: ptr<void>) -> i32 {
+    return geom_i16(s as i64, GEOM_OFF_SEC_SPECIAL)
+}
+
+@flow_api
+function GEOM_sector_tag(s: ptr<void>) -> i32 {
+    return geom_i16(s as i64, GEOM_OFF_SEC_TAG)
+}
+
+@flow_api
+function GEOM_sector_set_floorheight(s: ptr<void>, v: i32) -> void {
+    geom_set_i32(s as i64, GEOM_OFF_SEC_FLOORHEIGHT, v)
+}
+
+@flow_api
+function GEOM_sector_set_ceilingheight(s: ptr<void>, v: i32) -> void {
+    geom_set_i32(s as i64, GEOM_OFF_SEC_CEILINGHEIGHT, v)
+}
+
+@flow_api
+function GEOM_sector_set_floorpic(s: ptr<void>, v: i32) -> void {
+    geom_set_i16(s as i64, GEOM_OFF_SEC_FLOORPIC, v)
+}
+
+@flow_api
+function GEOM_sector_set_ceilingpic(s: ptr<void>, v: i32) -> void {
+    geom_set_i16(s as i64, GEOM_OFF_SEC_CEILINGPIC, v)
+}
+
+@flow_api
+function GEOM_sector_set_lightlevel(s: ptr<void>, v: i32) -> void {
+    geom_set_i16(s as i64, GEOM_OFF_SEC_LIGHTLEVEL, v)
+}
+
+@flow_api
+function GEOM_sector_set_special(s: ptr<void>, v: i32) -> void {
+    geom_set_i16(s as i64, GEOM_OFF_SEC_SPECIAL, v)
+}
+
+@flow_api
+function GEOM_sector_set_tag(s: ptr<void>, v: i32) -> void {
+    geom_set_i16(s as i64, GEOM_OFF_SEC_TAG, v)
+}
+
+@flow_api
+function GEOM_sector(i: i32) -> ptr<void> {
+    return ((sectors as i64) + (i * GEOM_SECTOR_SIZEOF) as i64) as ptr<void>
+}
+
+@flow_api
+function GEOM_sector_index(sec: ptr<void>) -> i32 {
+    return ((sec as i64) - (sectors as i64)) as i32 / GEOM_SECTOR_SIZEOF
+}
+
+@flow_api
+function GEOM_line(i: i32) -> ptr<void> {
+    return ((lines as i64) + (i * GEOM_LINE_SIZEOF) as i64) as ptr<void>
+}
+
+@flow_api
+function GEOM_line_index(line: ptr<void>) -> i32 {
+    return ((line as i64) - (lines as i64)) as i32 / GEOM_LINE_SIZEOF
+}
+
+@flow_api
+function GEOM_line_bbox(line: ptr<void>, i: i32) -> i32 {
+    return geom_i32(line as i64, GEOM_OFF_LINE_BBOX + i * 4)
+}
+
+@flow_api
+function GEOM_line_i_flags(i: i32) -> i32 {
+    return geom_i16(GEOM_line(i) as i64, GEOM_OFF_LINE_FLAGS)
+}
+
+@flow_api
+function GEOM_line_i_special(i: i32) -> i32 {
+    return geom_i16(GEOM_line(i) as i64, GEOM_OFF_LINE_SPECIAL)
+}
+
+@flow_api
+function GEOM_line_i_v1x(i: i32) -> i32 {
+    let v1: ptr<void> = geom_ptr(GEOM_line(i) as i64, GEOM_OFF_LINE_V1)
+    return geom_i32(v1 as i64, GEOM_OFF_VERTEX_X)
+}
+
+@flow_api
+function GEOM_line_i_v1y(i: i32) -> i32 {
+    let v1: ptr<void> = geom_ptr(GEOM_line(i) as i64, GEOM_OFF_LINE_V1)
+    return geom_i32(v1 as i64, GEOM_OFF_VERTEX_Y)
+}
+
+@flow_api
+function GEOM_line_i_v2x(i: i32) -> i32 {
+    let v2: ptr<void> = geom_ptr(GEOM_line(i) as i64, GEOM_OFF_LINE_V2)
+    return geom_i32(v2 as i64, GEOM_OFF_VERTEX_X)
+}
+
+@flow_api
+function GEOM_line_i_v2y(i: i32) -> i32 {
+    let v2: ptr<void> = geom_ptr(GEOM_line(i) as i64, GEOM_OFF_LINE_V2)
+    return geom_i32(v2 as i64, GEOM_OFF_VERTEX_Y)
+}
+
+@flow_api
+function GEOM_sector_specialdata(s: ptr<void>) -> ptr<void> {
+    return geom_ptr(s as i64, GEOM_OFF_SEC_SPECIALDATA)
+}
+
+@flow_api
+function GEOM_sector_set_specialdata(s: ptr<void>, p: ptr<void>) -> void {
+    geom_set_ptr(s as i64, GEOM_OFF_SEC_SPECIALDATA, p)
+}
+
+@flow_api
+function GEOM_sector_linecount(s: ptr<void>) -> i32 {
+    return geom_i32(s as i64, GEOM_OFF_SEC_LINECOUNT)
+}
+
+@flow_api
+function GEOM_sector_set_linecount(s: ptr<void>, v: i32) -> void {
+    geom_set_i32(s as i64, GEOM_OFF_SEC_LINECOUNT, v)
+}
+
+@flow_api
+function GEOM_sector_line(s: ptr<void>, i: i32) -> ptr<void> {
+    let lines_p: ptr<void> = geom_ptr(s as i64, GEOM_OFF_SEC_LINES)
+    return geom_ptr(lines_p as i64, i * GEOM_PTR_SIZEOF)
+}
+
+@flow_api
+function GEOM_sector_set_line(s: ptr<void>, i: i32, line: ptr<void>) -> void {
+    let lines_p: ptr<void> = geom_ptr(s as i64, GEOM_OFF_SEC_LINES)
+    geom_set_ptr(lines_p as i64, i * GEOM_PTR_SIZEOF, line)
+}
+
+@flow_api
+function GEOM_sector_set_lines(s: ptr<void>, lines_ptr: ptr<void>) -> void {
+    geom_set_ptr(s as i64, GEOM_OFF_SEC_LINES, lines_ptr)
+}
+
+@flow_api
+function GEOM_sector_soundorg(s: ptr<void>) -> ptr<void> {
+    return ((s as i64) + GEOM_OFF_SEC_SOUNDORG as i64) as ptr<void>
+}
+
+@flow_api
+function GEOM_sector_set_soundorg_xy(s: ptr<void>, x: i32, y: i32) -> void {
+    geom_set_i32(s as i64, GEOM_OFF_SEC_SOUNDORG_X, x)
+    geom_set_i32(s as i64, GEOM_OFF_SEC_SOUNDORG_Y, y)
+}
+
+@flow_api
+function GEOM_sector_soundtarget(s: ptr<void>) -> ptr<void> {
+    return geom_ptr(s as i64, GEOM_OFF_SEC_SOUNDTARGET)
+}
+
+@flow_api
+function GEOM_sector_set_soundtarget(s: ptr<void>, m: ptr<void>) -> void {
+    geom_set_ptr(s as i64, GEOM_OFF_SEC_SOUNDTARGET, m)
+}
+
+@flow_api
+function GEOM_sector_thinglist(s: ptr<void>) -> ptr<void> {
+    return geom_ptr(s as i64, GEOM_OFF_SEC_THINGLIST)
+}
+
+@flow_api
+function GEOM_sector_set_thinglist(s: ptr<void>, m: ptr<void>) -> void {
+    geom_set_ptr(s as i64, GEOM_OFF_SEC_THINGLIST, m)
+}
+
+@flow_api
+function GEOM_sector_validcount(s: ptr<void>) -> i32 {
+    return geom_i32(s as i64, GEOM_OFF_SEC_VALIDCOUNT)
+}
+
+@flow_api
+function GEOM_sector_set_validcount(s: ptr<void>, v: i32) -> void {
+    geom_set_i32(s as i64, GEOM_OFF_SEC_VALIDCOUNT, v)
+}
+
+@flow_api
+function GEOM_sector_blockbox(s: ptr<void>, i: i32) -> i32 {
+    return geom_i32(s as i64, GEOM_OFF_SEC_BLOCKBOX + i * 4)
+}
+
+@flow_api
+function GEOM_sector_set_blockbox(s: ptr<void>, top: i32, bottom: i32, left: i32, right: i32) -> void {
+    let base: i64 = s as i64
+    geom_set_i32(base, GEOM_OFF_SEC_BLOCKBOX + SETUP_BOXTOP * 4, top)
+    geom_set_i32(base, GEOM_OFF_SEC_BLOCKBOX + SETUP_BOXBOTTOM * 4, bottom)
+    geom_set_i32(base, GEOM_OFF_SEC_BLOCKBOX + SETUP_BOXLEFT * 4, left)
+    geom_set_i32(base, GEOM_OFF_SEC_BLOCKBOX + SETUP_BOXRIGHT * 4, right)
+}
+
+@flow_api
+function GEOM_sector_soundtraversed(s: ptr<void>) -> i32 {
+    return geom_i32(s as i64, GEOM_OFF_SEC_SOUNDTRAVERSED)
+}
+
+@flow_api
+function GEOM_sector_set_soundtraversed(s: ptr<void>, v: i32) -> void {
+    geom_set_i32(s as i64, GEOM_OFF_SEC_SOUNDTRAVERSED, v)
+}
+
+# Shared line_t / side_t accessors.
+
+@flow_api
+function GEOM_line_flags(ld: ptr<void>) -> i32 {
+    return geom_i16(ld as i64, GEOM_OFF_LINE_FLAGS)
+}
+
+@flow_api
+function GEOM_line_special(ld: ptr<void>) -> i32 {
+    return geom_i16(ld as i64, GEOM_OFF_LINE_SPECIAL)
+}
+
+@flow_api
+function GEOM_line_tag(ld: ptr<void>) -> i32 {
+    return geom_i16(ld as i64, GEOM_OFF_LINE_TAG)
+}
+
+@flow_api
+function GEOM_line_set_flags(ld: ptr<void>, v: i32) -> void {
+    geom_set_i16(ld as i64, GEOM_OFF_LINE_FLAGS, v)
+}
+
+@flow_api
+function GEOM_line_set_special(ld: ptr<void>, v: i32) -> void {
+    geom_set_i16(ld as i64, GEOM_OFF_LINE_SPECIAL, v)
+}
+
+@flow_api
+function GEOM_line_set_tag(ld: ptr<void>, v: i32) -> void {
+    geom_set_i16(ld as i64, GEOM_OFF_LINE_TAG, v)
+}
+
+@flow_api
+function GEOM_line_sidenum(ld: ptr<void>, side: i32) -> i32 {
+    return geom_i16(ld as i64, GEOM_OFF_LINE_SIDENUM + side * 2)
+}
+
+@flow_api
+function GEOM_line_set_sidenum(ld: ptr<void>, side: i32, v: i32) -> void {
+    geom_set_i16(ld as i64, GEOM_OFF_LINE_SIDENUM + side * 2, v)
+}
+
+@flow_api
+function GEOM_line_frontsector(ld: ptr<void>) -> ptr<void> {
+    return geom_ptr(ld as i64, GEOM_OFF_LINE_FRONTSECTOR)
+}
+
+@flow_api
+function GEOM_line_backsector(ld: ptr<void>) -> ptr<void> {
+    return geom_ptr(ld as i64, GEOM_OFF_LINE_BACKSECTOR)
+}
+
+@flow_api
+function GEOM_line_set_frontsector(ld: ptr<void>, s: ptr<void>) -> void {
+    geom_set_ptr(ld as i64, GEOM_OFF_LINE_FRONTSECTOR, s)
+}
+
+@flow_api
+function GEOM_line_set_backsector(ld: ptr<void>, s: ptr<void>) -> void {
+    geom_set_ptr(ld as i64, GEOM_OFF_LINE_BACKSECTOR, s)
+}
+
+@flow_api
+function GEOM_line_v1(ld: ptr<void>) -> ptr<void> {
+    return geom_ptr(ld as i64, GEOM_OFF_LINE_V1)
+}
+
+@flow_api
+function GEOM_line_v2(ld: ptr<void>) -> ptr<void> {
+    return geom_ptr(ld as i64, GEOM_OFF_LINE_V2)
+}
+
+@flow_api
+function GEOM_line_set_v1(ld: ptr<void>, v: ptr<void>) -> void {
+    geom_set_ptr(ld as i64, GEOM_OFF_LINE_V1, v)
+}
+
+@flow_api
+function GEOM_line_set_v2(ld: ptr<void>, v: ptr<void>) -> void {
+    geom_set_ptr(ld as i64, GEOM_OFF_LINE_V2, v)
+}
+
+@flow_api
+function GEOM_line_dx(ld: ptr<void>) -> i32 {
+    return geom_i32(ld as i64, GEOM_OFF_LINE_DX)
+}
+
+@flow_api
+function GEOM_line_dy(ld: ptr<void>) -> i32 {
+    return geom_i32(ld as i64, GEOM_OFF_LINE_DY)
+}
+
+@flow_api
+function GEOM_line_set_dx(ld: ptr<void>, v: i32) -> void {
+    geom_set_i32(ld as i64, GEOM_OFF_LINE_DX, v)
+}
+
+@flow_api
+function GEOM_line_set_dy(ld: ptr<void>, v: i32) -> void {
+    geom_set_i32(ld as i64, GEOM_OFF_LINE_DY, v)
+}
+
+@flow_api
+function GEOM_line_set_bbox(ld: ptr<void>, left: i32, right: i32, bottom: i32, top: i32) -> void {
+    let base: i64 = ld as i64
+    geom_set_i32(base, GEOM_OFF_LINE_BBOX + SETUP_BOXLEFT * 4, left)
+    geom_set_i32(base, GEOM_OFF_LINE_BBOX + SETUP_BOXRIGHT * 4, right)
+    geom_set_i32(base, GEOM_OFF_LINE_BBOX + SETUP_BOXBOTTOM * 4, bottom)
+    geom_set_i32(base, GEOM_OFF_LINE_BBOX + SETUP_BOXTOP * 4, top)
+}
+
+@flow_api
+function GEOM_side_sector(sd: ptr<void>) -> ptr<void> {
+    return geom_ptr(sd as i64, GEOM_OFF_SIDE_SECTOR)
+}
+
+@flow_api
+function GEOM_side_set_sector(sd: ptr<void>, sec: ptr<void>) -> void {
+    geom_set_ptr(sd as i64, GEOM_OFF_SIDE_SECTOR, sec)
+}
+
+@flow_api
+function GEOM_side_toptexture(sd: ptr<void>) -> i32 {
+    return geom_i16(sd as i64, GEOM_OFF_SIDE_TOPTEXTURE)
+}
+
+@flow_api
+function GEOM_side_midtexture(sd: ptr<void>) -> i32 {
+    return geom_i16(sd as i64, GEOM_OFF_SIDE_MIDTEXTURE)
+}
+
+@flow_api
+function GEOM_side_bottomtexture(sd: ptr<void>) -> i32 {
+    return geom_i16(sd as i64, GEOM_OFF_SIDE_BOTTOMTEXTURE)
+}
+
+@flow_api
+function GEOM_side_textureoffset(sd: ptr<void>) -> i32 {
+    return geom_i32(sd as i64, GEOM_OFF_SIDE_TEXTUREOFFSET)
+}
+
+@flow_api
+function GEOM_side_rowoffset(sd: ptr<void>) -> i32 {
+    return geom_i32(sd as i64, GEOM_OFF_SIDE_ROWOFFSET)
+}
+
+@flow_api
+function GEOM_side_set_textureoffset(sd: ptr<void>, v: i32) -> void {
+    geom_set_i32(sd as i64, GEOM_OFF_SIDE_TEXTUREOFFSET, v)
+}
+
+@flow_api
+function GEOM_side_set_rowoffset(sd: ptr<void>, v: i32) -> void {
+    geom_set_i32(sd as i64, GEOM_OFF_SIDE_ROWOFFSET, v)
+}
+
+@flow_api
+function GEOM_side_set_toptexture(sd: ptr<void>, v: i32) -> void {
+    geom_set_i16(sd as i64, GEOM_OFF_SIDE_TOPTEXTURE, v)
+}
+
+@flow_api
+function GEOM_side_set_midtexture(sd: ptr<void>, v: i32) -> void {
+    geom_set_i16(sd as i64, GEOM_OFF_SIDE_MIDTEXTURE, v)
+}
+
+@flow_api
+function GEOM_side_set_bottomtexture(sd: ptr<void>, v: i32) -> void {
+    geom_set_i16(sd as i64, GEOM_OFF_SIDE_BOTTOMTEXTURE, v)
+}
+
+@flow_api
+function GEOM_side(i: i32) -> ptr<void> {
+    return ((sides as i64) + (i * GEOM_SIDE_SIZEOF) as i64) as ptr<void>
+}
+
+@flow_api
+function GEOM_side_i_toptexture(i: i32) -> i32 {
+    return geom_i16(GEOM_side(i) as i64, GEOM_OFF_SIDE_TOPTEXTURE)
+}
+
+@flow_api
+function GEOM_side_i_midtexture(i: i32) -> i32 {
+    return geom_i16(GEOM_side(i) as i64, GEOM_OFF_SIDE_MIDTEXTURE)
+}
+
+@flow_api
+function GEOM_side_i_bottomtexture(i: i32) -> i32 {
+    return geom_i16(GEOM_side(i) as i64, GEOM_OFF_SIDE_BOTTOMTEXTURE)
+}
+
+@flow_api
+function GEOM_side_i_set_toptexture(i: i32, v: i32) -> void {
+    geom_set_i16(GEOM_side(i) as i64, GEOM_OFF_SIDE_TOPTEXTURE, v)
+}
+
+@flow_api
+function GEOM_side_i_set_midtexture(i: i32, v: i32) -> void {
+    geom_set_i16(GEOM_side(i) as i64, GEOM_OFF_SIDE_MIDTEXTURE, v)
+}
+
+@flow_api
+function GEOM_side_i_set_bottomtexture(i: i32, v: i32) -> void {
+    geom_set_i16(GEOM_side(i) as i64, GEOM_OFF_SIDE_BOTTOMTEXTURE, v)
+}
+
+@flow_api
+function GEOM_side_i_add_textureoffset(i: i32, delta: i32) -> void {
+    let base: i64 = GEOM_side(i) as i64
+    let cur: i32 = geom_i32(base, GEOM_OFF_SIDE_TEXTUREOFFSET)
+    geom_set_i32(base, GEOM_OFF_SIDE_TEXTUREOFFSET, cur + delta)
+}
+
+@flow_api
+function GEOM_side_i_sector(i: i32) -> ptr<void> {
+    return geom_ptr(GEOM_side(i) as i64, GEOM_OFF_SIDE_SECTOR)
+}
+
+@flow_api
+function GEOM_line_slopetype(ld: ptr<void>) -> i32 {
+    return geom_i32(ld as i64, GEOM_OFF_LINE_SLOPETYPE)
+}
+
+@flow_api
+function GEOM_line_set_slopetype(ld: ptr<void>, v: i32) -> void {
+    geom_set_i32(ld as i64, GEOM_OFF_LINE_SLOPETYPE, v)
+}
+
+@flow_api
+function GEOM_line_validcount(ld: ptr<void>) -> i32 {
+    return geom_i32(ld as i64, GEOM_OFF_LINE_VALIDCOUNT)
+}
+
+@flow_api
+function GEOM_line_set_validcount(ld: ptr<void>, v: i32) -> void {
+    geom_set_i32(ld as i64, GEOM_OFF_LINE_VALIDCOUNT, v)
+}
+
+@flow_api
+function GEOM_vertex_x(v: ptr<void>) -> i32 {
+    return geom_i32(v as i64, GEOM_OFF_VERTEX_X)
+}
+
+@flow_api
+function GEOM_vertex_y(v: ptr<void>) -> i32 {
+    return geom_i32(v as i64, GEOM_OFF_VERTEX_Y)
+}
+
+@flow_api
+function GEOM_vertex_set_xy(v: ptr<void>, x: i32, y: i32) -> void {
+    geom_set_i32(v as i64, GEOM_OFF_VERTEX_X, x)
+    geom_set_i32(v as i64, GEOM_OFF_VERTEX_Y, y)
+}
+
+# Shared subsector_t / seg_t / node_t accessors.
+
+@flow_api
+function GEOM_seg(i: i32) -> ptr<void> {
+    return ((segs as i64) + (i * GEOM_SEG_SIZEOF) as i64) as ptr<void>
+}
+
+@flow_api
+function GEOM_subsector(i: i32) -> ptr<void> {
+    return ((subsectors as i64) + (i * GEOM_SUBSECTOR_SIZEOF) as i64) as ptr<void>
+}
+
+@flow_api
+function GEOM_node(i: i32) -> ptr<void> {
+    return ((nodes as i64) + (i * GEOM_NODE_SIZEOF) as i64) as ptr<void>
+}
+
+@flow_api
+function GEOM_vertex(i: i32) -> ptr<void> {
+    return ((vertexes as i64) + (i * GEOM_VERTEX_SIZEOF) as i64) as ptr<void>
+}
+
+@flow_api
+function GEOM_vertex_i_x(i: i32) -> i32 {
+    return geom_i32(GEOM_vertex(i) as i64, GEOM_OFF_VERTEX_X)
+}
+
+@flow_api
+function GEOM_vertex_i_y(i: i32) -> i32 {
+    return geom_i32(GEOM_vertex(i) as i64, GEOM_OFF_VERTEX_Y)
+}
+
+@flow_api
+function GEOM_rejectmatrix() -> ptr<void> {
+    return rejectmatrix
+}
+
+@flow_api
+function GEOM_subsector_sector(ss: ptr<void>) -> ptr<void> {
+    return geom_ptr(ss as i64, GEOM_OFF_SUBSEC_SECTOR)
+}
+
+@flow_api
+function GEOM_subsector_set_sector(ss: ptr<void>, s: ptr<void>) -> void {
+    geom_set_ptr(ss as i64, GEOM_OFF_SUBSEC_SECTOR, s)
+}
+
+@flow_api
+function GEOM_subsector_numlines(ss: ptr<void>) -> i32 {
+    return geom_i16(ss as i64, GEOM_OFF_SUBSEC_NUMLINES)
+}
+
+@flow_api
+function GEOM_subsector_firstline(ss: ptr<void>) -> i32 {
+    return geom_i16(ss as i64, GEOM_OFF_SUBSEC_FIRSTLINE)
+}
+
+@flow_api
+function GEOM_subsector_set_numlines(ss: ptr<void>, v: i32) -> void {
+    geom_set_i16(ss as i64, GEOM_OFF_SUBSEC_NUMLINES, v)
+}
+
+@flow_api
+function GEOM_subsector_set_firstline(ss: ptr<void>, v: i32) -> void {
+    geom_set_i16(ss as i64, GEOM_OFF_SUBSEC_FIRSTLINE, v)
+}
+
+@flow_api
+function GEOM_seg_v1(sg: ptr<void>) -> ptr<void> {
+    return geom_ptr(sg as i64, GEOM_OFF_SEG_V1)
+}
+
+@flow_api
+function GEOM_seg_v2(sg: ptr<void>) -> ptr<void> {
+    return geom_ptr(sg as i64, GEOM_OFF_SEG_V2)
+}
+
+@flow_api
+function GEOM_seg_set_v1(sg: ptr<void>, v: ptr<void>) -> void {
+    geom_set_ptr(sg as i64, GEOM_OFF_SEG_V1, v)
+}
+
+@flow_api
+function GEOM_seg_set_v2(sg: ptr<void>, v: ptr<void>) -> void {
+    geom_set_ptr(sg as i64, GEOM_OFF_SEG_V2, v)
+}
+
+@flow_api
+function GEOM_seg_offset(sg: ptr<void>) -> i32 {
+    return geom_i32(sg as i64, GEOM_OFF_SEG_OFFSET)
+}
+
+@flow_api
+function GEOM_seg_set_offset(sg: ptr<void>, o: i32) -> void {
+    geom_set_i32(sg as i64, GEOM_OFF_SEG_OFFSET, o)
+}
+
+@flow_api
+function GEOM_seg_angle(sg: ptr<void>) -> u32 {
+    return geom_u32(sg as i64, GEOM_OFF_SEG_ANGLE)
+}
+
+@flow_api
+function GEOM_seg_set_angle(sg: ptr<void>, a: u32) -> void {
+    geom_set_u32(sg as i64, GEOM_OFF_SEG_ANGLE, a)
+}
+
+@flow_api
+function GEOM_seg_sidedef(sg: ptr<void>) -> ptr<void> {
+    return geom_ptr(sg as i64, GEOM_OFF_SEG_SIDEDEF)
+}
+
+@flow_api
+function GEOM_seg_set_sidedef(sg: ptr<void>, sd: ptr<void>) -> void {
+    geom_set_ptr(sg as i64, GEOM_OFF_SEG_SIDEDEF, sd)
+}
+
+@flow_api
+function GEOM_seg_linedef(sg: ptr<void>) -> ptr<void> {
+    return geom_ptr(sg as i64, GEOM_OFF_SEG_LINEDEF)
+}
+
+@flow_api
+function GEOM_seg_set_linedef(sg: ptr<void>, ld: ptr<void>) -> void {
+    geom_set_ptr(sg as i64, GEOM_OFF_SEG_LINEDEF, ld)
+}
+
+@flow_api
+function GEOM_seg_frontsector(sg: ptr<void>) -> ptr<void> {
+    return geom_ptr(sg as i64, GEOM_OFF_SEG_FRONTSECTOR)
+}
+
+@flow_api
+function GEOM_seg_backsector(sg: ptr<void>) -> ptr<void> {
+    return geom_ptr(sg as i64, GEOM_OFF_SEG_BACKSECTOR)
+}
+
+@flow_api
+function GEOM_seg_set_frontsector(sg: ptr<void>, s: ptr<void>) -> void {
+    geom_set_ptr(sg as i64, GEOM_OFF_SEG_FRONTSECTOR, s)
+}
+
+@flow_api
+function GEOM_seg_set_backsector(sg: ptr<void>, s: ptr<void>) -> void {
+    geom_set_ptr(sg as i64, GEOM_OFF_SEG_BACKSECTOR, s)
+}
+
+@flow_api
+function GEOM_node_x(no: ptr<void>) -> i32 {
+    return geom_i32(no as i64, GEOM_OFF_NODE_X)
+}
+
+@flow_api
+function GEOM_node_y(no: ptr<void>) -> i32 {
+    return geom_i32(no as i64, GEOM_OFF_NODE_Y)
+}
+
+@flow_api
+function GEOM_node_dx(no: ptr<void>) -> i32 {
+    return geom_i32(no as i64, GEOM_OFF_NODE_DX)
+}
+
+@flow_api
+function GEOM_node_dy(no: ptr<void>) -> i32 {
+    return geom_i32(no as i64, GEOM_OFF_NODE_DY)
+}
+
+@flow_api
+function GEOM_node_set_xy(no: ptr<void>, x: i32, y: i32) -> void {
+    geom_set_i32(no as i64, GEOM_OFF_NODE_X, x)
+    geom_set_i32(no as i64, GEOM_OFF_NODE_Y, y)
+}
+
+@flow_api
+function GEOM_node_set_dxy(no: ptr<void>, dx: i32, dy: i32) -> void {
+    geom_set_i32(no as i64, GEOM_OFF_NODE_DX, dx)
+    geom_set_i32(no as i64, GEOM_OFF_NODE_DY, dy)
+}
+
+@flow_api
+function GEOM_node_child(no: ptr<void>, side: i32) -> i32 {
+    return geom_u16(no as i64, GEOM_OFF_NODE_CHILDREN + side * 2)
+}
+
+@flow_api
+function GEOM_node_set_child(no: ptr<void>, j: i32, v: i32) -> void {
+    geom_set_u16(no as i64, GEOM_OFF_NODE_CHILDREN + j * 2, v)
+}
+
+@flow_api
+function GEOM_node_set_bbox(no: ptr<void>, j: i32, k: i32, v: i32) -> void {
+    geom_set_i32(no as i64, GEOM_OFF_NODE_BBOX + j * 16 + k * 4, v)
+}
+
+@flow_api
+function GEOM_node_i_x(i: i32) -> i32 {
+    return geom_i32(GEOM_node(i) as i64, GEOM_OFF_NODE_X)
+}
+
+@flow_api
+function GEOM_node_i_y(i: i32) -> i32 {
+    return geom_i32(GEOM_node(i) as i64, GEOM_OFF_NODE_Y)
+}
+
+@flow_api
+function GEOM_node_i_dx(i: i32) -> i32 {
+    return geom_i32(GEOM_node(i) as i64, GEOM_OFF_NODE_DX)
+}
+
+@flow_api
+function GEOM_node_i_dy(i: i32) -> i32 {
+    return geom_i32(GEOM_node(i) as i64, GEOM_OFF_NODE_DY)
+}
+
+@flow_api
+function GEOM_node_i_child(i: i32, side: i32) -> i32 {
+    return geom_u16(GEOM_node(i) as i64, GEOM_OFF_NODE_CHILDREN + side * 2)
+}
+
+@flow_api
+function GEOM_node_i_bbox(i: i32, side: i32) -> ptr<i32> {
+    let base: i64 = GEOM_node(i) as i64
+    return (base + (GEOM_OFF_NODE_BBOX + side * 16) as i64) as ptr<i32>
+}
+
+# was static int totallines in p_setup.c (module-private)
+let mut setup_totallines: i32 = 0
+
+# Scratch bbox for P_GroupLines (reused each sector).
+let mut setup_bbox: array<i32, 4> = [0, 0, 0, 0]
+
+const GEOM_OFF_MTHING_X: i32 = 0
+const GEOM_OFF_MTHING_Y: i32 = 2
+const GEOM_OFF_MTHING_ANGLE: i32 = 4
+const GEOM_OFF_MTHING_TYPE: i32 = 6
+const GEOM_OFF_MTHING_OPTIONS: i32 = 8
+
+# ---- helpers formerly in setup_shim.c ---------------------------------
+
+function setupshim_null_sector() -> ptr<void> {
+    if (setup_null_sector as i64) == 0 {
+        setup_null_sector = Z_Malloc(GEOM_SECTOR_SIZEOF, SETUP_PU_STATIC, null)
+        memset(setup_null_sector, 0, GEOM_SECTOR_SIZEOF as i64)
+        I_GetMemoryValue(0 as u32,
+            ((setup_null_sector as i64) + GEOM_OFF_SEC_FLOORHEIGHT as i64) as ptr<void>, 4)
+        I_GetMemoryValue(4 as u32,
+            ((setup_null_sector as i64) + GEOM_OFF_SEC_CEILINGHEIGHT as i64) as ptr<void>, 4)
+    }
+    return setup_null_sector
+}
+
+function setupshim_pad_reject_warn(len: i32, padsize: i32) -> void {
+    printf("PadRejectArray: REJECT lump too short to pad! (%i > %i)\n", len, padsize)
+}
+
+function setupshim_reject_pad_with_ff() -> i32 {
+    if M_CheckParm("-reject_pad_with_ff") != 0 {
+        return 1
+    }
+    return 0
+}
+
+function setupshim_map_lumpname(episode: i32, map: i32) -> string {
+    if STAT_gamemode() == SETUP_COMMERCIAL {
+        if map < 10 {
+            snprintf(setup_lumpname as string, 9, "map0%i", map)
+        } else {
+            snprintf(setup_lumpname as string, 9, "map%i", map)
+        }
+    } else {
+        setup_lumpname[0] = 69 as u8
+        setup_lumpname[1] = (48 + episode) as u8
+        setup_lumpname[2] = 77 as u8
+        setup_lumpname[3] = (48 + map) as u8
+        setup_lumpname[4] = 0 as u8
+    }
+    return setup_lumpname as string
+}
+
+function setupshim_init_sprites() -> void {
+    R_InitSprites(info_sprnames_addr() as ptr<ptr<u8> >)
+}
+
+function setupshim_spawn_mapthing(x: i32, y: i32, angle: i32,
+                                  thing_type: i32, options: i32) -> void {
+    let mut spawnthing: array<u8, 10> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let base: i64 = &spawnthing[0] as i64
+    geom_set_i16(base, GEOM_OFF_MTHING_X, x)
+    geom_set_i16(base, GEOM_OFF_MTHING_Y, y)
+    geom_set_i16(base, GEOM_OFF_MTHING_ANGLE, angle)
+    geom_set_i16(base, GEOM_OFF_MTHING_TYPE, thing_type)
+    geom_set_i16(base, GEOM_OFF_MTHING_OPTIONS, options)
+    P_SpawnMapThing(&spawnthing[0] as ptr<void>)
+}
+
+function setupshim_set_ique_head_tail(v: i32) -> void {
+    mobjshim_set_iquehead(v)
+    mobjshim_set_iquetail(v)
+}
+
+function setupshim_flat_num(name8: ptr<void>) -> i32 {
+    return R_FlatNumForName(name8 as string)
+}
+
+function setupshim_texture_num(name8: ptr<void>) -> i32 {
+    return R_TextureNumForName(name8 as string)
+}
+
+# ---- SHORT() on little-endian (i_swap.h: signed short cast) -----------
+
+function setup_short_at(p: ptr<u8>, off: i32) -> i32 {
+    let mut v: i32 = (p[off] as i32) | ((p[off + 1] as i32) << 8)
+    if v >= 32768 {
+        v = v - 65536
+    }
+    return v
+}
+
+# ---- P_LoadVertexes ---------------------------------------------------
+
+function P_LoadVertexes(lump: i32) -> void {
+    let n: i32 = W_LumpLength(lump as u32) / SETUP_SIZEOF_MAPVERTEX
+    GEOM_set_numvertexes(n)
+    GEOM_set_vertexes(Z_Malloc(n * GEOM_VERTEX_SIZEOF, SETUP_PU_LEVEL, null))
+
+    let data: ptr<u8> = W_CacheLumpNum(lump, SETUP_PU_STATIC) as ptr<u8>
+    for i in 0 to n {
+        let off: i32 = i * SETUP_SIZEOF_MAPVERTEX
+        let x: i32 = setup_short_at(data, off) << SETUP_FRACBITS
+        let y: i32 = setup_short_at(data, off + 2) << SETUP_FRACBITS
+        GEOM_vertex_set_xy(GEOM_vertex(i), x, y)
+    }
+    W_ReleaseLumpNum(lump)
+}
+
+# ---- P_LoadSegs -------------------------------------------------------
+
+function P_LoadSegs(lump: i32) -> void {
+    let n: i32 = W_LumpLength(lump as u32) / SETUP_SIZEOF_MAPSEG
+    GEOM_set_numsegs(n)
+    let segs_p: ptr<void> = Z_Malloc(n * GEOM_SEG_SIZEOF, SETUP_PU_LEVEL, null)
+    GEOM_set_segs(segs_p)
+    memset(segs_p, 0, (n * GEOM_SEG_SIZEOF) as i64)
+
+    let data: ptr<u8> = W_CacheLumpNum(lump, SETUP_PU_STATIC) as ptr<u8>
+    for i in 0 to n {
+        let off: i32 = i * SETUP_SIZEOF_MAPSEG
+        let li: ptr<void> = GEOM_seg(i)
+        let v1i: i32 = setup_short_at(data, off)
+        let v2i: i32 = setup_short_at(data, off + 2)
+        GEOM_seg_set_v1(li, GEOM_vertex(v1i))
+        GEOM_seg_set_v2(li, GEOM_vertex(v2i))
+
+        let ang: i32 = setup_short_at(data, off + 4)
+        let ofs: i32 = setup_short_at(data, off + 10)
+        GEOM_seg_set_angle(li, (ang << 16) as u32)
+        GEOM_seg_set_offset(li, ofs << 16)
+
+        let linedef: i32 = setup_short_at(data, off + 6)
+        let ldef: ptr<void> = GEOM_line(linedef)
+        GEOM_seg_set_linedef(li, ldef)
+
+        let side: i32 = setup_short_at(data, off + 8)
+        let sidenum0: i32 = GEOM_line_sidenum(ldef, side)
+        let sidedef: ptr<void> = GEOM_side(sidenum0)
+        GEOM_seg_set_sidedef(li, sidedef)
+        GEOM_seg_set_frontsector(li, GEOM_side_sector(sidedef))
+
+        if (GEOM_line_flags(ldef) & SETUP_ML_TWOSIDED) != 0 {
+            let sidenum: i32 = GEOM_line_sidenum(ldef, side ^ 1)
+            if sidenum < 0 or sidenum >= GEOM_numsides() {
+                GEOM_seg_set_backsector(li, setupshim_null_sector())
+            } else {
+                GEOM_seg_set_backsector(li, GEOM_side_sector(GEOM_side(sidenum)))
+            }
+        } else {
+            GEOM_seg_set_backsector(li, null)
+        }
+    }
+    W_ReleaseLumpNum(lump)
+}
+
+# ---- P_LoadSubsectors -------------------------------------------------
+
+function P_LoadSubsectors(lump: i32) -> void {
+    let n: i32 = W_LumpLength(lump as u32) / SETUP_SIZEOF_MAPSUBSECTOR
+    GEOM_set_numsubsectors(n)
+    let ss_p: ptr<void> = Z_Malloc(n * GEOM_SUBSECTOR_SIZEOF, SETUP_PU_LEVEL, null)
+    GEOM_set_subsectors(ss_p)
+
+    let data: ptr<u8> = W_CacheLumpNum(lump, SETUP_PU_STATIC) as ptr<u8>
+    memset(ss_p, 0, (n * GEOM_SUBSECTOR_SIZEOF) as i64)
+    for i in 0 to n {
+        let off: i32 = i * SETUP_SIZEOF_MAPSUBSECTOR
+        let ss: ptr<void> = GEOM_subsector(i)
+        GEOM_subsector_set_numlines(ss, setup_short_at(data, off))
+        GEOM_subsector_set_firstline(ss, setup_short_at(data, off + 2))
+    }
+    W_ReleaseLumpNum(lump)
+}
+
+# ---- P_LoadSectors ----------------------------------------------------
+
+function P_LoadSectors(lump: i32) -> void {
+    let n: i32 = W_LumpLength(lump as u32) / SETUP_SIZEOF_MAPSECTOR
+    GEOM_set_numsectors(n)
+    let sec_p: ptr<void> = Z_Malloc(n * GEOM_SECTOR_SIZEOF, SETUP_PU_LEVEL, null)
+    GEOM_set_sectors(sec_p)
+    memset(sec_p, 0, (n * GEOM_SECTOR_SIZEOF) as i64)
+
+    let data: ptr<u8> = W_CacheLumpNum(lump, SETUP_PU_STATIC) as ptr<u8>
+    for i in 0 to n {
+        let off: i32 = i * SETUP_SIZEOF_MAPSECTOR
+        let ss: ptr<void> = GEOM_sector(i)
+        GEOM_sector_set_floorheight(ss, setup_short_at(data, off) << SETUP_FRACBITS)
+        GEOM_sector_set_ceilingheight(ss, setup_short_at(data, off + 2) << SETUP_FRACBITS)
+        # floorpic @4, ceilingpic @12 (char[8] each)
+        let floorpic: ptr<void> = ((data as i64) + (off + 4) as i64) as ptr<void>
+        let ceilingpic: ptr<void> = ((data as i64) + (off + 12) as i64) as ptr<void>
+        GEOM_sector_set_floorpic(ss, setupshim_flat_num(floorpic))
+        GEOM_sector_set_ceilingpic(ss, setupshim_flat_num(ceilingpic))
+        GEOM_sector_set_lightlevel(ss, setup_short_at(data, off + 20))
+        GEOM_sector_set_special(ss, setup_short_at(data, off + 22))
+        GEOM_sector_set_tag(ss, setup_short_at(data, off + 24))
+        GEOM_sector_set_thinglist(ss, null)
+    }
+    W_ReleaseLumpNum(lump)
+}
+
+# ---- P_LoadNodes ------------------------------------------------------
+
+function P_LoadNodes(lump: i32) -> void {
+    let n: i32 = W_LumpLength(lump as u32) / SETUP_SIZEOF_MAPNODE
+    GEOM_set_numnodes(n)
+    GEOM_set_nodes(Z_Malloc(n * GEOM_NODE_SIZEOF, SETUP_PU_LEVEL, null))
+
+    let data: ptr<u8> = W_CacheLumpNum(lump, SETUP_PU_STATIC) as ptr<u8>
+    for i in 0 to n {
+        let off: i32 = i * SETUP_SIZEOF_MAPNODE
+        let no: ptr<void> = GEOM_node(i)
+        GEOM_node_set_xy(no,
+            setup_short_at(data, off) << SETUP_FRACBITS,
+            setup_short_at(data, off + 2) << SETUP_FRACBITS)
+        GEOM_node_set_dxy(no,
+            setup_short_at(data, off + 4) << SETUP_FRACBITS,
+            setup_short_at(data, off + 6) << SETUP_FRACBITS)
+        # children are unsigned short in C; SHORT() then assign zero-extends
+        # into unsigned short. Read as signed short then mask to 16 bits
+        # so values like 0x8000 (NF_SUBSECTOR) survive.
+        for j in 0 to 2 {
+            let child_off: i32 = off + 24 + j * 2
+            let child: i32 = setup_short_at(data, child_off) & 65535
+            GEOM_node_set_child(no, j, child)
+            for k in 0 to 4 {
+                let bbox_off: i32 = off + 8 + (j * 8) + (k * 2)
+                GEOM_node_set_bbox(no, j, k, setup_short_at(data, bbox_off) << SETUP_FRACBITS)
+            }
+        }
+    }
+    W_ReleaseLumpNum(lump)
+}
+
+# ---- P_LoadThings -----------------------------------------------------
+
+function P_LoadThings(lump: i32) -> void {
+    let data: ptr<u8> = W_CacheLumpNum(lump, SETUP_PU_STATIC) as ptr<u8>
+    let numthings: i32 = W_LumpLength(lump as u32) / SETUP_SIZEOF_MAPTHING
+
+    for i in 0 to numthings {
+        let off: i32 = i * SETUP_SIZEOF_MAPTHING
+        let mut spawn: i32 = 1
+        let thing_type: i32 = setup_short_at(data, off + 6)
+
+        # Do not spawn cool, new monsters if !commercial
+        if STAT_gamemode() != SETUP_COMMERCIAL {
+            if thing_type == 68 or thing_type == 64 or thing_type == 88 or thing_type == 89 or thing_type == 69 or thing_type == 67 or thing_type == 71 or thing_type == 65 or thing_type == 66 or thing_type == 84 {
+                spawn = 0
+            }
+        }
+        # Vanilla: break (not continue) — stops loading remaining things.
+        if spawn == 0 {
+            break
+        }
+
+        setupshim_spawn_mapthing(
+            setup_short_at(data, off),
+            setup_short_at(data, off + 2),
+            setup_short_at(data, off + 4),
+            thing_type,
+            setup_short_at(data, off + 8))
+    }
+    W_ReleaseLumpNum(lump)
+}
+
+# ---- P_LoadLineDefs ---------------------------------------------------
+
+function P_LoadLineDefs(lump: i32) -> void {
+    let n: i32 = W_LumpLength(lump as u32) / SETUP_SIZEOF_MAPLINEDEF
+    GEOM_set_numlines(n)
+    let lines_p: ptr<void> = Z_Malloc(n * GEOM_LINE_SIZEOF, SETUP_PU_LEVEL, null)
+    GEOM_set_lines(lines_p)
+    memset(lines_p, 0, (n * GEOM_LINE_SIZEOF) as i64)
+
+    let data: ptr<u8> = W_CacheLumpNum(lump, SETUP_PU_STATIC) as ptr<u8>
+    for i in 0 to n {
+        let off: i32 = i * SETUP_SIZEOF_MAPLINEDEF
+        let ld: ptr<void> = GEOM_line(i)
+        GEOM_line_set_flags(ld, setup_short_at(data, off + 4))
+        GEOM_line_set_special(ld, setup_short_at(data, off + 6))
+        GEOM_line_set_tag(ld, setup_short_at(data, off + 8))
+
+        let v1: ptr<void> = GEOM_vertex(setup_short_at(data, off))
+        let v2: ptr<void> = GEOM_vertex(setup_short_at(data, off + 2))
+        GEOM_line_set_v1(ld, v1)
+        GEOM_line_set_v2(ld, v2)
+
+        let dx: i32 = GEOM_vertex_x(v2) - GEOM_vertex_x(v1)
+        let dy: i32 = GEOM_vertex_y(v2) - GEOM_vertex_y(v1)
+        GEOM_line_set_dx(ld, dx)
+        GEOM_line_set_dy(ld, dy)
+
+        if dx == 0 {
+            GEOM_line_set_slopetype(ld, SETUP_ST_VERTICAL)
+        } elif dy == 0 {
+            GEOM_line_set_slopetype(ld, SETUP_ST_HORIZONTAL)
+        } elif FixedDiv(dy, dx) > 0 {
+            GEOM_line_set_slopetype(ld, SETUP_ST_POSITIVE)
+        } else {
+            GEOM_line_set_slopetype(ld, SETUP_ST_NEGATIVE)
+        }
+
+        let v1x: i32 = GEOM_vertex_x(v1)
+        let v2x: i32 = GEOM_vertex_x(v2)
+        let v1y: i32 = GEOM_vertex_y(v1)
+        let v2y: i32 = GEOM_vertex_y(v2)
+        let mut left: i32 = v2x
+        let mut right: i32 = v1x
+        if v1x < v2x {
+            left = v1x
+            right = v2x
+        }
+        let mut bottom: i32 = v2y
+        let mut top: i32 = v1y
+        if v1y < v2y {
+            bottom = v1y
+            top = v2y
+        }
+        GEOM_line_set_bbox(ld, left, right, bottom, top)
+
+        GEOM_line_set_sidenum(ld, 0, setup_short_at(data, off + 10))
+        GEOM_line_set_sidenum(ld, 1, setup_short_at(data, off + 12))
+
+        let sn0: i32 = GEOM_line_sidenum(ld, 0)
+        if sn0 != 0 - 1 {
+            GEOM_line_set_frontsector(ld, GEOM_side_sector(GEOM_side(sn0)))
+        } else {
+            GEOM_line_set_frontsector(ld, null)
+        }
+
+        let sn1: i32 = GEOM_line_sidenum(ld, 1)
+        if sn1 != 0 - 1 {
+            GEOM_line_set_backsector(ld, GEOM_side_sector(GEOM_side(sn1)))
+        } else {
+            GEOM_line_set_backsector(ld, null)
+        }
+    }
+    W_ReleaseLumpNum(lump)
+}
+
+# ---- P_LoadSideDefs ---------------------------------------------------
+
+function P_LoadSideDefs(lump: i32) -> void {
+    let n: i32 = W_LumpLength(lump as u32) / SETUP_SIZEOF_MAPSIDEDEF
+    GEOM_set_numsides(n)
+    let sides_p: ptr<void> = Z_Malloc(n * GEOM_SIDE_SIZEOF, SETUP_PU_LEVEL, null)
+    GEOM_set_sides(sides_p)
+    memset(sides_p, 0, (n * GEOM_SIDE_SIZEOF) as i64)
+
+    let data: ptr<u8> = W_CacheLumpNum(lump, SETUP_PU_STATIC) as ptr<u8>
+    for i in 0 to n {
+        let off: i32 = i * SETUP_SIZEOF_MAPSIDEDEF
+        let sd: ptr<void> = GEOM_side(i)
+        GEOM_side_set_textureoffset(sd, setup_short_at(data, off) << SETUP_FRACBITS)
+        GEOM_side_set_rowoffset(sd, setup_short_at(data, off + 2) << SETUP_FRACBITS)
+        let top: ptr<void> = ((data as i64) + (off + 4) as i64) as ptr<void>
+        let bottom: ptr<void> = ((data as i64) + (off + 12) as i64) as ptr<void>
+        let mid: ptr<void> = ((data as i64) + (off + 20) as i64) as ptr<void>
+        GEOM_side_set_toptexture(sd, setupshim_texture_num(top))
+        GEOM_side_set_bottomtexture(sd, setupshim_texture_num(bottom))
+        GEOM_side_set_midtexture(sd, setupshim_texture_num(mid))
+        GEOM_side_set_sector(sd, GEOM_sector(setup_short_at(data, off + 28)))
+    }
+    W_ReleaseLumpNum(lump)
+}
+
+# ---- P_LoadBlockMap ---------------------------------------------------
+
+function P_LoadBlockMap(lump: i32) -> void {
+    let lumplen: i32 = W_LumpLength(lump as u32)
+    let count: i32 = lumplen / 2
+
+    let lump_p: ptr<void> = Z_Malloc(lumplen, SETUP_PU_LEVEL, null)
+    GEOM_set_blockmaplump(lump_p)
+    W_ReadLump(lump as u32, lump_p)
+    # blockmap = blockmaplump + 4 (short*)
+    GEOM_set_blockmap(((lump_p as i64) + 8) as ptr<void>)
+
+    for i in 0 to count {
+        let s: i16 = GEOM_blockmaplump_at(i)
+        # SHORT() on little-endian: signed short identity
+        GEOM_set_blockmaplump_at(i, s)
+    }
+
+    GEOM_set_bmaporgx((GEOM_blockmaplump_at(0) as i32) << SETUP_FRACBITS)
+    GEOM_set_bmaporgy((GEOM_blockmaplump_at(1) as i32) << SETUP_FRACBITS)
+    GEOM_set_bmapwidth(GEOM_blockmaplump_at(2) as i32)
+    GEOM_set_bmapheight(GEOM_blockmaplump_at(3) as i32)
+
+    let link_bytes: i32 = GEOM_PTR_SIZEOF * GEOM_bmapwidth() * GEOM_bmapheight()
+    let links: ptr<void> = Z_Malloc(link_bytes, SETUP_PU_LEVEL, null)
+    GEOM_set_blocklinks(links)
+    memset(links, 0, link_bytes as i64)
+}
+
+# ---- P_GroupLines -----------------------------------------------------
+
+function P_GroupLines() -> void {
+    # look up sector number for each subsector
+    let nss: i32 = GEOM_numsubsectors()
+    for i in 0 to nss {
+        let ss: ptr<void> = GEOM_subsector(i)
+        let seg: ptr<void> = GEOM_seg(GEOM_subsector_firstline(ss))
+        GEOM_subsector_set_sector(ss, GEOM_side_sector(GEOM_seg_sidedef(seg)))
+    }
+
+    # count number of lines in each sector
+    setup_totallines = 0
+    let nlines: i32 = GEOM_numlines()
+    for i in 0 to nlines {
+        let li: ptr<void> = GEOM_line(i)
+        setup_totallines = setup_totallines + 1
+        let front: ptr<void> = GEOM_line_frontsector(li)
+        GEOM_sector_set_linecount(front, GEOM_sector_linecount(front) + 1)
+
+        let back: ptr<void> = GEOM_line_backsector(li)
+        if (back as i64) != 0 and (back as i64) != (front as i64) {
+            GEOM_sector_set_linecount(back, GEOM_sector_linecount(back) + 1)
+            setup_totallines = setup_totallines + 1
+        }
+    }
+
+    # build line tables for each sector
+    let mut linebuffer: ptr<void> = Z_Malloc(setup_totallines * GEOM_PTR_SIZEOF, SETUP_PU_LEVEL, null)
+    let nsec: i32 = GEOM_numsectors()
+    for i in 0 to nsec {
+        let sec: ptr<void> = GEOM_sector(i)
+        GEOM_sector_set_lines(sec, linebuffer)
+        let lc: i32 = GEOM_sector_linecount(sec)
+        linebuffer = ((linebuffer as i64) + (lc * GEOM_PTR_SIZEOF) as i64) as ptr<void>
+        GEOM_sector_set_linecount(sec, 0)
+    }
+
+    for i in 0 to nlines {
+        let li: ptr<void> = GEOM_line(i)
+        let front2: ptr<void> = GEOM_line_frontsector(li)
+        if (front2 as i64) != 0 {
+            let lc: i32 = GEOM_sector_linecount(front2)
+            GEOM_sector_set_line(front2, lc, li)
+            GEOM_sector_set_linecount(front2, lc + 1)
+        }
+        let back2: ptr<void> = GEOM_line_backsector(li)
+        let front3: ptr<void> = GEOM_line_frontsector(li)
+        if (back2 as i64) != 0 and (front3 as i64) != (back2 as i64) {
+            let lc2: i32 = GEOM_sector_linecount(back2)
+            GEOM_sector_set_line(back2, lc2, li)
+            GEOM_sector_set_linecount(back2, lc2 + 1)
+        }
+    }
+
+    # Generate bounding boxes for sectors
+    for i in 0 to nsec {
+        let sector: ptr<void> = GEOM_sector(i)
+        M_ClearBox(&setup_bbox[0])
+        let lc3: i32 = GEOM_sector_linecount(sector)
+        for j in 0 to lc3 {
+            let li2: ptr<void> = GEOM_sector_line(sector, j)
+            let vv1: ptr<void> = GEOM_line_v1(li2)
+            let vv2: ptr<void> = GEOM_line_v2(li2)
+            M_AddToBox(&setup_bbox[0], GEOM_vertex_x(vv1), GEOM_vertex_y(vv1))
+            M_AddToBox(&setup_bbox[0], GEOM_vertex_x(vv2), GEOM_vertex_y(vv2))
+        }
+
+        GEOM_sector_set_soundorg_xy(sector,
+            (setup_bbox[SETUP_BOXRIGHT] + setup_bbox[SETUP_BOXLEFT]) / 2,
+            (setup_bbox[SETUP_BOXTOP] + setup_bbox[SETUP_BOXBOTTOM]) / 2)
+
+        let mut block: i32 = (setup_bbox[SETUP_BOXTOP] - GEOM_bmaporgy() + SETUP_MAXRADIUS) >> SETUP_MAPBLOCKSHIFT
+        if block >= GEOM_bmapheight() {
+            block = GEOM_bmapheight() - 1
+        }
+        let top: i32 = block
+
+        block = (setup_bbox[SETUP_BOXBOTTOM] - GEOM_bmaporgy() - SETUP_MAXRADIUS) >> SETUP_MAPBLOCKSHIFT
+        if block < 0 {
+            block = 0
+        }
+        let bottom: i32 = block
+
+        block = (setup_bbox[SETUP_BOXRIGHT] - GEOM_bmaporgx() + SETUP_MAXRADIUS) >> SETUP_MAPBLOCKSHIFT
+        if block >= GEOM_bmapwidth() {
+            block = GEOM_bmapwidth() - 1
+        }
+        let right: i32 = block
+
+        block = (setup_bbox[SETUP_BOXLEFT] - GEOM_bmaporgx() - SETUP_MAXRADIUS) >> SETUP_MAPBLOCKSHIFT
+        if block < 0 {
+            block = 0
+        }
+        let left: i32 = block
+
+        GEOM_sector_set_blockbox(sector, top, bottom, left, right)
+    }
+}
+
+# ---- PadRejectArray / P_LoadReject ------------------------------------
+
+function PadRejectArray(array: ptr<u8>, len: u32) -> void {
+    # Values to pad the REJECT array with (from totallines / zone header).
+    let pad0: u32 = ((((setup_totallines * 4 + 3) as u32) & (0 - 4) as u32) + (24 as u32))
+    let pad1: u32 = 0
+    let pad2: u32 = 50
+    let pad3: u32 = 1918481   # 0x1d4a11 DOOM_CONST_ZONEID
+
+    let mut dest: ptr<u8> = array
+    let mut i: u32 = 0
+    while i < len and i < (SETUP_REJECTPAD_BYTES as u32) {
+        let byte_num: u32 = i % (4 as u32)
+        let mut word: u32 = pad0
+        let wi: u32 = i / (4 as u32)
+        if wi == (1 as u32) {
+            word = pad1
+        } elif wi == (2 as u32) {
+            word = pad2
+        } elif wi == (3 as u32) {
+            word = pad3
+        }
+        dest[0] = ((word >> (byte_num * (8 as u32))) & (255 as u32)) as u8
+        dest = ((dest as i64) + 1) as ptr<u8>
+        i = i + (1 as u32)
+    }
+
+    if len > (SETUP_REJECTPAD_BYTES as u32) {
+        setupshim_pad_reject_warn(len as i32, SETUP_REJECTPAD_BYTES)
+        let mut padvalue: i32 = 3840   # 0xf00 — memset truncates to byte 0
+        if setupshim_reject_pad_with_ff() != 0 {
+            padvalue = 255
+        }
+        memset(((array as i64) + (SETUP_REJECTPAD_BYTES as i64)) as ptr<void>,
+            padvalue, (len as i64) - (SETUP_REJECTPAD_BYTES as i64))
+    }
+}
+
+function P_LoadReject(lumpnum: i32) -> void {
+    let minlength: i32 = (GEOM_numsectors() * GEOM_numsectors() + 7) / 8
+    let lumplen: i32 = W_LumpLength(lumpnum as u32)
+
+    if lumplen >= minlength {
+        GEOM_set_rejectmatrix(W_CacheLumpNum(lumpnum, SETUP_PU_LEVEL))
+    } else {
+        let mat: ptr<void> = Z_Malloc(minlength, SETUP_PU_LEVEL, GEOM_rejectmatrix_user() as ptr<void>)
+        GEOM_set_rejectmatrix(mat)
+        W_ReadLump(lumpnum as u32, mat)
+        let pad_base: ptr<u8> = ((mat as i64) + (lumplen as i64)) as ptr<u8>
+        PadRejectArray(pad_base, (minlength - lumplen) as u32)
+    }
+}
+
+# ---- P_SetupLevel / P_Init --------------------------------------------
+
+@flow_api
+function P_SetupLevel(episode: i32, map: i32, playermask: i32, skill: i32) -> void {
+    setupshim_clear_totals()
+    for i in 0 to SETUP_MAXPLAYERS {
+        let pl: ptr<void> = PLAYER_at(i)
+        PLAYER_set_killcount(pl, 0)
+        PLAYER_set_secretcount(pl, 0)
+        PLAYER_set_itemcount(pl, 0)
+    }
+
+    # Initial height of PointOfView will be set by player think.
+    PLAYER_set_viewz(PLAYER_at(STAT_consoleplayer()), 1)
+
+    # Make sure all sounds are stopped before Z_FreeTags.
+    S_Start()
+
+    Z_FreeTags(SETUP_PU_LEVEL, SETUP_PU_PURGELEVEL - 1)
+    P_InitThinkers()
+
+    let lumpnum: i32 = W_GetNumForName(setupshim_map_lumpname(episode, map))
+    STAT_set_leveltime(0)
+
+    # note: most of this ordering is important
+    P_LoadBlockMap(lumpnum + SETUP_ML_BLOCKMAP)
+    P_LoadVertexes(lumpnum + SETUP_ML_VERTEXES)
+    P_LoadSectors(lumpnum + SETUP_ML_SECTORS)
+    P_LoadSideDefs(lumpnum + SETUP_ML_SIDEDEFS)
+
+    P_LoadLineDefs(lumpnum + SETUP_ML_LINEDEFS)
+    P_LoadSubsectors(lumpnum + SETUP_ML_SSECTORS)
+    P_LoadNodes(lumpnum + SETUP_ML_NODES)
+    P_LoadSegs(lumpnum + SETUP_ML_SEGS)
+
+    P_GroupLines()
+    P_LoadReject(lumpnum + SETUP_ML_REJECT)
+
+    gameshim_set_bodyqueslot(0)
+    setupshim_reset_deathmatch_p()
+    P_LoadThings(lumpnum + SETUP_ML_THINGS)
+
+    # if deathmatch, randomly spawn the active players
+    if STAT_deathmatch() != 0 {
+        for i in 0 to SETUP_MAXPLAYERS {
+            if STAT_playeringame(i) != 0 {
+                PLAYER_set_mo(PLAYER_at(i), null)
+                G_DeathMatchSpawnPlayer(i)
+            }
+        }
+    }
+
+    # clear special respawning que
+    setupshim_set_ique_head_tail(0)
+
+    # set up world state
+    P_SpawnSpecials()
+
+    # preload graphics
+    if setupshim_precache() != 0 {
+        R_PrecacheLevel()
+    }
+}
+
+@flow_api
+function P_Init() -> void {
+    P_InitSwitchList()
+    P_InitPicAnims()
+    setupshim_init_sprites()
+}

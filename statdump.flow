@@ -1,0 +1,42 @@
+# End-of-level statistics capture, ported from statdump.c to Flow.
+#
+# ORIGCODE is undefined in this build (config.h), so StatDump is a
+# no-op and the DiscoverGamemode / PrintStats machinery is absent.
+# StatCopy still captures wbstartstruct_t snapshots when -statdump is
+# on the command line. sizeof(wbstartstruct_t) is 200 on LP64
+# (verified); MAX_CAPTURES is 32.
+
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+extern { function M_ParmExists(check: string) -> i32 }
+
+const MAX_CAPTURES: i32 = 32
+const WBSTART_SIZE: i32 = 200
+
+let mut captured_stats: ptr<u8> = null
+let mut num_captured_stats: i32 = 0
+
+function sd_ensure() -> void {
+    if (captured_stats as i64) == 0 {
+        captured_stats = calloc(MAX_CAPTURES as i64, WBSTART_SIZE as i64) as ptr<u8>
+    }
+}
+
+function sd_slot(i: i32) -> ptr<void> {
+    sd_ensure()
+    return ((captured_stats as i64) + (i * WBSTART_SIZE) as i64) as ptr<void>
+}
+
+@flow_api
+function StatCopy(stats: ptr<void>) -> void {
+    if M_ParmExists("-statdump") != 0 and num_captured_stats < MAX_CAPTURES {
+        memcpy(sd_slot(num_captured_stats), stats, WBSTART_SIZE as i64)
+        num_captured_stats = num_captured_stats + 1
+    }
+}
+
+@flow_api
+function StatDump() -> void {
+    # Body is #if ORIGCODE in the C source; ORIGCODE is off here.
+    return
+}

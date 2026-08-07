@@ -1,0 +1,1065 @@
+# Heads-up display, ported from hu_lib.c + hu_stuff.c to Flow as one unit.
+#
+# The widget structs (hu_textline_t, hu_stext_t, hu_itext_t) are used by
+# no engine file outside hu_lib.c / hu_stuff.c (verified by grep), so
+# their layout is Flow-private here. They live in calloc'd buffers with
+# explicit offsets:
+#
+#   textline (stride 112):        stext (464 bytes):
+#     0  x           i32            0    l[4]     4 x textline
+#     4  y           i32            448  h        i32
+#     8  f           i64 (font)     452  cl       i32
+#     16 sc          i32            456  on id    i32
+#     20 len         i32            460  laston   i32
+#     24 needsupdate i32
+#     28 l[81]       bytes        itext (128 bytes):
+#                                   0    l        textline
+#                                   112  lm       i32
+#                                   116  on id    i32
+#                                   120  laston   i32
+#
+# The C widgets held a boolean* "on"; here it is an id resolved at read
+# time: 0 = always_off, 1 = message_on (Flow-private), 2 = chat_on
+# (C-side in hu_shim.c; menu.flow reads via HU_chat_on).
+#
+# chat_on / message_dontfuckwithme / hu_font[] live here (were hu_shim.c).
+# Engine struct fields still go through PLAYER_* / PATCH_* accessors.
+
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+extern { function DRAW_viewwidth() -> i32 }
+extern { function DRAW_viewheight() -> i32 }
+extern { function W_CacheLumpName(name: string, tag: i32) -> ptr<void> }
+extern { function V_DrawPatchDirect(x: i32, y: i32, patch: ptr<void>) -> void }
+extern { function R_VideoErase(ofs: u32, count: i32) -> void }
+extern { function S_StartSound(origin: ptr<void>, sound_id: i32) -> void }
+extern { function M_StringCopy(dest: ptr<u8>, src: ptr<u8>, size: i64) -> i32 }
+extern { function PATCH_width(p: ptr<void>) -> i32 }
+extern { function PATCH_height(p: ptr<void>) -> i32 }
+extern { function STAT_automapactive() -> i32 }
+let mut hu_font: array<i64, 63> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+let mut chat_on: i32 = 0
+let mut message_dontfuckwithme: i32 = 0
+let mut chat_char: i32 = 0
+
+let mut chat_macros: array<ptr<u8>, 10> = [
+    "No" as ptr<u8>,
+    "I'm ready to kick butt!" as ptr<u8>,
+    "I'm OK." as ptr<u8>,
+    "I'm not looking too good!" as ptr<u8>,
+    "Help!" as ptr<u8>,
+    "You suck!" as ptr<u8>,
+    "Next time, scumbag..." as ptr<u8>,
+    "Come here!" as ptr<u8>,
+    "I'll take care of it." as ptr<u8>,
+    "Yes" as ptr<u8>
+]
+
+let mut player_names: array<ptr<u8>, 4> = [
+    "Green: " as ptr<u8>,
+    "Indigo: " as ptr<u8>,
+    "Brown: " as ptr<u8>,
+    "Red: " as ptr<u8>
+]
+
+@flow_api
+function hushim_set_hu_font(i: i32, p: ptr<void>) -> void {
+    hu_font[i] = p as i64
+}
+
+@flow_api
+function hushim_hu_font() -> ptr<void> {
+    return &hu_font[0] as ptr<void>
+}
+
+@flow_api
+function hushim_chat_macro_bind_addr(i: i32) -> ptr<void> {
+    return &chat_macros[i] as ptr<void>
+}
+
+@flow_api
+function hushim_chat_macro(i: i32) -> ptr<u8> {
+    return chat_macros[i]
+}
+
+@flow_api
+function hushim_player_name(i: i32) -> ptr<u8> {
+    return player_names[i]
+}
+
+extern { function STAT_logical_gamemission() -> i32 }
+
+# showMessages owned by menu.flow / menu_shim.c
+extern { function STAT_showMessages() -> i32 }
+extern { function RMAIN_viewwindowx() -> i32 }
+extern { function RMAIN_viewwindowy() -> i32 }
+extern { function KEY_message_refresh() -> i32 }
+extern { function KEY_multi_msg() -> i32 }
+extern { function KEY_multi_msgplayer(i: i32) -> i32 }
+extern { function PLAYER_at(i: i32) -> ptr<void> }
+extern { function PLAYER_message(p: ptr<void>) -> ptr<u8> }
+extern { function PLAYER_set_message(p: ptr<void>, msg: string) -> void }
+extern { function PLAYER_cmd_chatchar(p: ptr<void>) -> i32 }
+extern { function PLAYER_cmd_set_chatchar(p: ptr<void>, v: i32) -> void }
+
+# ---- constants ---------------------------------------------------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+const HU_SCREENWIDTH: i32 = 320       # i_video.h
+const MAXPLAYERS: i32 = 4          # doomdef.h
+const HU_MAXLINELENGTH: i32 = 80   # hu_lib.h
+const HU_FONTSTART: i32 = 33       # hu_stuff.h: '!'
+const HU_FONTEND: i32 = 95         # hu_stuff.h: '_'
+const HU_FONTSIZE: i32 = 63        # hu_stuff.h
+const HU_BROADCAST: i32 = 5        # hu_stuff.h
+const HU_MSGX: i32 = 0             # hu_stuff.h
+const HU_MSGY: i32 = 0             # hu_stuff.h
+const HU_MSGHEIGHT: i32 = 1        # hu_stuff.h, in lines
+const HU_MSGTIMEOUT: i32 = 140     # hu_stuff.h: 4*TICRATE
+const HU_TITLEX: i32 = 0           # hu_stuff.c
+const QUEUESIZE: i32 = 128         # hu_stuff.c
+
+const KEY_ENTER: i32 = 13          # doomkeys.h
+const KEY_ESCAPE: i32 = 27         # doomkeys.h
+const KEY_BACKSPACE: i32 = 127     # doomkeys.h: 0x7f
+const KEY_RSHIFT: i32 = 182       # doomkeys.h: 0x80+0x36
+const KEY_RALT: i32 = 184         # doomkeys.h: 0x80+0x38
+const KEY_LALT: i32 = 184         # doomkeys.h: == KEY_RALT
+
+const HU_EV_KEYDOWN: i32 = 0          # d_event.h evtype_t
+const HU_PU_STATIC: i32 = 1           # z_zone.h
+const SFX_TINK: i32 = 87           # sounds.h sfx_tink
+const SFX_RADIO: i32 = 108         # sounds.h sfx_radio
+
+# d_mode.h GameMission_t / GameMode_t / GameVersion_t
+const HU_MISSION_DOOM: i32 = 0
+const MISSION_DOOM2: i32 = 1
+const MISSION_PACK_TNT: i32 = 2
+const MISSION_PACK_PLUT: i32 = 3
+const HU_GM_COMMERCIAL: i32 = 2
+const HU_EXE_CHEX: i32 = 9
+
+# textline field offsets
+const TL_X: i32 = 0
+const TL_Y: i32 = 4
+const TL_F: i32 = 8
+const TL_SC: i32 = 16
+const TL_LEN: i32 = 20
+const TL_UPD: i32 = 24
+const TL_L: i32 = 28
+const TL_STRIDE: i32 = 112
+
+# stext field offsets (after 4 textlines)
+const ST_H: i32 = 448
+const ST_CL: i32 = 452
+const ST_ON: i32 = 456
+const ST_LASTON: i32 = 460
+
+# itext field offsets (after 1 textline)
+const IT_LM: i32 = 112
+const IT_ON: i32 = 116
+const IT_LASTON: i32 = 120
+
+# "on" ids
+const ON_OFF: i32 = 0       # was &always_off
+const ON_MESSAGE: i32 = 1   # was &message_on
+const ON_CHAT: i32 = 2      # was &chat_on (C-side, hu_shim.c)
+
+# chat_on owned here; menu.flow reads via HU_chat_on
+@flow_api
+function HU_chat_on() -> i32 { return chat_on }
+@flow_api
+function HU_set_chat_on(v: i32) -> void { chat_on = v }
+@flow_api
+function hushim_message_dontfuckwithme() -> i32 { return message_dontfuckwithme }
+@flow_api
+function hushim_set_message_dontfuckwithme(v: i32) -> void { message_dontfuckwithme = v }
+
+# ---- widget storage and hu_stuff statics -------------------------------
+
+let mut w_title: i64 = 0        # hu_textline_t
+let mut w_message: i64 = 0      # hu_stext_t
+let mut w_chat: i64 = 0         # hu_itext_t
+let mut w_inputbuffer: i64 = 0  # hu_itext_t[MAXPLAYERS], stride 128
+let mut chat_dest: ptr<u8> = null   # char[MAXPLAYERS]
+let mut chatchars: ptr<u8> = null   # char[QUEUESIZE]
+let mut lastmessage: ptr<u8> = null # static char[HU_MAXLINELENGTH+1]
+let mut fnbuf: ptr<u8> = null       # char buffer[9] in HU_Init
+
+let mut plr: i64 = 0            # player_t*, set by HU_Start
+let mut message_on: i32 = 0
+let mut message_nottobefuckedwith: i32 = 0
+let mut message_counter: i32 = 0
+let mut headsupactive: i32 = 0
+let mut qhead: i32 = 0          # was `head`
+let mut qtail: i32 = 0          # was `tail`
+let mut altdown: i32 = 0        # static in HU_Responder
+let mut num_nobrainers: i32 = 0 # static in HU_Responder
+let mut hu_ready: i32 = 0
+
+# ---- builtin map names (d_englsh.h via dstrings.h) ---------------------
+#
+# Only hu_stuff.c reads these (verified by grep), so they stay Flow-side.
+
+# DOOM shareware/registered/retail (Ultimate) names.
+let mut mapnames: array<string, 45> = [
+    "E1M1: Hangar",
+    "E1M2: Nuclear Plant",
+    "E1M3: Toxin Refinery",
+    "E1M4: Command Control",
+    "E1M5: Phobos Lab",
+    "E1M6: Central Processing",
+    "E1M7: Computer Station",
+    "E1M8: Phobos Anomaly",
+    "E1M9: Military Base",
+
+    "E2M1: Deimos Anomaly",
+    "E2M2: Containment Area",
+    "E2M3: Refinery",
+    "E2M4: Deimos Lab",
+    "E2M5: Command Center",
+    "E2M6: Halls of the Damned",
+    "E2M7: Spawning Vats",
+    "E2M8: Tower of Babel",
+    "E2M9: Fortress of Mystery",
+
+    "E3M1: Hell Keep",
+    "E3M2: Slough of Despair",
+    "E3M3: Pandemonium",
+    "E3M4: House of Pain",
+    "E3M5: Unholy Cathedral",
+    "E3M6: Mt. Erebus",
+    "E3M7: Limbo",
+    "E3M8: Dis",
+    "E3M9: Warrens",
+
+    "E4M1: Hell Beneath",
+    "E4M2: Perfect Hatred",
+    "E4M3: Sever The Wicked",
+    "E4M4: Unruly Evil",
+    "E4M5: They Will Repent",
+    "E4M6: Against Thee Wickedly",
+    "E4M7: And Hell Followed",
+    "E4M8: Unto The Cruel",
+    "E4M9: Fear",
+
+    "NEWLEVEL",
+    "NEWLEVEL",
+    "NEWLEVEL",
+    "NEWLEVEL",
+    "NEWLEVEL",
+    "NEWLEVEL",
+    "NEWLEVEL",
+    "NEWLEVEL",
+    "NEWLEVEL"
+]
+
+# List of names for levels in commercial IWADs (doom2.wad, plutonia.wad,
+# tnt.wad). Kept as ONE array so a MAP33 lookup overflows from the DOOM 2
+# block into the Plutonia block, as in the Vanilla executable.
+let mut mapnames_commercial: array<string, 96> = [
+    # DOOM 2 map names.
+    "level 1: entryway",
+    "level 2: underhalls",
+    "level 3: the gantlet",
+    "level 4: the focus",
+    "level 5: the waste tunnels",
+    "level 6: the crusher",
+    "level 7: dead simple",
+    "level 8: tricks and traps",
+    "level 9: the pit",
+    "level 10: refueling base",
+    "level 11: 'o' of destruction!",
+
+    "level 12: the factory",
+    "level 13: downtown",
+    "level 14: the inmost dens",
+    "level 15: industrial zone",
+    "level 16: suburbs",
+    "level 17: tenements",
+    "level 18: the courtyard",
+    "level 19: the citadel",
+    "level 20: gotcha!",
+
+    "level 21: nirvana",
+    "level 22: the catacombs",
+    "level 23: barrels o' fun",
+    "level 24: the chasm",
+    "level 25: bloodfalls",
+    "level 26: the abandoned mines",
+    "level 27: monster condo",
+    "level 28: the spirit world",
+    "level 29: the living end",
+    "level 30: icon of sin",
+    "level 31: wolfenstein",
+    "level 32: grosse",
+
+    # Plutonia WAD map names.
+    "level 1: congo",
+    "level 2: well of souls",
+    "level 3: aztec",
+    "level 4: caged",
+    "level 5: ghost town",
+    "level 6: baron's lair",
+    "level 7: caughtyard",
+    "level 8: realm",
+    "level 9: abattoire",
+    "level 10: onslaught",
+    "level 11: hunted",
+
+    "level 12: speed",
+    "level 13: the crypt",
+    "level 14: genesis",
+    "level 15: the twilight",
+    "level 16: the omen",
+    "level 17: compound",
+    "level 18: neurosphere",
+    "level 19: nme",
+    "level 20: the death domain",
+
+    "level 21: slayer",
+    "level 22: impossible mission",
+    "level 23: tombstone",
+    "level 24: the final frontier",
+    "level 25: the temple of darkness",
+    "level 26: bunker",
+    "level 27: anti-christ",
+    "level 28: the sewers",
+    "level 29: odyssey of noises",
+    "level 30: the gateway of hell",
+    "level 31: cyberden",
+    "level 32: go 2 it",
+
+    # TNT WAD map names.
+    "level 1: system control",
+    "level 2: human bbq",
+    "level 3: power control",
+    "level 4: wormhole",
+    "level 5: hanger",
+    "level 6: open season",
+    "level 7: prison",
+    "level 8: metal",
+    "level 9: stronghold",
+    "level 10: redemption",
+    "level 11: storage facility",
+
+    "level 12: crater",
+    "level 13: nukage processing",
+    "level 14: steel works",
+    "level 15: dead zone",
+    "level 16: deepest reaches",
+    "level 17: processing area",
+    "level 18: mill",
+    "level 19: shipping/respawning",
+    "level 20: central processing",
+
+    "level 21: administration center",
+    "level 22: habitat",
+    "level 23: lunar mining project",
+    "level 24: quarry",
+    "level 25: baron's den",
+    "level 26: ballistyx",
+    "level 27: mount pain",
+    "level 28: heck",
+    "level 29: river styx",
+    "level 30: last call",
+    "level 31: pharaoh",
+    "level 32: caribbean"
+]
+
+# ---- widget field access, by explicit layout ---------------------------
+
+function tl_geti(tl: i64, off: i32) -> i32 {
+    let p: ptr<i32> = (tl + off as i64) as ptr<i32>
+    return p[0]
+}
+
+function tl_seti(tl: i64, off: i32, v: i32) -> void {
+    let p: ptr<i32> = (tl + off as i64) as ptr<i32>
+    p[0] = v
+}
+
+function tl_getf(tl: i64) -> i64 {
+    let p: ptr<i64> = (tl + TL_F as i64) as ptr<i64>
+    return p[0]
+}
+
+function tl_setf(tl: i64, f: i64) -> void {
+    let p: ptr<i64> = (tl + TL_F as i64) as ptr<i64>
+    p[0] = f
+}
+
+function tl_l(tl: i64) -> ptr<u8> {
+    return (tl + TL_L as i64) as ptr<u8>
+}
+
+# entry idx of a patch_t*[] font array
+function font_patch(f: i64, idx: i32) -> ptr<void> {
+    let words: ptr<i64> = f as ptr<i64>
+    return words[idx] as ptr<void>
+}
+
+function st_line(st: i64, i: i32) -> i64 {
+    return st + (i * TL_STRIDE) as i64
+}
+
+function it_line(it: i64) -> i64 {
+    return it
+}
+
+function hu_on_value(id: i32) -> i32 {
+    if id == ON_MESSAGE {
+        return message_on
+    }
+    if id == ON_CHAT {
+        return HU_chat_on()
+    }
+    return 0
+}
+
+function hu_toupper(c: i32) -> i32 {
+    if c >= 97 and c <= 122 {
+        return c - 32
+    }
+    return c
+}
+
+# ---- hu_lib: text line -------------------------------------------------
+
+function hulib_clear_textline(tl: i64) -> void {
+    tl_seti(tl, TL_LEN, 0)
+    let l: ptr<u8> = tl_l(tl)
+    l[0] = 0 as u8
+    tl_seti(tl, TL_UPD, 1)   # needsupdate = true
+}
+
+function hulib_init_textline(tl: i64, x: i32, y: i32, f: i64, sc: i32) -> void {
+    tl_seti(tl, TL_X, x)
+    tl_seti(tl, TL_Y, y)
+    tl_setf(tl, f)
+    tl_seti(tl, TL_SC, sc)
+    hulib_clear_textline(tl)
+}
+
+function hulib_add_char_to_textline(tl: i64, ch: i32) -> i32 {
+    let len: i32 = tl_geti(tl, TL_LEN)
+    if len == HU_MAXLINELENGTH {
+        return 0
+    }
+    let l: ptr<u8> = tl_l(tl)
+    l[len] = (ch & 255) as u8
+    l[len + 1] = 0 as u8
+    tl_seti(tl, TL_LEN, len + 1)
+    tl_seti(tl, TL_UPD, 4)
+    return 1
+}
+
+function hulib_del_char_from_textline(tl: i64) -> i32 {
+    let len: i32 = tl_geti(tl, TL_LEN)
+    if len == 0 {
+        return 0
+    }
+    let l: ptr<u8> = tl_l(tl)
+    l[len - 1] = 0 as u8
+    tl_seti(tl, TL_LEN, len - 1)
+    tl_seti(tl, TL_UPD, 4)
+    return 1
+}
+
+function hulib_draw_textline(tl: i64, drawcursor: i32) -> void {
+    let y: i32 = tl_geti(tl, TL_Y)
+    let f: i64 = tl_getf(tl)
+    let sc: i32 = tl_geti(tl, TL_SC)
+    let len: i32 = tl_geti(tl, TL_LEN)
+    let l: ptr<u8> = tl_l(tl)
+
+    # draw the new stuff
+    let mut x: i32 = tl_geti(tl, TL_X)
+    let mut i: i32 = 0
+    let mut stop: i32 = 0
+    while i < len and stop == 0 {
+        let c: i32 = hu_toupper(l[i] as i32)
+        if c != 32 and c >= sc and c <= 95 {   # ' ' / '_'
+            let p: ptr<void> = font_patch(f, c - sc)
+            let w: i32 = PATCH_width(p)
+            if x + w > HU_SCREENWIDTH {
+                stop = 1
+            } else {
+                V_DrawPatchDirect(x, y, p)
+                x = x + w
+            }
+        } else {
+            x = x + 4
+            if x >= HU_SCREENWIDTH {
+                stop = 1
+            }
+        }
+        i = i + 1
+    }
+
+    # draw the cursor if requested
+    if drawcursor != 0 {
+        let cursor: ptr<void> = font_patch(f, 95 - sc)   # '_'
+        if x + PATCH_width(cursor) <= HU_SCREENWIDTH {
+            V_DrawPatchDirect(x, y, cursor)
+        }
+    }
+}
+
+# Only erases when NOT in automap and the screen is reduced, and the
+# text must either need updating or refreshing (because of a recent
+# change back from the automap). "noterased" was #defined viewwindowx.
+function hulib_erase_textline(tl: i64) -> void {
+    let upd: i32 = tl_geti(tl, TL_UPD)
+
+    if STAT_automapactive() == 0 and RMAIN_viewwindowx() != 0 and upd != 0 {
+        let lh: i32 = PATCH_height(font_patch(tl_getf(tl), 0)) + 1
+        let ty: i32 = tl_geti(tl, TL_Y)
+        let vwx: i32 = RMAIN_viewwindowx()
+        let vwy: i32 = RMAIN_viewwindowy()
+        let vw: i32 = DRAW_viewwidth()
+        let vh: i32 = DRAW_viewheight()
+        let mut y: i32 = ty
+        let mut yoffset: i32 = ty * HU_SCREENWIDTH
+        while y < ty + lh {
+            if y < vwy or y >= vwy + vh {
+                R_VideoErase(yoffset as u32, HU_SCREENWIDTH)   # erase entire line
+            } else {
+                R_VideoErase(yoffset as u32, vwx)           # erase left border
+                R_VideoErase((yoffset + vwx + vw) as u32, vwx)
+                # erase right border
+            }
+            y = y + 1
+            yoffset = yoffset + HU_SCREENWIDTH
+        }
+    }
+
+    if upd != 0 {
+        tl_seti(tl, TL_UPD, upd - 1)
+    }
+}
+
+# ---- hu_lib: scrolling text window -------------------------------------
+
+function hulib_init_stext(st: i64, x: i32, y: i32, h: i32, f: i64, sc: i32, on_id: i32) -> void {
+    tl_seti(st, ST_H, h)
+    tl_seti(st, ST_ON, on_id)
+    tl_seti(st, ST_LASTON, 1)
+    tl_seti(st, ST_CL, 0)
+    let lh: i32 = PATCH_height(font_patch(f, 0)) + 1
+    let mut i: i32 = 0
+    while i < h {
+        hulib_init_textline(st_line(st, i), x, y - i * lh, f, sc)
+        i = i + 1
+    }
+}
+
+function hulib_add_line_to_stext(st: i64) -> void {
+    # add a clear line
+    let mut cl: i32 = tl_geti(st, ST_CL) + 1
+    if cl == tl_geti(st, ST_H) {
+        cl = 0
+    }
+    tl_seti(st, ST_CL, cl)
+    hulib_clear_textline(st_line(st, cl))
+
+    # everything needs updating
+    let mut i: i32 = 0
+    while i < tl_geti(st, ST_H) {
+        tl_seti(st_line(st, i), TL_UPD, 4)
+        i = i + 1
+    }
+}
+
+function hulib_add_message_to_stext(st: i64, prefix: i64, msg: i64) -> void {
+    hulib_add_line_to_stext(st)
+    let line: i64 = st_line(st, tl_geti(st, ST_CL))
+    if prefix != 0 {
+        let p: ptr<u8> = prefix as ptr<u8>
+        let mut i: i32 = 0
+        while (p[i] as i32) != 0 {
+            hulib_add_char_to_textline(line, p[i] as i32)
+            i = i + 1
+        }
+    }
+    let m: ptr<u8> = msg as ptr<u8>
+    let mut j: i32 = 0
+    while (m[j] as i32) != 0 {
+        hulib_add_char_to_textline(line, m[j] as i32)
+        j = j + 1
+    }
+}
+
+function hulib_draw_stext(st: i64) -> void {
+    if hu_on_value(tl_geti(st, ST_ON)) != 0 {
+        # draw everything
+        let h: i32 = tl_geti(st, ST_H)
+        let cl: i32 = tl_geti(st, ST_CL)
+        let mut i: i32 = 0
+        while i < h {
+            let mut idx: i32 = cl - i
+            if idx < 0 {
+                idx = idx + h   # handle queue of lines
+            }
+            # need a decision made here on whether to skip the draw
+            hulib_draw_textline(st_line(st, idx), 0)   # no cursor, please
+            i = i + 1
+        }
+    }
+}
+
+function hulib_erase_stext(st: i64) -> void {
+    let onv: i32 = hu_on_value(tl_geti(st, ST_ON))
+    let laston: i32 = tl_geti(st, ST_LASTON)
+    let mut i: i32 = 0
+    while i < tl_geti(st, ST_H) {
+        if laston != 0 and onv == 0 {
+            tl_seti(st_line(st, i), TL_UPD, 4)
+        }
+        hulib_erase_textline(st_line(st, i))
+        i = i + 1
+    }
+    tl_seti(st, ST_LASTON, onv)
+}
+
+# ---- hu_lib: input text line -------------------------------------------
+
+function hulib_init_itext(it: i64, x: i32, y: i32, f: i64, sc: i32, on_id: i32) -> void {
+    tl_seti(it, IT_LM, 0)   # default left margin is start of text
+    tl_seti(it, IT_ON, on_id)
+    tl_seti(it, IT_LASTON, 1)
+    hulib_init_textline(it_line(it), x, y, f, sc)
+}
+
+# The deletion routines adhere to the left margin restriction
+function hulib_del_char_from_itext(it: i64) -> void {
+    if tl_geti(it_line(it), TL_LEN) != tl_geti(it, IT_LM) {
+        hulib_del_char_from_textline(it_line(it))
+    }
+}
+
+# Resets left margin as well
+function hulib_reset_itext(it: i64) -> void {
+    tl_seti(it, IT_LM, 0)
+    hulib_clear_textline(it_line(it))
+}
+
+# wrapper function for handling general keyed input.
+# returns true if it ate the key
+function hulib_key_in_itext(it: i64, ch: i32) -> i32 {
+    let c: i32 = hu_toupper(ch & 255)
+    if c >= 32 and c <= 95 {   # ' ' / '_'
+        hulib_add_char_to_textline(it_line(it), c)
+    } else {
+        if c == KEY_BACKSPACE {
+            hulib_del_char_from_itext(it)
+        } else {
+            if c != KEY_ENTER {
+                return 0   # did not eat key
+            }
+        }
+    }
+    return 1   # ate the key
+}
+
+function hulib_draw_itext(it: i64) -> void {
+    if hu_on_value(tl_geti(it, IT_ON)) != 0 {
+        hulib_draw_textline(it_line(it), 1)   # draw the line w/ cursor
+    }
+}
+
+function hulib_erase_itext(it: i64) -> void {
+    let onv: i32 = hu_on_value(tl_geti(it, IT_ON))
+    if tl_geti(it, IT_LASTON) != 0 and onv == 0 {
+        tl_seti(it_line(it), TL_UPD, 4)
+    }
+    hulib_erase_textline(it_line(it))
+    tl_seti(it, IT_LASTON, onv)
+}
+
+# ---- hu_stuff ----------------------------------------------------------
+
+function hu_ensure() -> void {
+    if hu_ready == 0 {
+        w_title = calloc(1, 112) as i64
+        w_message = calloc(1, 464) as i64
+        w_chat = calloc(1, 128) as i64
+        w_inputbuffer = calloc(4, 128) as i64
+        chat_dest = calloc(4, 1) as ptr<u8>
+        chatchars = calloc(128, 1) as ptr<u8>
+        lastmessage = calloc(81, 1) as ptr<u8>
+        fnbuf = calloc(9, 1) as ptr<u8>
+        hu_ready = 1
+    }
+}
+
+@flow_api
+function HU_Init() -> void {
+    hu_ensure()
+
+    # load the heads-up font: STCFN033 .. STCFN095.
+    # DEH_snprintf(buffer, 9, "STCFN%.3d", j++) is plain snprintf; j is
+    # 33..95, "%.3d" zero-pads to three digits.
+    let mut i: i32 = 0
+    let mut j: i32 = HU_FONTSTART
+    while i < HU_FONTSIZE {
+        fnbuf[0] = 83 as u8   # 'S'
+        fnbuf[1] = 84 as u8   # 'T'
+        fnbuf[2] = 67 as u8   # 'C'
+        fnbuf[3] = 70 as u8   # 'F'
+        fnbuf[4] = 78 as u8   # 'N'
+        fnbuf[5] = (48 + (j / 100) % 10) as u8
+        fnbuf[6] = (48 + (j / 10) % 10) as u8
+        fnbuf[7] = (48 + j % 10) as u8
+        fnbuf[8] = 0 as u8
+        hushim_set_hu_font(i, W_CacheLumpName(fnbuf as string, HU_PU_STATIC))
+        j = j + 1
+        i = i + 1
+    }
+}
+
+# HU_Stop is called only from HU_Start (verified by grep), so it stays
+# module-private.
+function hu_stop() -> void {
+    headsupactive = 0
+}
+
+@flow_api
+function HU_Start() -> void {
+    hu_ensure()
+
+    if headsupactive != 0 {
+        hu_stop()
+    }
+
+    plr = PLAYER_at(STAT_consoleplayer()) as i64
+    message_on = 0
+    message_dontfuckwithme = 0
+    message_nottobefuckedwith = 0
+    HU_set_chat_on(0)
+
+    let f: i64 = hushim_hu_font() as i64
+    let h0: i32 = PATCH_height(font_patch(f, 0))
+
+    # create the message widget
+    hulib_init_stext(w_message, HU_MSGX, HU_MSGY, HU_MSGHEIGHT,
+                     f, HU_FONTSTART, ON_MESSAGE)
+
+    # create the map title widget; HU_TITLEY = 167 - font height
+    hulib_init_textline(w_title, HU_TITLEX, 167 - h0, f, HU_FONTSTART)
+
+    let mission: i32 = STAT_logical_gamemission()
+    let gm: i32 = STAT_gamemap()
+    let mut s: string = "Unknown level"
+    if mission == HU_MISSION_DOOM {
+        s = mapnames[(STAT_gameepisode() - 1) * 9 + gm - 1]
+    }
+    if mission == MISSION_DOOM2 {
+        s = mapnames_commercial[gm - 1]
+    }
+    if mission == MISSION_PACK_PLUT {
+        s = mapnames_commercial[gm - 1 + 32]
+    }
+    if mission == MISSION_PACK_TNT {
+        s = mapnames_commercial[gm - 1 + 64]
+    }
+
+    # Chex.exe always uses the episode 1 level title
+    # eg. E2M1 gives the title for E1M1
+    if STAT_gameversion() == HU_EXE_CHEX {
+        s = mapnames[gm - 1]
+    }
+
+    # (dehacked substitution DEH_String(s) is the identity here)
+    let sp: ptr<u8> = s as ptr<u8>
+    let mut k: i32 = 0
+    while (sp[k] as i32) != 0 {
+        hulib_add_char_to_textline(w_title, sp[k] as i32)
+        k = k + 1
+    }
+
+    # create the chat widget; HU_INPUTX = HU_MSGX,
+    # HU_INPUTY = HU_MSGY + HU_MSGHEIGHT*(font height + 1)
+    hulib_init_itext(w_chat, HU_MSGX, HU_MSGY + HU_MSGHEIGHT * (h0 + 1),
+                     f, HU_FONTSTART, ON_CHAT)
+
+    # create the inputbuffer widgets
+    let mut i: i32 = 0
+    while i < MAXPLAYERS {
+        hulib_init_itext(w_inputbuffer + (i * 128) as i64, 0, 0, 0, 0, ON_OFF)
+        i = i + 1
+    }
+
+    headsupactive = 1
+}
+
+@flow_api
+function HU_Drawer() -> void {
+    hu_ensure()
+    hulib_draw_stext(w_message)
+    hulib_draw_itext(w_chat)
+    if STAT_automapactive() != 0 {
+        hulib_draw_textline(w_title, 0)
+    }
+}
+
+@flow_api
+function HU_Erase() -> void {
+    hu_ensure()
+    hulib_erase_stext(w_message)
+    hulib_erase_itext(w_chat)
+    hulib_erase_textline(w_title)
+}
+
+function hu_queue_chat_char(c: i32) -> void {
+    if ((qhead + 1) & (QUEUESIZE - 1)) == qtail {
+        # HUSTR_MSGU
+        PLAYER_set_message(plr as ptr<void>,
+                                  "[Message unsent]" as ptr<u8>)
+    } else {
+        chatchars[qhead] = (c & 255) as u8
+        qhead = (qhead + 1) & (QUEUESIZE - 1)
+    }
+}
+
+@flow_api
+function HU_dequeueChatChar() -> i32 {
+    let mut c: i32 = 0
+    if qhead != qtail {
+        c = chatchars[qtail] as i32
+        qtail = (qtail + 1) & (QUEUESIZE - 1)
+    }
+    return c
+}
+
+@flow_api
+function HU_Ticker() -> void {
+    hu_ensure()
+
+    # tick down message counter if message is up
+    if message_counter != 0 {
+        message_counter = message_counter - 1
+        if message_counter == 0 {
+            message_on = 0
+            message_nottobefuckedwith = 0
+        }
+    }
+
+    let dfwm: i32 = message_dontfuckwithme
+    if STAT_showMessages() != 0 or dfwm != 0 {
+        # display message if necessary
+        let msg: ptr<u8> = PLAYER_message(plr as ptr<void>)
+        if (msg as i64) != 0 {
+            if message_nottobefuckedwith == 0 or dfwm != 0 {
+                hulib_add_message_to_stext(w_message, 0, msg as i64)
+                PLAYER_set_message(plr as ptr<void>, null)
+                message_on = 1
+                message_counter = HU_MSGTIMEOUT
+                message_nottobefuckedwith = dfwm
+                message_dontfuckwithme = 0
+            }
+        }
+    }
+
+    # check for incoming chat characters
+    if STAT_netgame() != 0 {
+        let cp: i32 = STAT_consoleplayer()
+        let mut i: i32 = 0
+        while i < MAXPLAYERS {
+            if STAT_playeringame(i) != 0 and i != cp {
+                let p: ptr<void> = PLAYER_at(i)
+                # cmd.chatchar is a byte; sign-extend like C's `char c`
+                let mut c: i32 = PLAYER_cmd_chatchar(p)
+                if c > 127 {
+                    c = c - 256
+                }
+                if c != 0 {
+                    if c <= HU_BROADCAST {
+                        chat_dest[i] = (c & 255) as u8
+                    } else {
+                        let ib: i64 = w_inputbuffer + (i * 128) as i64
+                        let rc: i32 = hulib_key_in_itext(ib, c)
+                        if rc != 0 and c == KEY_ENTER {
+                            let dest: i32 = chat_dest[i] as i32
+                            if tl_geti(ib, TL_LEN) != 0
+                                and (dest == cp + 1 or dest == HU_BROADCAST) {
+                                hulib_add_message_to_stext(
+                                    w_message,
+                                    hushim_player_name(i) as i64,
+                                    tl_l(ib) as i64)
+                                message_nottobefuckedwith = 1
+                                message_on = 1
+                                message_counter = HU_MSGTIMEOUT
+                                if STAT_gamemode() == HU_GM_COMMERCIAL {
+                                    S_StartSound(null, SFX_RADIO)
+                                } else {
+                                    S_StartSound(null, SFX_TINK)
+                                }
+                            }
+                            hulib_reset_itext(ib)
+                        }
+                    }
+                    PLAYER_cmd_set_chatchar(p, 0)
+                }
+            }
+            i = i + 1
+        }
+    }
+}
+
+@flow_api
+function HU_Responder(ev: ptr<i32>) -> i32 {
+    hu_ensure()
+
+    # event_t layout (d_event.h): type, data1, data2, data3, data4
+    let evtype: i32 = ev[0]
+    let d1: i32 = ev[1]
+    let d2: i32 = ev[2]
+
+    let mut eatkey: i32 = 0
+
+    let mut numplayers: i32 = 0
+    let mut i: i32 = 0
+    while i < MAXPLAYERS {
+        numplayers = numplayers + STAT_playeringame(i)
+        i = i + 1
+    }
+
+    if d1 == KEY_RSHIFT {
+        return 0
+    }
+    if d1 == KEY_RALT or d1 == KEY_LALT {
+        if evtype == HU_EV_KEYDOWN {
+            altdown = 1
+        } else {
+            altdown = 0
+        }
+        return 0
+    }
+
+    if evtype != HU_EV_KEYDOWN {
+        return 0
+    }
+
+    if HU_chat_on() == 0 {
+        if d1 == KEY_message_refresh() {
+            message_on = 1
+            message_counter = HU_MSGTIMEOUT
+            eatkey = 1
+        } else {
+            if STAT_netgame() != 0 and d2 == KEY_multi_msg() {
+                eatkey = 1
+                HU_set_chat_on(1)
+                hulib_reset_itext(w_chat)
+                hu_queue_chat_char(HU_BROADCAST)
+            } else {
+                if STAT_netgame() != 0 and numplayers > 2 {
+                    let cp: i32 = STAT_consoleplayer()
+                    let mut k: i32 = 0
+                    let mut stop: i32 = 0
+                    while k < MAXPLAYERS and stop == 0 {
+                        if d2 == KEY_multi_msgplayer(k) {
+                            if STAT_playeringame(k) != 0 and k != cp {
+                                eatkey = 1
+                                HU_set_chat_on(1)
+                                hulib_reset_itext(w_chat)
+                                hu_queue_chat_char(k + 1)
+                                stop = 1
+                            } else {
+                                if k == cp {
+                                    num_nobrainers = num_nobrainers + 1
+                                    if num_nobrainers < 3 {
+                                        PLAYER_set_message(plr as ptr<void>,
+                                            "You mumble to yourself" as ptr<u8>)
+                                    } else {
+                                        if num_nobrainers < 6 {
+                                            PLAYER_set_message(plr as ptr<void>,
+                                                "Who's there?" as ptr<u8>)
+                                        } else {
+                                            if num_nobrainers < 9 {
+                                                PLAYER_set_message(plr as ptr<void>,
+                                                    "You scare yourself" as ptr<u8>)
+                                            } else {
+                                                if num_nobrainers < 32 {
+                                                    PLAYER_set_message(plr as ptr<void>,
+                                                        "You start to rave" as ptr<u8>)
+                                                } else {
+                                                    PLAYER_set_message(plr as ptr<void>,
+                                                        "You've lost it..." as ptr<u8>)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        k = k + 1
+                    }
+                }
+            }
+        }
+    } else {
+        # send a macro
+        if altdown != 0 {
+            let c: i32 = (d1 - 48) & 255   # unsigned char c = ev->data1 - '0'
+            if c > 9 {
+                return 0
+            }
+            let macro: ptr<u8> = hushim_chat_macro(c)
+
+            # kill last message with a '\n'
+            hu_queue_chat_char(KEY_ENTER)   # DEBUG!!!
+
+            # send the macro message
+            let mut m: i32 = 0
+            while (macro[m] as i32) != 0 {
+                hu_queue_chat_char(macro[m] as i32)
+                m = m + 1
+            }
+            hu_queue_chat_char(KEY_ENTER)
+
+            # leave chat mode and notify that it was sent
+            HU_set_chat_on(0)
+            M_StringCopy(lastmessage, hushim_chat_macro(c), 81)
+            PLAYER_set_message(plr as ptr<void>, lastmessage)
+            eatkey = 1
+        } else {
+            let c: i32 = d2 & 255   # unsigned char c = ev->data2
+            eatkey = hulib_key_in_itext(w_chat, c)
+            if eatkey != 0 {
+                hu_queue_chat_char(c)
+            }
+            if c == KEY_ENTER {
+                HU_set_chat_on(0)
+                if tl_geti(w_chat, TL_LEN) != 0 {
+                    M_StringCopy(lastmessage, tl_l(w_chat), 81)
+                    PLAYER_set_message(plr as ptr<void>, lastmessage)
+                }
+            } else {
+                if c == KEY_ESCAPE {
+                    HU_set_chat_on(0)
+                }
+            }
+        }
+    }
+
+    return eatkey
+}

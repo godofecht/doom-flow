@@ -1,0 +1,489 @@
+# Main game loop / tic sync, ported from d_loop.c to Flow.
+#
+# FEATURE_MULTIPLAYER is #undef — multiplayer bodies stay stubbed.
+# ORIGCODE is #undef — D_StartNetGame takes the stub path.
+#
+# gametic / singletics / ticdup are Flow-owned. Loop callbacks
+# (ProcessEvents / BuildTiccmd / RunTic / RunMenu) are called directly —
+# no loop_interface_t indirection.
+
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+extern { function memset(p: ptr<void>, v: i32, n: i64) -> ptr<void> }
+extern { function printf(fmt: string, s: string) -> i32 }
+
+extern { function I_Error(msg: string) -> void }
+extern { function I_AtExit(func: ptr<void>, run_on_error: i32) -> void }
+extern { function I_StartTic() -> void }
+extern { function I_GetTime() -> i32 }
+extern { function I_GetTimeMS() -> i32 }
+extern { function I_Sleep(ms: i32) -> void }
+
+extern { function STAT_drone() -> i32 }
+extern { function D_ProcessEvents() -> void }
+extern { function M_Ticker() -> void }
+extern { function G_BuildTiccmd(cmd: ptr<void>, maketic: i32) -> void }
+extern { function Net_RunTic(cmds: ptr<void>, ingame: ptr<void>) -> void }
+
+# ---- gametic / singletics / ticdup (was loop_shim.c) -----------------
+
+let mut gametic: i32 = 0
+let mut singletics: i32 = 0
+let mut ticdup: i32 = 0
+
+@flow_api
+function loopshim_gametic() -> i32 { return gametic }
+@flow_api
+function loopshim_set_gametic(v: i32) -> void { gametic = v }
+@flow_api
+function loopshim_inc_gametic() -> void { gametic = gametic + 1 }
+@flow_api
+function loopshim_singletics() -> i32 { return singletics }
+@flow_api
+function loopshim_set_singletics(v: i32) -> void { singletics = v }
+@flow_api
+function loopshim_ticdup() -> i32 { return ticdup }
+@flow_api
+function loopshim_set_ticdup(v: i32) -> void { ticdup = v }
+
+@flow_api
+function loopshim_net_client_connected() -> i32 { return 0 }
+
+@flow_api
+function loopshim_at_exit_quit() -> void {
+    I_AtExit(D_QuitNetGame as ptr<void>, 1)
+}
+
+# ---- STAT_gametic / STAT_ticdup --------------------------------------
+
+@flow_api
+function STAT_gametic() -> i32 { return gametic }
+@flow_api
+function STAT_set_gametic(v: i32) -> void { gametic = v }
+@flow_api
+function STAT_inc_gametic() -> void { gametic = gametic + 1 }
+@flow_api
+function STAT_ticdup() -> i32 { return ticdup }
+@flow_api
+function STAT_set_ticdup(v: i32) -> void { ticdup = v }
+
+# ---- constants (LOOP_ prefix) ----------------------------------------
+
+const LOOP_NET_MAXPLAYERS: i32 = 8     # net_defs.h NET_MAXPLAYERS
+const LOOP_BACKUPTICS: i32 = 128       # net_defs.h BACKUPTICS
+const LOOP_TICRATE: i32 = 35           # i_timer.h
+const LOOP_FRACUNIT: i32 = 65536       # m_fixed.h (1<<16)
+const LOOP_BT_SPECIAL: i32 = 128       # d_event.h
+const LOOP_SIZEOF_TICCMD: i32 = 16     # sizeof(ticcmd_t) LP64
+const LOOP_SIZEOF_TICSET: i32 = 160    # sizeof(ticcmd_set_t) LP64
+const LOOP_INGAME_OFF: i32 = 128       # offsetof(ticcmd_set_t, ingame)
+
+# net_gamesettings_t / net_connect_data_t field offsets (LP64)
+const LOOP_GS_TICDUP: i32 = 0
+const LOOP_GS_EXTRATICS: i32 = 4
+const LOOP_GS_NEW_SYNC: i32 = 44
+const LOOP_GS_NUM_PLAYERS: i32 = 60
+const LOOP_GS_CONSOLEPLAYER: i32 = 64
+const LOOP_GS_PLAYER_CLASSES: i32 = 68
+const LOOP_CD_PLAYER_CLASS: i32 = 64
+
+# ---- private Flow structs --------------------------------------------
+
+struct LoopTicCmd {
+    forwardmove: i8,
+    sidemove: i8,
+    angleturn: i16,
+    chatchar: u8,
+    buttons: u8,
+    consistancy: u8,
+    buttons2: u8,
+    inventory: i32,
+    lookfly: u8,
+    arti: u8
+}
+
+struct LoopTicSet {
+    cmds: array<LoopTicCmd, 8>,
+    ingame: array<i32, 8>
+}
+
+# ---- module-private state --------------------------------------------
+
+let mut ticdata: ptr<u8> = null
+let mut build_cmd_buf: ptr<u8> = null
+let mut maketic: i32 = 0
+let mut recvtic: i32 = 0
+let mut localplayer: i32 = 0
+let mut skiptics: i32 = 0
+let mut offsetms: i32 = 0
+let mut new_sync: i32 = 1
+let mut local_playeringame: array<i32, 8> = [0, 0, 0, 0, 0, 0, 0, 0]
+let mut player_class: i32 = 0
+let mut lasttime: i32 = 0
+let mut frameon: i32 = 0
+let mut frameskip: array<i32, 4> = [0, 0, 0, 0]
+let mut oldnettics: i32 = 0
+let mut oldentertics: i32 = 0
+
+function loop_ensure_ticdata() -> void {
+    if (ticdata as i64) == 0 {
+        ticdata = calloc(LOOP_BACKUPTICS as i64, LOOP_SIZEOF_TICSET as i64) as ptr<u8>
+    }
+}
+
+function loop_ensure_cmd_buf() -> ptr<u8> {
+    if (build_cmd_buf as i64) == 0 {
+        build_cmd_buf = calloc(1, LOOP_SIZEOF_TICCMD as i64) as ptr<u8>
+    }
+    memset(build_cmd_buf as ptr<void>, 0, LOOP_SIZEOF_TICCMD as i64)
+    return build_cmd_buf
+}
+
+function loop_get_set(i: i32) -> LoopTicSet {
+    loop_ensure_ticdata()
+    let p: ptr<LoopTicSet> = ((ticdata as i64) + (i * LOOP_SIZEOF_TICSET) as i64) as ptr<LoopTicSet>
+    return p[0]
+}
+
+function loop_put_set(i: i32, s: LoopTicSet) -> void {
+    loop_ensure_ticdata()
+    let p: ptr<LoopTicSet> = ((ticdata as i64) + (i * LOOP_SIZEOF_TICSET) as i64) as ptr<LoopTicSet>
+    p[0] = s
+}
+
+function loop_set_slot_ptr(i: i32) -> ptr<void> {
+    loop_ensure_ticdata()
+    return ((ticdata as i64) + (i * LOOP_SIZEOF_TICSET) as i64) as ptr<void>
+}
+
+function loop_set_i32(base: ptr<u8>, off: i32, v: i32) -> void {
+    let p: ptr<i32> = ((base as i64) + off as i64) as ptr<i32>
+    p[0] = v
+}
+
+function loop_get_i32(base: ptr<u8>, off: i32) -> i32 {
+    let p: ptr<i32> = ((base as i64) + off as i64) as ptr<i32>
+    return p[0]
+}
+
+function GetAdjustedTime() -> i32 {
+    let mut time_ms: i32 = I_GetTimeMS()
+    if new_sync != 0 {
+        time_ms = time_ms + (offsetms / LOOP_FRACUNIT)
+    }
+    return (time_ms * LOOP_TICRATE) / 1000
+}
+
+function BuildNewTic() -> i32 {
+    let ticdup: i32 = STAT_ticdup()
+    let gameticdiv: i32 = STAT_gametic() / ticdup
+
+    I_StartTic()
+    D_ProcessEvents()
+    M_Ticker()
+
+    if STAT_drone() != 0 {
+        return 0
+    }
+
+    if new_sync != 0 {
+        if loopshim_net_client_connected() == 0 and maketic - gameticdiv > 2 {
+            return 0
+        }
+        if maketic - gameticdiv > 8 {
+            return 0
+        }
+    } elif maketic - gameticdiv >= 5 {
+        return 0
+    }
+
+    let cmdbuf: ptr<u8> = loop_ensure_cmd_buf()
+    G_BuildTiccmd(cmdbuf as ptr<void>, maketic)
+    let cmdp: ptr<LoopTicCmd> = cmdbuf as ptr<LoopTicCmd>
+    let cmd: LoopTicCmd = cmdp[0]
+
+    # FEATURE_MULTIPLAYER stub: NET_CL_SendTiccmd omitted
+
+    let slot: i32 = maketic % LOOP_BACKUPTICS
+    let mut set: LoopTicSet = loop_get_set(slot)
+    set.cmds[localplayer] = cmd
+    set.ingame[localplayer] = 1
+    loop_put_set(slot, set)
+
+    maketic = maketic + 1
+    return 1
+}
+
+@flow_api
+function NetUpdate() -> void {
+    if loopshim_singletics() != 0 {
+        return
+    }
+
+    # FEATURE_MULTIPLAYER stub: NET_CL_Run / NET_SV_Run omitted
+
+    let ticdup: i32 = STAT_ticdup()
+    let nowtime: i32 = GetAdjustedTime() / ticdup
+    let mut newtics: i32 = nowtime - lasttime
+    lasttime = nowtime
+
+    if skiptics <= newtics {
+        newtics = newtics - skiptics
+        skiptics = 0
+    } else {
+        skiptics = skiptics - newtics
+        newtics = 0
+    }
+
+    for i in 0 to newtics {
+        if BuildNewTic() == 0 {
+            return
+        }
+    }
+}
+
+function D_Disconnected() -> void {
+    if STAT_drone() != 0 {
+        I_Error("Disconnected from server in drone mode.")
+    }
+    printf("Disconnected from server.%s\n", "")
+}
+
+@flow_api
+function D_ReceiveTic(ticcmds: ptr<void>, players_mask: ptr<void>) -> void {
+    if (ticcmds as i64) == 0 and (players_mask as i64) == 0 {
+        D_Disconnected()
+        return
+    }
+
+    let slot: i32 = recvtic % LOOP_BACKUPTICS
+    let mut set: LoopTicSet = loop_get_set(slot)
+    let cmdsrc: ptr<LoopTicCmd> = ticcmds as ptr<LoopTicCmd>
+    let mask: ptr<i32> = players_mask as ptr<i32>
+
+    for i in 0 to LOOP_NET_MAXPLAYERS {
+        # Local player: don't overwrite our own ticcmd.
+        if STAT_drone() != 0 or i != localplayer {
+            set.cmds[i] = cmdsrc[i]
+            set.ingame[i] = mask[i]
+        }
+    }
+    loop_put_set(slot, set)
+    recvtic = recvtic + 1
+}
+
+@flow_api
+function D_StartGameLoop() -> void {
+    lasttime = GetAdjustedTime() / STAT_ticdup()
+}
+
+@flow_api
+function D_StartNetGame(settings: ptr<u8>, callback: ptr<void>) -> void {
+    # ORIGCODE stub path (config.h #undef ORIGCODE)
+    loop_set_i32(settings, LOOP_GS_CONSOLEPLAYER, 0)
+    loop_set_i32(settings, LOOP_GS_NUM_PLAYERS, 1)
+    loop_set_i32(settings, LOOP_GS_PLAYER_CLASSES, player_class)
+    loop_set_i32(settings, LOOP_GS_NEW_SYNC, 0)
+    loop_set_i32(settings, LOOP_GS_EXTRATICS, 1)
+    loop_set_i32(settings, LOOP_GS_TICDUP, 1)
+
+    STAT_set_ticdup(loop_get_i32(settings, LOOP_GS_TICDUP))
+    new_sync = loop_get_i32(settings, LOOP_GS_NEW_SYNC)
+    # callback unused outside ORIGCODE BlockUntilStart (keep param for ABI)
+    if (callback as i64) == 0 {
+        return
+    }
+}
+
+@flow_api
+function D_InitNetGame(connect_data: ptr<u8>) -> i32 {
+    loopshim_at_exit_quit()
+    player_class = loop_get_i32(connect_data, LOOP_CD_PLAYER_CLASS)
+    # FEATURE_MULTIPLAYER stub: no server/client connect
+    return 0
+}
+
+@flow_api
+function D_QuitNetGame() -> void {
+    # FEATURE_MULTIPLAYER stub: NET_SV_Shutdown / NET_CL_Disconnect omitted
+    return
+}
+
+function GetLowTic() -> i32 {
+    let mut lowtic: i32 = maketic
+    # FEATURE_MULTIPLAYER path kept for structure; connected is always false
+    if loopshim_net_client_connected() != 0 {
+        if STAT_drone() != 0 or recvtic < lowtic {
+            lowtic = recvtic
+        }
+    }
+    return lowtic
+}
+
+function OldNetSync() -> void {
+    frameon = frameon + 1
+
+    let mut keyplayer: i32 = 0 - 1
+    for i in 0 to LOOP_NET_MAXPLAYERS {
+        if keyplayer < 0 and local_playeringame[i] != 0 {
+            keyplayer = i
+        }
+    }
+
+    if keyplayer < 0 {
+        return
+    }
+
+    if localplayer != keyplayer {
+        if maketic <= recvtic {
+            lasttime = lasttime - 1
+        }
+        if oldnettics > recvtic {
+            frameskip[frameon & 3] = 1
+        } else {
+            frameskip[frameon & 3] = 0
+        }
+        oldnettics = maketic
+        if frameskip[0] != 0 and frameskip[1] != 0 and frameskip[2] != 0 and frameskip[3] != 0 {
+            skiptics = 1
+        }
+    }
+}
+
+function PlayersInGame() -> i32 {
+    let mut result: i32 = 0
+
+    if loopshim_net_client_connected() != 0 {
+        for i in 0 to LOOP_NET_MAXPLAYERS {
+            if local_playeringame[i] != 0 {
+                result = 1
+            }
+        }
+    }
+
+    if STAT_drone() == 0 {
+        result = 1
+    }
+
+    return result
+}
+
+function TicdupSquash(set: LoopTicSet) -> LoopTicSet {
+    let mut s: LoopTicSet = set
+    for i in 0 to LOOP_NET_MAXPLAYERS {
+        let mut cmd: LoopTicCmd = s.cmds[i]
+        cmd.chatchar = 0 as u8
+        if (cmd.buttons as i32 & LOOP_BT_SPECIAL) != 0 {
+            cmd.buttons = 0 as u8
+        }
+        s.cmds[i] = cmd
+    }
+    return s
+}
+
+function SinglePlayerClear(set: LoopTicSet) -> LoopTicSet {
+    let mut s: LoopTicSet = set
+    for i in 0 to LOOP_NET_MAXPLAYERS {
+        if i != localplayer {
+            s.ingame[i] = 0
+        }
+    }
+    return s
+}
+
+@flow_api
+function TryRunTics() -> void {
+    let ticdup: i32 = STAT_ticdup()
+    let entertic: i32 = I_GetTime() / ticdup
+    let realtics: i32 = entertic - oldentertics
+    oldentertics = entertic
+
+    if loopshim_singletics() != 0 {
+        BuildNewTic()
+    } else {
+        NetUpdate()
+    }
+
+    let mut lowtic: i32 = GetLowTic()
+    let availabletics: i32 = lowtic - STAT_gametic() / ticdup
+
+    let mut counts: i32 = 0
+    if new_sync != 0 {
+        counts = availabletics
+    } else {
+        if realtics < availabletics - 1 {
+            counts = realtics + 1
+        } elif realtics < availabletics {
+            counts = realtics
+        } else {
+            counts = availabletics
+        }
+        if counts < 1 {
+            counts = 1
+        }
+        if loopshim_net_client_connected() != 0 {
+            OldNetSync()
+        }
+    }
+
+    if counts < 1 {
+        counts = 1
+    }
+
+    while PlayersInGame() == 0 or lowtic < STAT_gametic() / ticdup + counts {
+        NetUpdate()
+        lowtic = GetLowTic()
+        if lowtic < STAT_gametic() / ticdup {
+            I_Error("TryRunTics: lowtic < gametic")
+        }
+        if I_GetTime() / ticdup - entertic > 0 {
+            return
+        }
+        I_Sleep(1)
+    }
+
+    let mut remaining: i32 = counts
+    while remaining > 0 {
+        remaining = remaining - 1
+
+        if PlayersInGame() == 0 {
+            return
+        }
+
+        let slot: i32 = (STAT_gametic() / ticdup) % LOOP_BACKUPTICS
+        let mut set: LoopTicSet = loop_get_set(slot)
+
+        if loopshim_net_client_connected() == 0 {
+            set = SinglePlayerClear(set)
+            loop_put_set(slot, set)
+        }
+
+        for i in 0 to ticdup {
+            if STAT_gametic() / ticdup > lowtic {
+                I_Error("gametic>lowtic")
+            }
+
+            for p in 0 to LOOP_NET_MAXPLAYERS {
+                local_playeringame[p] = set.ingame[p]
+            }
+
+            let setptr: ptr<void> = loop_set_slot_ptr(slot)
+            Net_RunTic(
+                setptr,
+                ((setptr as i64) + LOOP_INGAME_OFF as i64) as ptr<void>
+            )
+            STAT_inc_gametic()
+
+            set = TicdupSquash(set)
+            loop_put_set(slot, set)
+        }
+
+        NetUpdate()
+    }
+}
+
+# Historical d_loop API — callbacks are wired directly above; keep a
+# no-op so callers (D_CheckNetGame era) still link.
+@flow_api
+function D_RegisterLoopCallbacks(i: ptr<void>) -> void {
+    let _unused: ptr<void> = i
+}

@@ -1,0 +1,43 @@
+# Sky mapping, ported from r_sky.c to Flow.
+#
+# skyflatnum / skytexture / skytexturemid are Flow-owned (was sky_shim.c /
+# skyshim_*). All readers go through SKY_* — no C globals or per-module
+# clones remain.
+
+let mut skyflatnum: i32 = 0
+let mut skytexture: i32 = 0
+let mut skytexturemid: i32 = 0
+
+# m_fixed.h
+const SKY_FRACUNIT: i32 = 65536
+
+@flow_api
+function SKY_skyflatnum() -> i32 {
+    return skyflatnum
+}
+
+@flow_api
+function SKY_set_skyflatnum(v: i32) -> void {
+    skyflatnum = v
+}
+
+@flow_api
+function SKY_skytexture() -> i32 {
+    return skytexture
+}
+
+@flow_api
+function SKY_set_skytexture(v: i32) -> void {
+    skytexture = v
+}
+
+@flow_api
+function SKY_skytexturemid() -> i32 {
+    return skytexturemid
+}
+
+@flow_api
+function R_InitSkyMap() -> void {
+    # skyflatnum = R_FlatNumForName(SKYFLATNAME);  // commented out in C too
+    skytexturemid = 100 * SKY_FRACUNIT
+}

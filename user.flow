@@ -1,0 +1,816 @@
+# Player movement / thinking, ported from p_user.c to Flow.
+#
+# Handles bobbing POV height, thrust from ticcmd, death fall-to-face,
+# weapon change, use, power-up counters and fixedcolormap.
+#
+# player_t / ticcmd_t / pspdef_t field access uses LP64 offsetof helpers
+# (PLAYER_OFF_*, pl_i32 / pl_ptr). players[] lives in game_state.flow
+# (gameshim_player_at). onground is private to this module.
+#
+# LP64 offsetof tables (PLAYER_OFF_* below):
+#
+#   player_t (sizeof 328 = PLAYER_SIZEOF)
+#     mo 0, playerstate 8, cmd 12, viewz 28, viewheight 32,
+#     deltaviewheight 36, bob 40, health 44, armorpoints 48,
+#     armortype 52, powers 56, cards 80, backpack 104, frags 108,
+#     readyweapon 124, pendingweapon 128, weaponowned 132, ammo 168,
+#     maxammo 184, attackdown 200, usedown 204, cheats 208, refire 212,
+#     killcount 216, itemcount 220, secretcount 224, message 232,
+#     damagecount 240, bonuscount 244, attacker 248, extralight 256,
+#     fixedcolormap 260, colormap 264, psprites 272, didsecret 320
+#
+#   ticcmd_t (sizeof 16 = TICCMD_SIZEOF, embedded at player_t.cmd) —
+#   accessors CMD_* / gameshim_cmd_*:
+#     forwardmove 0 (i8), sidemove 1 (i8), angleturn 2 (i16),
+#     chatchar 4, buttons 5, consistancy 6
+#
+#   pspdef_t (sizeof 24 = PSPDEF_SIZEOF, embedded in player_t.psprites[]):
+#     state 0 (ptr), tics 8, sx 12, sy 16
+#
+#   weaponinfo_t (sizeof 24 = WEAPONINFO_SIZEOF): see items.flow
+#
+#   mobj_t: see sight.flow / mobj.flow MOBJ_OFF_*
+
+# ---- externs: fixed-point (fixp.flow, exact C names) ------------------
+
+extern { function FixedMul(a: i32, b: i32) -> i32 }
+extern { function TABLES_finesine(idx: i32) -> i32 }
+extern { function TABLES_finecosine(idx: i32) -> i32 }
+extern { function TABLES_finetangent(idx: i32) -> i32 }
+
+# ---- externs: engine C ------------------------------------------------
+
+extern { function P_SetMobjState(mobj: ptr<void>, state: i32) -> i32 }
+extern { function P_MovePsprites(player: ptr<void>) -> void }
+extern { function P_UseLines(player: ptr<void>) -> void }
+extern { function P_PlayerInSpecialSector(player: ptr<void>) -> void }
+extern { function R_PointToAngle2(x1: i32, y1: i32, x2: i32, y2: i32) -> u32 }
+
+# ---- externs: shared state / game_shim.c -------------------------------
+
+extern { function STATE_at(i: i32) -> ptr<void> }
+
+# players[] storage (game_shim.c); collapses into Flow with game.flow later.
+extern { function gameshim_player_at(i: i32) -> ptr<void> }
+extern { function INFO_maxammo(i: i32) -> i32 }
+extern { function memset(dest: ptr<void>, c: i32, n: i64) -> ptr<void> }
+
+# subsector->sector->special, for the special-sector check in P_PlayerThink.
+extern { function GEOM_subsector_sector(ss: ptr<void>) -> ptr<void> }
+extern { function GEOM_sector_special(s: ptr<void>) -> i32 }
+
+# Bare ticcmd_t* field accessors (owned by game.flow / gameshim_cmd_*).
+extern { function CMD_forwardmove(cmd: ptr<void>) -> i32 }
+extern { function CMD_sidemove(cmd: ptr<void>) -> i32 }
+extern { function CMD_angleturn(cmd: ptr<void>) -> i32 }
+extern { function CMD_buttons(cmd: ptr<void>) -> i32 }
+extern { function CMD_consistancy(cmd: ptr<void>) -> i32 }
+extern { function CMD_set_angleturn(cmd: ptr<void>, v: i32) -> void }
+extern { function CMD_set_forwardmove(cmd: ptr<void>, v: i32) -> void }
+extern { function CMD_set_sidemove(cmd: ptr<void>, v: i32) -> void }
+extern { function CMD_set_buttons(cmd: ptr<void>, v: i32) -> void }
+extern { function CMD_chatchar(cmd: ptr<void>) -> i32 }
+extern { function CMD_set_chatchar(cmd: ptr<void>, v: i32) -> void }
+
+extern { function MOBJ_x(m: ptr<void>) -> i32 }
+extern { function MOBJ_y(m: ptr<void>) -> i32 }
+extern { function MOBJ_z(m: ptr<void>) -> i32 }
+extern { function MOBJ_angle(m: ptr<void>) -> u32 }
+extern { function MOBJ_set_angle(m: ptr<void>, v: u32) -> void }
+extern { function MOBJ_floorz(m: ptr<void>) -> i32 }
+extern { function MOBJ_ceilingz(m: ptr<void>) -> i32 }
+extern { function MOBJ_momx(m: ptr<void>) -> i32 }
+extern { function MOBJ_momy(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_momx(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_momy(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_flags(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_flags(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_state(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_subsector(m: ptr<void>) -> ptr<void> }
+
+# ---- constants --------------------------------------------------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+# p_user.c
+const USER_INVERSECOLORMAP: i32 = 32
+const USER_MAXBOB: i32 = 1048576          # 0x100000
+
+# m_fixed.h / p_local.h
+const USER_FRACUNIT: i32 = 65536
+const USER_VIEWHEIGHT: i32 = 2686976      # 41*FRACUNIT
+
+# tables.h
+const USER_FINEANGLES: i32 = 8192
+const USER_FINEMASK: i32 = 8191
+const USER_ANGLETOFINESHIFT: u32 = 19
+const USER_ANG90: u32 = 1073741824
+const USER_ANG180: u32 = 2147483648
+const USER_ANG5: u32 = 59652323           # ANG90/18
+
+# d_player.h
+const USER_PST_LIVE: i32 = 0
+const USER_PST_DEAD: i32 = 1
+const USER_PST_REBORN: i32 = 2
+const USER_CF_NOCLIP: i32 = 1
+const USER_CF_NOMOMENTUM: i32 = 4
+
+# p_mobj.h
+const USER_MF_NOCLIP: i32 = 4096
+const USER_MF_JUSTATTACKED: i32 = 128
+const USER_MF_SHADOW: i32 = 262144
+
+# d_event.h
+const USER_BT_USE: i32 = 2
+const USER_BT_CHANGE: i32 = 4
+const USER_BT_SPECIAL: i32 = 128
+const USER_BT_WEAPONMASK: i32 = 56
+const USER_BT_WEAPONSHIFT: i32 = 3
+
+# doomdef.h weapontype_t / powertype_t
+const USER_WP_FIST: i32 = 0
+const USER_WP_PISTOL: i32 = 1
+const USER_WP_SHOTGUN: i32 = 2
+const USER_WP_PLASMA: i32 = 5
+const USER_WP_BFG: i32 = 6
+const USER_WP_CHAINSAW: i32 = 7
+const USER_WP_SUPERSHOTGUN: i32 = 8
+const USER_PW_INVULNERABILITY: i32 = 0
+const USER_PW_STRENGTH: i32 = 1
+const USER_PW_INVISIBILITY: i32 = 2
+const USER_PW_IRONFEET: i32 = 3
+const USER_PW_INFRARED: i32 = 5
+
+# doomdef.h ammotype_t
+const USER_AM_CLIP: i32 = 0
+
+# deh_misc.h defaults (FEATURE_DEHACKED is #undef'd in this build, so
+# deh_initial_health / deh_initial_bullets are these compile-time constants).
+const PLAYER_DEH_INITIAL_HEALTH: i32 = 100
+const PLAYER_DEH_INITIAL_BULLETS: i32 = 50
+
+# d_mode.h GameMode_t
+const USER_SHAREWARE: i32 = 0
+const USER_COMMERCIAL: i32 = 2
+
+# info.h
+const USER_S_PLAY: i32 = 149
+const USER_S_PLAY_RUN1: i32 = 150
+
+# Chainsaw forced forward: 0xc800/512
+const USER_CHAINSAW_FORWARD: i32 = 100
+
+# ---- player_t offsetof constants (LP64; see header table above) -------
+
+const PLAYER_SIZEOF: i32 = 328
+
+const PLAYER_OFF_MO: i32 = 0
+const PLAYER_OFF_PLAYERSTATE: i32 = 8
+const PLAYER_OFF_CMD: i32 = 12
+const PLAYER_OFF_VIEWZ: i32 = 28
+const PLAYER_OFF_VIEWHEIGHT: i32 = 32
+const PLAYER_OFF_DELTAVIEWHEIGHT: i32 = 36
+const PLAYER_OFF_BOB: i32 = 40
+const PLAYER_OFF_HEALTH: i32 = 44
+const PLAYER_OFF_ARMORPOINTS: i32 = 48
+const PLAYER_OFF_ARMORTYPE: i32 = 52
+const PLAYER_OFF_POWERS: i32 = 56
+const PLAYER_OFF_CARDS: i32 = 80
+const PLAYER_OFF_BACKPACK: i32 = 104
+const PLAYER_OFF_FRAGS: i32 = 108
+const PLAYER_OFF_READYWEAPON: i32 = 124
+const PLAYER_OFF_PENDINGWEAPON: i32 = 128
+const PLAYER_OFF_WEAPONOWNED: i32 = 132
+const PLAYER_OFF_AMMO: i32 = 168
+const PLAYER_OFF_MAXAMMO: i32 = 184
+const PLAYER_OFF_ATTACKDOWN: i32 = 200
+const PLAYER_OFF_USEDOWN: i32 = 204
+const PLAYER_OFF_CHEATS: i32 = 208
+const PLAYER_OFF_REFIRE: i32 = 212
+const PLAYER_OFF_KILLCOUNT: i32 = 216
+const PLAYER_OFF_ITEMCOUNT: i32 = 220
+const PLAYER_OFF_SECRETCOUNT: i32 = 224
+const PLAYER_OFF_MESSAGE: i32 = 232
+const PLAYER_OFF_DAMAGECOUNT: i32 = 240
+const PLAYER_OFF_BONUSCOUNT: i32 = 244
+const PLAYER_OFF_ATTACKER: i32 = 248
+const PLAYER_OFF_EXTRALIGHT: i32 = 256
+const PLAYER_OFF_FIXEDCOLORMAP: i32 = 260
+const PLAYER_OFF_COLORMAP: i32 = 264
+const PLAYER_OFF_PSPRITES: i32 = 272
+const PLAYER_OFF_DIDSECRET: i32 = 320
+
+# doomdef.h array-length constants embedded in player_t.
+const PLAYER_MAXPLAYERS: i32 = 4
+const PLAYER_NUMPOWERS: i32 = 6
+const PLAYER_NUMCARDS: i32 = 6
+const PLAYER_NUMWEAPONS: i32 = 9
+const PLAYER_NUMAMMO: i32 = 4
+
+# pspdef_t (sizeof 24), embedded array player_t.psprites[NUMPSPRITES].
+const PSPDEF_SIZEOF: i32 = 24
+
+# ticcmd_t (sizeof 16), embedded at player_t.cmd / netcmds slots.
+const TICCMD_SIZEOF: i32 = 16
+const TICCMD_OFF_FORWARDMOVE: i32 = 0
+const TICCMD_OFF_SIDEMOVE: i32 = 1
+const TICCMD_OFF_ANGLETURN: i32 = 2
+const TICCMD_OFF_CHATCHAR: i32 = 4
+const TICCMD_OFF_BUTTONS: i32 = 5
+const TICCMD_OFF_CONSISTANCY: i32 = 6
+
+# weaponinfo_t (sizeof 24); storage in pspr_shim.c, readers WEAPONINFO_*.
+const WEAPONINFO_SIZEOF: i32 = 24
+const WEAPONINFO_NUMWEAPONS: i32 = 9
+const WEAPONINFO_OFF_AMMO: i32 = 0
+const WEAPONINFO_OFF_UPSTATE: i32 = 4
+const WEAPONINFO_OFF_DOWNSTATE: i32 = 8
+const WEAPONINFO_OFF_READYSTATE: i32 = 12
+const WEAPONINFO_OFF_ATKSTATE: i32 = 16
+const WEAPONINFO_OFF_FLASHSTATE: i32 = 20
+
+# ---- private state ----------------------------------------------------
+
+let mut onground: i32 = 0
+
+# ---- LP64 offsetof helpers (mirrors sg_* in saveg.flow / geom_* in setup.flow)
+
+function pl_i32(base: i64, off: i32) -> i32 {
+    let p: ptr<i32> = (base + off as i64) as ptr<i32>
+    return p[0]
+}
+
+function pl_set_i32(base: i64, off: i32, v: i32) -> void {
+    let p: ptr<i32> = (base + off as i64) as ptr<i32>
+    p[0] = v
+}
+
+function pl_ptr(base: i64, off: i32) -> ptr<void> {
+    let p: ptr<i64> = (base + off as i64) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+function pl_set_ptr(base: i64, off: i32, v: ptr<void>) -> void {
+    let p: ptr<i64> = (base + off as i64) as ptr<i64>
+    p[0] = v as i64
+}
+
+# Shared player_t field accessors. Prefer these over per-module *shim_player_* clones.
+
+@flow_api
+function PLAYER_at(i: i32) -> ptr<void> { return gameshim_player_at(i) }
+@flow_api
+function PLAYER_index(p: ptr<void>) -> i32 {
+    let players0: i64 = gameshim_player_at(0) as i64
+    return (((p as i64) - players0) / (PLAYER_SIZEOF as i64)) as i32
+}
+@flow_api
+function PLAYER_index_plus1(pl: ptr<void>) -> i32 {
+    if (pl as i64) == 0 {
+        return 0
+    }
+    return PLAYER_index(pl) + 1
+}
+@flow_api
+function PLAYER_mo(p: ptr<void>) -> ptr<void> { return pl_ptr(p as i64, PLAYER_OFF_MO) }
+@flow_api
+function PLAYER_set_mo(p: ptr<void>, m: ptr<void>) -> void { pl_set_ptr(p as i64, PLAYER_OFF_MO, m) }
+@flow_api
+function PLAYER_playerstate(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_PLAYERSTATE) }
+@flow_api
+function PLAYER_set_playerstate(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_PLAYERSTATE, v) }
+@flow_api
+function PLAYER_viewz(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_VIEWZ) }
+@flow_api
+function PLAYER_set_viewz(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_VIEWZ, v) }
+@flow_api
+function PLAYER_viewheight(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_VIEWHEIGHT) }
+@flow_api
+function PLAYER_set_viewheight(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_VIEWHEIGHT, v) }
+@flow_api
+function PLAYER_deltaviewheight(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_DELTAVIEWHEIGHT) }
+@flow_api
+function PLAYER_set_deltaviewheight(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_DELTAVIEWHEIGHT, v) }
+@flow_api
+function PLAYER_bob(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_BOB) }
+@flow_api
+function PLAYER_set_bob(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_BOB, v) }
+@flow_api
+function PLAYER_cheats(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_CHEATS) }
+@flow_api
+function PLAYER_set_cheats(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_CHEATS, v) }
+@flow_api
+function PLAYER_frags(p: ptr<void>, i: i32) -> i32 { return pl_i32(p as i64, PLAYER_OFF_FRAGS + i * 4) }
+@flow_api
+function PLAYER_inc_frag(p: ptr<void>, idx: i32) -> void {
+    let base: i64 = p as i64
+    let off: i32 = PLAYER_OFF_FRAGS + idx * 4
+    pl_set_i32(base, off, pl_i32(base, off) + 1)
+}
+@flow_api
+function PLAYER_usedown(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_USEDOWN) }
+@flow_api
+function PLAYER_set_usedown(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_USEDOWN, v) }
+@flow_api
+function PLAYER_damagecount(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_DAMAGECOUNT) }
+@flow_api
+function PLAYER_set_damagecount(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_DAMAGECOUNT, v) }
+@flow_api
+function PLAYER_bonuscount(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_BONUSCOUNT) }
+@flow_api
+function PLAYER_set_bonuscount(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_BONUSCOUNT, v) }
+@flow_api
+function PLAYER_attacker(p: ptr<void>) -> ptr<void> { return pl_ptr(p as i64, PLAYER_OFF_ATTACKER) }
+@flow_api
+function PLAYER_set_attacker(p: ptr<void>, a: ptr<void>) -> void { pl_set_ptr(p as i64, PLAYER_OFF_ATTACKER, a) }
+@flow_api
+function PLAYER_fixedcolormap(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_FIXEDCOLORMAP) }
+@flow_api
+function PLAYER_set_fixedcolormap(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_FIXEDCOLORMAP, v) }
+@flow_api
+function PLAYER_extralight(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_EXTRALIGHT) }
+@flow_api
+function PLAYER_set_extralight(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_EXTRALIGHT, v) }
+@flow_api
+function PLAYER_readyweapon(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_READYWEAPON) }
+@flow_api
+function PLAYER_set_readyweapon(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_READYWEAPON, v) }
+@flow_api
+function PLAYER_pendingweapon(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_PENDINGWEAPON) }
+@flow_api
+function PLAYER_set_pendingweapon(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_PENDINGWEAPON, v) }
+@flow_api
+function PLAYER_weaponowned(p: ptr<void>, w: i32) -> i32 { return pl_i32(p as i64, PLAYER_OFF_WEAPONOWNED + w * 4) }
+@flow_api
+function PLAYER_set_weaponowned(p: ptr<void>, w: i32, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_WEAPONOWNED + w * 4, v) }
+@flow_api
+function PLAYER_power(p: ptr<void>, pw: i32) -> i32 { return pl_i32(p as i64, PLAYER_OFF_POWERS + pw * 4) }
+@flow_api
+function PLAYER_set_power(p: ptr<void>, pw: i32, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_POWERS + pw * 4, v) }
+@flow_api
+function PLAYER_health(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_HEALTH) }
+@flow_api
+function PLAYER_set_health(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_HEALTH, v) }
+@flow_api
+function PLAYER_armorpoints(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_ARMORPOINTS) }
+@flow_api
+function PLAYER_set_armorpoints(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_ARMORPOINTS, v) }
+@flow_api
+function PLAYER_armortype(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_ARMORTYPE) }
+@flow_api
+function PLAYER_set_armortype(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_ARMORTYPE, v) }
+@flow_api
+function PLAYER_ammo(p: ptr<void>, a: i32) -> i32 { return pl_i32(p as i64, PLAYER_OFF_AMMO + a * 4) }
+@flow_api
+function PLAYER_set_ammo(p: ptr<void>, a: i32, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_AMMO + a * 4, v) }
+@flow_api
+function PLAYER_maxammo(p: ptr<void>, a: i32) -> i32 { return pl_i32(p as i64, PLAYER_OFF_MAXAMMO + a * 4) }
+@flow_api
+function PLAYER_set_maxammo(p: ptr<void>, a: i32, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_MAXAMMO + a * 4, v) }
+@flow_api
+function PLAYER_card(p: ptr<void>, c: i32) -> i32 { return pl_i32(p as i64, PLAYER_OFF_CARDS + c * 4) }
+@flow_api
+function PLAYER_set_card(p: ptr<void>, c: i32, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_CARDS + c * 4, v) }
+@flow_api
+function PLAYER_backpack(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_BACKPACK) }
+@flow_api
+function PLAYER_set_backpack(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_BACKPACK, v) }
+@flow_api
+function PLAYER_itemcount(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_ITEMCOUNT) }
+@flow_api
+function PLAYER_set_itemcount(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_ITEMCOUNT, v) }
+@flow_api
+function PLAYER_killcount(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_KILLCOUNT) }
+@flow_api
+function PLAYER_set_killcount(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_KILLCOUNT, v) }
+@flow_api
+function PLAYER_secretcount(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_SECRETCOUNT) }
+@flow_api
+function PLAYER_set_secretcount(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_SECRETCOUNT, v) }
+@flow_api
+function PLAYER_inc_secretcount(p: ptr<void>) -> void {
+    let base: i64 = p as i64
+    pl_set_i32(base, PLAYER_OFF_SECRETCOUNT, pl_i32(base, PLAYER_OFF_SECRETCOUNT) + 1)
+}
+@flow_api
+function PLAYER_attackdown(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_ATTACKDOWN) }
+@flow_api
+function PLAYER_set_attackdown(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_ATTACKDOWN, v) }
+@flow_api
+function PLAYER_refire(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_REFIRE) }
+@flow_api
+function PLAYER_set_refire(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_REFIRE, v) }
+@flow_api
+function PLAYER_didsecret(p: ptr<void>) -> i32 { return pl_i32(p as i64, PLAYER_OFF_DIDSECRET) }
+@flow_api
+function PLAYER_set_didsecret(p: ptr<void>, v: i32) -> void { pl_set_i32(p as i64, PLAYER_OFF_DIDSECRET, v) }
+@flow_api
+function PLAYER_set_message(p: ptr<void>, msg: string) -> void { pl_set_ptr(p as i64, PLAYER_OFF_MESSAGE, (msg as ptr<u8>) as ptr<void>) }
+@flow_api
+function PLAYER_message(p: ptr<void>) -> ptr<u8> { return pl_ptr(p as i64, PLAYER_OFF_MESSAGE) as ptr<u8> }
+@flow_api
+function PLAYER_psp(p: ptr<void>, i: i32) -> ptr<void> {
+    return ((p as i64) + (PLAYER_OFF_PSPRITES + i * PSPDEF_SIZEOF) as i64) as ptr<void>
+}
+
+# Player-embedded ticcmd: PLAYER_cmd_* thin-wraps bare CMD_* on &player->cmd.
+# Raw ticcmd_t* buffers (demo I/O, BuildTiccmd) call CMD_* directly.
+
+@flow_api
+function PLAYER_cmd(p: ptr<void>) -> ptr<void> { return ((p as i64) + PLAYER_OFF_CMD as i64) as ptr<void> }
+@flow_api
+function PLAYER_cmd_forwardmove(p: ptr<void>) -> i32 { return CMD_forwardmove(PLAYER_cmd(p)) }
+@flow_api
+function PLAYER_cmd_sidemove(p: ptr<void>) -> i32 { return CMD_sidemove(PLAYER_cmd(p)) }
+@flow_api
+function PLAYER_cmd_angleturn(p: ptr<void>) -> i32 { return CMD_angleturn(PLAYER_cmd(p)) }
+@flow_api
+function PLAYER_cmd_buttons(p: ptr<void>) -> i32 { return CMD_buttons(PLAYER_cmd(p)) }
+@flow_api
+function PLAYER_cmd_consistancy(p: ptr<void>) -> i32 { return CMD_consistancy(PLAYER_cmd(p)) }
+@flow_api
+function PLAYER_cmd_set_angleturn(p: ptr<void>, v: i32) -> void { CMD_set_angleturn(PLAYER_cmd(p), v) }
+@flow_api
+function PLAYER_cmd_set_forwardmove(p: ptr<void>, v: i32) -> void { CMD_set_forwardmove(PLAYER_cmd(p), v) }
+@flow_api
+function PLAYER_cmd_set_sidemove(p: ptr<void>, v: i32) -> void { CMD_set_sidemove(PLAYER_cmd(p), v) }
+@flow_api
+function PLAYER_cmd_set_buttons(p: ptr<void>, v: i32) -> void { CMD_set_buttons(PLAYER_cmd(p), v) }
+@flow_api
+function PLAYER_cmd_chatchar(p: ptr<void>) -> i32 { return CMD_chatchar(PLAYER_cmd(p)) }
+@flow_api
+function PLAYER_cmd_set_chatchar(p: ptr<void>, v: i32) -> void { CMD_set_chatchar(PLAYER_cmd(p), v) }
+@flow_api
+function PLAYER_i_cmd_buttons(i: i32) -> i32 { return CMD_buttons(PLAYER_cmd(PLAYER_at(i))) }
+@flow_api
+function PLAYER_i_usedown(i: i32) -> i32 { return PLAYER_usedown(PLAYER_at(i)) }
+@flow_api
+function PLAYER_i_set_usedown(i: i32, v: i32) -> void { PLAYER_set_usedown(PLAYER_at(i), v) }
+@flow_api
+function PLAYER_i_attackdown(i: i32) -> i32 { return PLAYER_attackdown(PLAYER_at(i)) }
+@flow_api
+function PLAYER_i_set_attackdown(i: i32, v: i32) -> void { PLAYER_set_attackdown(PLAYER_at(i), v) }
+
+@flow_api
+function PLAYER_clear_frags(p: ptr<void>) -> void {
+    let base: i64 = p as i64
+    for i in 0 to PLAYER_MAXPLAYERS {
+        pl_set_i32(base, PLAYER_OFF_FRAGS + i * 4, 0)
+    }
+}
+@flow_api
+function PLAYER_finish_level(p: ptr<void>) -> void {
+    let base: i64 = p as i64
+    for i in 0 to PLAYER_NUMPOWERS {
+        pl_set_i32(base, PLAYER_OFF_POWERS + i * 4, 0)
+    }
+    for i in 0 to PLAYER_NUMCARDS {
+        pl_set_i32(base, PLAYER_OFF_CARDS + i * 4, 0)
+    }
+    let mo: ptr<void> = PLAYER_mo(p)
+    MOBJ_set_flags(mo, MOBJ_flags(mo) & (0 - 1 - USER_MF_SHADOW))
+    pl_set_i32(base, PLAYER_OFF_EXTRALIGHT, 0)
+    pl_set_i32(base, PLAYER_OFF_FIXEDCOLORMAP, 0)
+    pl_set_i32(base, PLAYER_OFF_DAMAGECOUNT, 0)
+    pl_set_i32(base, PLAYER_OFF_BONUSCOUNT, 0)
+}
+@flow_api
+function PLAYER_reborn_core(player: i32) -> void {
+    let p: ptr<void> = PLAYER_at(player)
+    let base: i64 = p as i64
+
+    let f0: i32 = pl_i32(base, PLAYER_OFF_FRAGS + 0 * 4)
+    let f1: i32 = pl_i32(base, PLAYER_OFF_FRAGS + 1 * 4)
+    let f2: i32 = pl_i32(base, PLAYER_OFF_FRAGS + 2 * 4)
+    let f3: i32 = pl_i32(base, PLAYER_OFF_FRAGS + 3 * 4)
+    let killcount: i32 = pl_i32(base, PLAYER_OFF_KILLCOUNT)
+    let itemcount: i32 = pl_i32(base, PLAYER_OFF_ITEMCOUNT)
+    let secretcount: i32 = pl_i32(base, PLAYER_OFF_SECRETCOUNT)
+
+    memset(p, 0, PLAYER_SIZEOF as i64)
+
+    pl_set_i32(base, PLAYER_OFF_FRAGS + 0 * 4, f0)
+    pl_set_i32(base, PLAYER_OFF_FRAGS + 1 * 4, f1)
+    pl_set_i32(base, PLAYER_OFF_FRAGS + 2 * 4, f2)
+    pl_set_i32(base, PLAYER_OFF_FRAGS + 3 * 4, f3)
+    pl_set_i32(base, PLAYER_OFF_KILLCOUNT, killcount)
+    pl_set_i32(base, PLAYER_OFF_ITEMCOUNT, itemcount)
+    pl_set_i32(base, PLAYER_OFF_SECRETCOUNT, secretcount)
+
+    pl_set_i32(base, PLAYER_OFF_USEDOWN, 1)
+    pl_set_i32(base, PLAYER_OFF_ATTACKDOWN, 1)
+    pl_set_i32(base, PLAYER_OFF_PLAYERSTATE, USER_PST_LIVE)
+    pl_set_i32(base, PLAYER_OFF_HEALTH, PLAYER_DEH_INITIAL_HEALTH)
+    pl_set_i32(base, PLAYER_OFF_READYWEAPON, USER_WP_PISTOL)
+    pl_set_i32(base, PLAYER_OFF_PENDINGWEAPON, USER_WP_PISTOL)
+    pl_set_i32(base, PLAYER_OFF_WEAPONOWNED + USER_WP_FIST * 4, 1)
+    pl_set_i32(base, PLAYER_OFF_WEAPONOWNED + USER_WP_PISTOL * 4, 1)
+    pl_set_i32(base, PLAYER_OFF_AMMO + USER_AM_CLIP * 4, PLAYER_DEH_INITIAL_BULLETS)
+
+    for i in 0 to PLAYER_NUMAMMO {
+        pl_set_i32(base, PLAYER_OFF_MAXAMMO + i * 4, INFO_maxammo(i))
+    }
+}
+
+# ---- P_Thrust ---------------------------------------------------------
+
+function P_Thrust(player: ptr<void>, angle: u32, move: i32) -> void {
+    let a: u32 = angle >> USER_ANGLETOFINESHIFT
+    let mo: ptr<void> = PLAYER_mo(player)
+    MOBJ_set_momx(mo, MOBJ_momx(mo) + FixedMul(move, TABLES_finecosine(a as i32)))
+    MOBJ_set_momy(mo, MOBJ_momy(mo) + FixedMul(move, TABLES_finesine(a as i32)))
+}
+
+# ---- P_CalcHeight -----------------------------------------------------
+
+function P_CalcHeight(player: ptr<void>) -> void {
+    let mo: ptr<void> = PLAYER_mo(player)
+
+    let mut bob: i32 = FixedMul(MOBJ_momx(mo), MOBJ_momx(mo))
+        + FixedMul(MOBJ_momy(mo), MOBJ_momy(mo))
+    bob = bob >> 2
+    if bob > USER_MAXBOB {
+        bob = USER_MAXBOB
+    }
+    PLAYER_set_bob(player, bob)
+
+    if (PLAYER_cheats(player) & USER_CF_NOMOMENTUM) != 0 or onground == 0 {
+        PLAYER_set_viewz(player, MOBJ_z(mo) + USER_VIEWHEIGHT)
+        if PLAYER_viewz(player) > MOBJ_ceilingz(mo) - 4 * USER_FRACUNIT {
+            PLAYER_set_viewz(player, MOBJ_ceilingz(mo) - 4 * USER_FRACUNIT)
+        }
+        PLAYER_set_viewz(player, MOBJ_z(mo) + PLAYER_viewheight(player))
+        return
+    }
+
+    let angle: i32 = (USER_FINEANGLES / 20 * STAT_leveltime()) & USER_FINEMASK
+    bob = FixedMul(PLAYER_bob(player) / 2, TABLES_finesine(angle as i32))
+
+    if PLAYER_playerstate(player) == USER_PST_LIVE {
+        PLAYER_set_viewheight(player,
+            PLAYER_viewheight(player) + PLAYER_deltaviewheight(player))
+
+        if PLAYER_viewheight(player) > USER_VIEWHEIGHT {
+            PLAYER_set_viewheight(player, USER_VIEWHEIGHT)
+            PLAYER_set_deltaviewheight(player, 0)
+        }
+
+        if PLAYER_viewheight(player) < USER_VIEWHEIGHT / 2 {
+            PLAYER_set_viewheight(player, USER_VIEWHEIGHT / 2)
+            if PLAYER_deltaviewheight(player) <= 0 {
+                PLAYER_set_deltaviewheight(player, 1)
+            }
+        }
+
+        if PLAYER_deltaviewheight(player) != 0 {
+            PLAYER_set_deltaviewheight(player,
+                PLAYER_deltaviewheight(player) + USER_FRACUNIT / 4)
+            if PLAYER_deltaviewheight(player) == 0 {
+                PLAYER_set_deltaviewheight(player, 1)
+            }
+        }
+    }
+
+    PLAYER_set_viewz(player,
+        MOBJ_z(mo) + PLAYER_viewheight(player) + bob)
+
+    if PLAYER_viewz(player) > MOBJ_ceilingz(mo) - 4 * USER_FRACUNIT {
+        PLAYER_set_viewz(player, MOBJ_ceilingz(mo) - 4 * USER_FRACUNIT)
+    }
+}
+
+# ---- P_MovePlayer -----------------------------------------------------
+
+function P_MovePlayer(player: ptr<void>) -> void {
+    let mo: ptr<void> = PLAYER_mo(player)
+
+    MOBJ_set_angle(mo,
+        MOBJ_angle(mo) + ((PLAYER_cmd_angleturn(player) << 16) as u32))
+
+    if MOBJ_z(mo) <= MOBJ_floorz(mo) {
+        onground = 1
+    } else {
+        onground = 0
+    }
+
+    let fwd: i32 = PLAYER_cmd_forwardmove(player)
+    let side: i32 = PLAYER_cmd_sidemove(player)
+
+    if fwd != 0 and onground != 0 {
+        P_Thrust(player, MOBJ_angle(mo), fwd * 2048)
+    }
+
+    if side != 0 and onground != 0 {
+        P_Thrust(player, MOBJ_angle(mo) - USER_ANG90, side * 2048)
+    }
+
+    if (fwd != 0 or side != 0) and (MOBJ_state(mo) as i64) == (STATE_at(USER_S_PLAY) as i64) {
+        P_SetMobjState(mo, USER_S_PLAY_RUN1)
+    }
+}
+
+# ---- P_DeathThink -----------------------------------------------------
+
+function P_DeathThink(player: ptr<void>) -> void {
+    P_MovePsprites(player)
+
+    if PLAYER_viewheight(player) > 6 * USER_FRACUNIT {
+        PLAYER_set_viewheight(player, PLAYER_viewheight(player) - USER_FRACUNIT)
+    }
+
+    if PLAYER_viewheight(player) < 6 * USER_FRACUNIT {
+        PLAYER_set_viewheight(player, 6 * USER_FRACUNIT)
+    }
+
+    PLAYER_set_deltaviewheight(player, 0)
+
+    let mo: ptr<void> = PLAYER_mo(player)
+    if MOBJ_z(mo) <= MOBJ_floorz(mo) {
+        onground = 1
+    } else {
+        onground = 0
+    }
+    P_CalcHeight(player)
+
+    let attacker: ptr<void> = PLAYER_attacker(player)
+    if (attacker as i64) != 0 and (attacker as i64) != (mo as i64) {
+        let angle: u32 = R_PointToAngle2(
+            MOBJ_x(mo), MOBJ_y(mo),
+            MOBJ_x(attacker), MOBJ_y(attacker))
+        let delta: u32 = angle - MOBJ_angle(mo)
+        # (unsigned)-ANG5
+        let neg_ang5: u32 = (0 as u32) - USER_ANG5
+
+        if delta < USER_ANG5 or delta > neg_ang5 {
+            MOBJ_set_angle(mo, angle)
+            if PLAYER_damagecount(player) != 0 {
+                PLAYER_set_damagecount(player, PLAYER_damagecount(player) - 1)
+            }
+        } else {
+            if delta < USER_ANG180 {
+                MOBJ_set_angle(mo, MOBJ_angle(mo) + USER_ANG5)
+            } else {
+                MOBJ_set_angle(mo, MOBJ_angle(mo) - USER_ANG5)
+            }
+        }
+    } else {
+        if PLAYER_damagecount(player) != 0 {
+            PLAYER_set_damagecount(player, PLAYER_damagecount(player) - 1)
+        }
+    }
+
+    if (PLAYER_cmd_buttons(player) & USER_BT_USE) != 0 {
+        PLAYER_set_playerstate(player, USER_PST_REBORN)
+    }
+}
+
+# ---- P_PlayerThink ----------------------------------------------------
+
+@flow_api
+function P_PlayerThink(player: ptr<void>) -> void {
+    let mo: ptr<void> = PLAYER_mo(player)
+
+    if (PLAYER_cheats(player) & USER_CF_NOCLIP) != 0 {
+        MOBJ_set_flags(mo, MOBJ_flags(mo) | USER_MF_NOCLIP)
+    } else {
+        MOBJ_set_flags(mo, MOBJ_flags(mo) & (0 - 1 - USER_MF_NOCLIP))
+    }
+
+    if (MOBJ_flags(mo) & USER_MF_JUSTATTACKED) != 0 {
+        PLAYER_cmd_set_angleturn(player, 0)
+        PLAYER_cmd_set_forwardmove(player, USER_CHAINSAW_FORWARD)
+        PLAYER_cmd_set_sidemove(player, 0)
+        MOBJ_set_flags(mo, MOBJ_flags(mo) & (0 - 1 - USER_MF_JUSTATTACKED))
+    }
+
+    if PLAYER_playerstate(player) == USER_PST_DEAD {
+        P_DeathThink(player)
+        return
+    }
+
+    if MOBJ_reactiontime(mo) != 0 {
+        MOBJ_set_reactiontime(mo, MOBJ_reactiontime(mo) - 1)
+    } else {
+        P_MovePlayer(player)
+    }
+
+    P_CalcHeight(player)
+
+    if GEOM_sector_special(GEOM_subsector_sector(MOBJ_subsector(mo))) != 0 {
+        P_PlayerInSpecialSector(player)
+    }
+
+    if (PLAYER_cmd_buttons(player) & USER_BT_SPECIAL) != 0 {
+        PLAYER_cmd_set_buttons(player, 0)
+    }
+
+    if (PLAYER_cmd_buttons(player) & USER_BT_CHANGE) != 0 {
+        let mut newweapon: i32 = (PLAYER_cmd_buttons(player) & USER_BT_WEAPONMASK) >> USER_BT_WEAPONSHIFT
+
+        if newweapon == USER_WP_FIST and PLAYER_weaponowned(player, USER_WP_CHAINSAW) != 0 {
+            if !(PLAYER_readyweapon(player) == USER_WP_CHAINSAW
+                and PLAYER_power(player, USER_PW_STRENGTH) != 0) {
+                newweapon = USER_WP_CHAINSAW
+            }
+        }
+
+        if STAT_gamemode() == USER_COMMERCIAL and newweapon == USER_WP_SHOTGUN
+            and PLAYER_weaponowned(player, USER_WP_SUPERSHOTGUN) != 0
+            and PLAYER_readyweapon(player) != USER_WP_SUPERSHOTGUN {
+            newweapon = USER_WP_SUPERSHOTGUN
+        }
+
+        if PLAYER_weaponowned(player, newweapon) != 0
+            and newweapon != PLAYER_readyweapon(player) {
+            if (newweapon != USER_WP_PLASMA and newweapon != USER_WP_BFG)
+                or STAT_gamemode() != USER_SHAREWARE {
+                PLAYER_set_pendingweapon(player, newweapon)
+            }
+        }
+    }
+
+    if (PLAYER_cmd_buttons(player) & USER_BT_USE) != 0 {
+        if PLAYER_usedown(player) == 0 {
+            P_UseLines(player)
+            PLAYER_set_usedown(player, 1)
+        }
+    } else {
+        PLAYER_set_usedown(player, 0)
+    }
+
+    P_MovePsprites(player)
+
+    if PLAYER_power(player, USER_PW_STRENGTH) != 0 {
+        PLAYER_set_power(player, USER_PW_STRENGTH,
+            PLAYER_power(player, USER_PW_STRENGTH) + 1)
+    }
+
+    if PLAYER_power(player, USER_PW_INVULNERABILITY) != 0 {
+        PLAYER_set_power(player, USER_PW_INVULNERABILITY,
+            PLAYER_power(player, USER_PW_INVULNERABILITY) - 1)
+    }
+
+    if PLAYER_power(player, USER_PW_INVISIBILITY) != 0 {
+        let inv: i32 = PLAYER_power(player, USER_PW_INVISIBILITY) - 1
+        PLAYER_set_power(player, USER_PW_INVISIBILITY, inv)
+        if inv == 0 {
+            MOBJ_set_flags(mo, MOBJ_flags(mo) & (0 - 1 - USER_MF_SHADOW))
+        }
+    }
+
+    if PLAYER_power(player, USER_PW_INFRARED) != 0 {
+        PLAYER_set_power(player, USER_PW_INFRARED,
+            PLAYER_power(player, USER_PW_INFRARED) - 1)
+    }
+
+    if PLAYER_power(player, USER_PW_IRONFEET) != 0 {
+        PLAYER_set_power(player, USER_PW_IRONFEET,
+            PLAYER_power(player, USER_PW_IRONFEET) - 1)
+    }
+
+    if PLAYER_damagecount(player) != 0 {
+        PLAYER_set_damagecount(player, PLAYER_damagecount(player) - 1)
+    }
+
+    if PLAYER_bonuscount(player) != 0 {
+        PLAYER_set_bonuscount(player, PLAYER_bonuscount(player) - 1)
+    }
+
+    if PLAYER_power(player, USER_PW_INVULNERABILITY) != 0 {
+        let inv2: i32 = PLAYER_power(player, USER_PW_INVULNERABILITY)
+        if inv2 > 4 * 32 or (inv2 & 8) != 0 {
+            PLAYER_set_fixedcolormap(player, USER_INVERSECOLORMAP)
+        } else {
+            PLAYER_set_fixedcolormap(player, 0)
+        }
+    } else {
+        if PLAYER_power(player, USER_PW_INFRARED) != 0 {
+            let ir: i32 = PLAYER_power(player, USER_PW_INFRARED)
+            if ir > 4 * 32 or (ir & 8) != 0 {
+                PLAYER_set_fixedcolormap(player, 1)
+            } else {
+                PLAYER_set_fixedcolormap(player, 0)
+            }
+        } else {
+            PLAYER_set_fixedcolormap(player, 0)
+        }
+    }
+}

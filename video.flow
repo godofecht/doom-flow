@@ -1,0 +1,788 @@
+# 2D video layer, ported from v_video.c to Flow.
+#
+# Patch drawing (by post), block blits, rect copies, dirty-rect marks,
+# PCX screenshots and the mouse speed box. This module owns the current
+# draw target (dest_screen), dirtybox, and the Heretic/Strife blending
+# tables (tinttable / xlatab); those were TU-private or engine-unused in C.
+#
+# patch_t is a WAD data format (doomdata.h / v_patch.h), parsed here by
+# explicit byte offsets, all fields little-endian:
+#
+#   offset  size  field
+#   0       2     width       (int16)  bounding box size
+#   2       2     height      (int16)
+#   4       2     leftoffset  (int16)  pixels to the left of origin
+#   6       2     topoffset   (int16)  pixels below the origin
+#   8       4*w   columnofs   (int32[width]) offsets from patch base
+#
+# Each column is a list of posts, terminated by topdelta 0xff:
+#
+#   offset  size  field
+#   0       1     topdelta    (0xff ends the column)
+#   1       1     length      (pixel count)
+#   2       1     padding
+#   3       len   pixels
+#   3+len   1     padding
+#
+# so the next post starts at +length+4.
+
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+extern { function memset(dest: ptr<void>, c: i32, n: i64) -> ptr<void> }
+extern { function malloc(n: i64) -> ptr<void> }
+extern { function free(p: ptr<void>) -> void }
+
+extern { function I_Error(msg: string) -> void }
+extern { function I_GetPaletteIndex(r: i32, g: i32, b: i32) -> i32 }
+
+# Flow-owned ABI (fixp.flow, zone.flow, wad.flow).
+extern { function M_AddToBox(box: ptr<i32>, x: i32, y: i32) -> void }
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function Z_Free(p: ptr<void>) -> void }
+extern { function W_CacheLumpName(name: string, tag: i32) -> ptr<void> }
+
+extern { function M_WriteFile(name: ptr<u8>, source: ptr<void>, length: i32) -> i32 }
+extern { function M_FileExists(name: ptr<u8>) -> i32 }
+
+extern { function snprintf(buf: string, n: i64, fmt: string, num: i32, ext: string) -> i32 }
+extern { function IVIDEO_usemouse() -> i32 }
+extern { function IVIDEO_mouse_threshold() -> i32 }
+extern { function IVIDEO_mouse_acceleration() -> f32 }
+
+extern { function vshim_call_patchclip(fn: ptr<void>, patch: ptr<void>, x: i32, y: i32) -> i32 }
+
+# Strife patch clip callback dispatch stays in platform_stub.c.
+extern { function VIDEO_buffer() -> ptr<u8> }
+
+function vshim_screenshot_name(buf: ptr<u8>, fmt: string, num: i32, ext: string) -> void {
+    snprintf(buf as string, 16, fmt, num, ext)
+}
+
+# i_video.h
+const SCREENWIDTH: i32 = 320
+const SCREENHEIGHT: i32 = 200
+
+# z_zone.h
+const V_PU_STATIC: i32 = 1
+const PU_CACHE: i32 = 8
+
+# Blending table used for fuzzpatch, etc. Only used in Heretic/Hexen.
+let mut tinttable: ptr<u8> = null
+
+# villsa [STRIFE] Blending table used for Strife.
+let mut xlatab: ptr<u8> = null
+
+# The screen buffer that the v_video.c code draws to.
+let mut dest_screen: ptr<u8> = null
+
+# dirtybox[4] from v_video.c — declared extern in v_video.h.
+let mut dirtybox: array<i32, 4> = [0, 0, 0, 0]
+
+@flow_api
+function VIDEO_dirtybox_addr() -> ptr<i32> { return &dirtybox[0] }
+
+function video_mouse_accel_is_off() -> bool {
+    let a: f32 = IVIDEO_mouse_acceleration()
+    let d: f32 = a - 1.0
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d < 0.01
+}
+
+function video_unaccelerate(dspeed: i32) -> i32 {
+    let a: f32 = IVIDEO_mouse_acceleration()
+    return (dspeed as f32 / a) as i32
+}
+
+# haleyjd 08/28/10: clipping callback function for patches (Chocolate
+# Strife). Stored as an address; called through vshim_call_patchclip.
+let mut patchclip_callback: i64 = 0
+
+# ---- patch_t field access, by explicit layout -------------------------
+
+function v_addr(base: ptr<u8>, off: i32) -> ptr<u8> {
+    return ((base as i64) + off as i64) as ptr<u8>
+}
+
+# Little-endian int16 at byte offset off, sign-extended.
+function v_i16(p: ptr<u8>, off: i32) -> i32 {
+    let mut v: i32 = (p[off] as i32) | ((p[off + 1] as i32) << 8)
+    if v >= 32768 {
+        v = v - 65536
+    }
+    return v
+}
+
+function patch_width(p: ptr<u8>) -> i32 {
+    return v_i16(p, 0)
+}
+
+function patch_height(p: ptr<u8>) -> i32 {
+    return v_i16(p, 2)
+}
+
+function patch_leftoffset(p: ptr<u8>) -> i32 {
+    return v_i16(p, 4)
+}
+
+function patch_topoffset(p: ptr<u8>) -> i32 {
+    return v_i16(p, 6)
+}
+
+# Little-endian int32 columnofs[col] at byte offset 8 + 4*col.
+function patch_columnofs(p: ptr<u8>, col: i32) -> i32 {
+    let off: i32 = 8 + col * 4
+    let v: u32 = (p[off] as u32)
+        | ((p[off + 1] as u32) << 8)
+        | ((p[off + 2] as u32) << 16)
+        | ((p[off + 3] as u32) << 24)
+    return v as i32
+}
+
+# Shared patch_t accessors for other Flow modules (was hu_patch_* /
+# st_shim patch_* / thingshim_patch_columnofs). Prefer PATCH_* over
+# per-module clones.
+@flow_api
+function PATCH_width(p: ptr<void>) -> i32 {
+    return patch_width(p as ptr<u8>)
+}
+
+@flow_api
+function PATCH_height(p: ptr<void>) -> i32 {
+    return patch_height(p as ptr<u8>)
+}
+
+@flow_api
+function PATCH_leftoffset(p: ptr<void>) -> i32 {
+    return patch_leftoffset(p as ptr<u8>)
+}
+
+@flow_api
+function PATCH_topoffset(p: ptr<void>) -> i32 {
+    return patch_topoffset(p as ptr<u8>)
+}
+
+@flow_api
+function PATCH_columnofs(p: ptr<void>, col: i32) -> i32 {
+    return patch_columnofs(p as ptr<u8>, col)
+}
+
+#
+# V_MarkRect
+#
+@flow_api
+function V_MarkRect(x: i32, y: i32, width: i32, height: i32) -> void {
+    # If we are temporarily using an alternate screen, do not
+    # affect the update box.
+    if (dest_screen as i64) == (VIDEO_buffer() as i64) {
+        let box: ptr<i32> = VIDEO_dirtybox_addr()
+        M_AddToBox(box, x, y)
+        M_AddToBox(box, x + width - 1, y + height - 1)
+    }
+}
+
+#
+# V_CopyRect
+#
+@flow_api
+function V_CopyRect(srcx: i32, srcy: i32, source: ptr<u8>, width: i32, height: i32, destx: i32, desty: i32) -> void {
+    # RANGECHECK (defined unconditionally in v_video.c)
+    if srcx < 0
+        or srcx + width > SCREENWIDTH
+        or srcy < 0
+        or srcy + height > SCREENHEIGHT
+        or destx < 0
+        or destx + width > SCREENWIDTH
+        or desty < 0
+        or desty + height > SCREENHEIGHT {
+        I_Error("Bad V_CopyRect")
+    }
+
+    V_MarkRect(destx, desty, width, height)
+
+    let mut src: ptr<u8> = v_addr(source, SCREENWIDTH * srcy + srcx)
+    let mut dest: ptr<u8> = v_addr(dest_screen, SCREENWIDTH * desty + destx)
+
+    let mut h: i32 = height
+    while h > 0 {
+        memcpy(dest as ptr<void>, src as ptr<void>, width as i64)
+        src = v_addr(src, SCREENWIDTH)
+        dest = v_addr(dest, SCREENWIDTH)
+        h = h - 1
+    }
+}
+
+#
+# V_SetPatchClipCallback
+#
+# haleyjd 08/28/10: Added for Strife support. Nothing in this codebase
+# installs a callback, so the address stays 0 and the draw functions
+# take the unclipped path, exactly as in C.
+#
+@flow_api
+function V_SetPatchClipCallback(func: ptr<void>) -> void {
+    patchclip_callback = func as i64
+}
+
+#
+# V_DrawPatch
+# Masks a column based masked pic to the screen.
+#
+@flow_api
+function V_DrawPatch(x: i32, y: i32, patch: ptr<void>) -> void {
+    let p: ptr<u8> = patch as ptr<u8>
+    let py: i32 = y - patch_topoffset(p)
+    let px: i32 = x - patch_leftoffset(p)
+
+    # haleyjd 08/28/10: Strife needs silent error checking here.
+    if patchclip_callback != 0 {
+        if vshim_call_patchclip(patchclip_callback as ptr<void>, patch, px, py) == 0 {
+            return
+        }
+    }
+
+    let w: i32 = patch_width(p)
+
+    # RANGECHECK
+    if px < 0
+        or px + w > SCREENWIDTH
+        or py < 0
+        or py + patch_height(p) > SCREENHEIGHT {
+        I_Error("Bad V_DrawPatch")
+    }
+
+    V_MarkRect(px, py, w, patch_height(p))
+
+    let mut col: i32 = 0
+    while col < w {
+        let mut cp: ptr<u8> = v_addr(p, patch_columnofs(p, col))
+        # step through the posts in a column
+        let mut topdelta: i32 = cp[0] as i32
+        while topdelta != 255 {
+            let length: i32 = cp[1] as i32
+            let src: ptr<u8> = v_addr(cp, 3)
+            let dst: ptr<u8> = v_addr(dest_screen, (py + topdelta) * SCREENWIDTH + px + col)
+            let mut i: i32 = 0
+            while i < length {
+                dst[i * SCREENWIDTH] = src[i]
+                i = i + 1
+            }
+            cp = v_addr(cp, length + 4)
+            topdelta = cp[0] as i32
+        }
+        col = col + 1
+    }
+}
+
+#
+# V_DrawPatchFlipped
+# Masks a column based masked pic to the screen.
+# Flips horizontally, e.g. to mirror face.
+#
+@flow_api
+function V_DrawPatchFlipped(x: i32, y: i32, patch: ptr<void>) -> void {
+    let p: ptr<u8> = patch as ptr<u8>
+    let py: i32 = y - patch_topoffset(p)
+    let px: i32 = x - patch_leftoffset(p)
+
+    # haleyjd 08/28/10: Strife needs silent error checking here.
+    if patchclip_callback != 0 {
+        if vshim_call_patchclip(patchclip_callback as ptr<void>, patch, px, py) == 0 {
+            return
+        }
+    }
+
+    let w: i32 = patch_width(p)
+
+    # RANGECHECK
+    if px < 0
+        or px + w > SCREENWIDTH
+        or py < 0
+        or py + patch_height(p) > SCREENHEIGHT {
+        I_Error("Bad V_DrawPatchFlipped")
+    }
+
+    V_MarkRect(px, py, w, patch_height(p))
+
+    let mut col: i32 = 0
+    while col < w {
+        let mut cp: ptr<u8> = v_addr(p, patch_columnofs(p, w - 1 - col))
+        # step through the posts in a column
+        let mut topdelta: i32 = cp[0] as i32
+        while topdelta != 255 {
+            let length: i32 = cp[1] as i32
+            let src: ptr<u8> = v_addr(cp, 3)
+            let dst: ptr<u8> = v_addr(dest_screen, (py + topdelta) * SCREENWIDTH + px + col)
+            let mut i: i32 = 0
+            while i < length {
+                dst[i * SCREENWIDTH] = src[i]
+                i = i + 1
+            }
+            cp = v_addr(cp, length + 4)
+            topdelta = cp[0] as i32
+        }
+        col = col + 1
+    }
+}
+
+#
+# V_DrawPatchDirect
+# Draws directly to the screen on the pc.
+#
+@flow_api
+function V_DrawPatchDirect(x: i32, y: i32, patch: ptr<void>) -> void {
+    V_DrawPatch(x, y, patch)
+}
+
+#
+# V_DrawTLPatch
+# Masks a column based translucent masked pic to the screen.
+# (Heretic; no callers in this codebase, kept for the full v_video.c set.)
+#
+@flow_api
+function V_DrawTLPatch(x: i32, y: i32, patch: ptr<void>) -> void {
+    let p: ptr<u8> = patch as ptr<u8>
+    let py: i32 = y - patch_topoffset(p)
+    let px: i32 = x - patch_leftoffset(p)
+
+    if px < 0
+        or px + patch_width(p) > SCREENWIDTH
+        or py < 0
+        or py + patch_height(p) > SCREENHEIGHT {
+        I_Error("Bad V_DrawTLPatch")
+    }
+
+    let w: i32 = patch_width(p)
+    let mut col: i32 = 0
+    while col < w {
+        let mut cp: ptr<u8> = v_addr(p, patch_columnofs(p, col))
+        # step through the posts in a column
+        let mut topdelta: i32 = cp[0] as i32
+        while topdelta != 255 {
+            let length: i32 = cp[1] as i32
+            let src: ptr<u8> = v_addr(cp, 3)
+            let dst: ptr<u8> = v_addr(dest_screen, (py + topdelta) * SCREENWIDTH + px + col)
+            let mut i: i32 = 0
+            while i < length {
+                dst[i * SCREENWIDTH] = tinttable[((dst[i * SCREENWIDTH] as i32) << 8) + (src[i] as i32)]
+                i = i + 1
+            }
+            cp = v_addr(cp, length + 4)
+            topdelta = cp[0] as i32
+        }
+        col = col + 1
+    }
+}
+
+#
+# V_DrawXlaPatch
+# villsa [STRIFE] Masks a column based translucent masked pic to the
+# screen. (No callers in this codebase.)
+#
+@flow_api
+function V_DrawXlaPatch(x: i32, y: i32, patch: ptr<void>) -> void {
+    let p: ptr<u8> = patch as ptr<u8>
+    let py: i32 = y - patch_topoffset(p)
+    let px: i32 = x - patch_leftoffset(p)
+
+    if patchclip_callback != 0 {
+        if vshim_call_patchclip(patchclip_callback as ptr<void>, patch, px, py) == 0 {
+            return
+        }
+    }
+
+    let w: i32 = patch_width(p)
+    let mut col: i32 = 0
+    while col < w {
+        let mut cp: ptr<u8> = v_addr(p, patch_columnofs(p, col))
+        # step through the posts in a column
+        let mut topdelta: i32 = cp[0] as i32
+        while topdelta != 255 {
+            let length: i32 = cp[1] as i32
+            let src: ptr<u8> = v_addr(cp, 3)
+            let dst: ptr<u8> = v_addr(dest_screen, (py + topdelta) * SCREENWIDTH + px + col)
+            let mut i: i32 = 0
+            while i < length {
+                dst[i * SCREENWIDTH] = xlatab[(dst[i * SCREENWIDTH] as i32) + ((src[i] as i32) << 8)]
+                i = i + 1
+            }
+            cp = v_addr(cp, length + 4)
+            topdelta = cp[0] as i32
+        }
+        col = col + 1
+    }
+}
+
+#
+# V_DrawAltTLPatch
+# Masks a column based translucent masked pic to the screen.
+# (Heretic; no callers in this codebase.)
+#
+@flow_api
+function V_DrawAltTLPatch(x: i32, y: i32, patch: ptr<void>) -> void {
+    let p: ptr<u8> = patch as ptr<u8>
+    let py: i32 = y - patch_topoffset(p)
+    let px: i32 = x - patch_leftoffset(p)
+
+    if px < 0
+        or px + patch_width(p) > SCREENWIDTH
+        or py < 0
+        or py + patch_height(p) > SCREENHEIGHT {
+        I_Error("Bad V_DrawAltTLPatch")
+    }
+
+    let w: i32 = patch_width(p)
+    let mut col: i32 = 0
+    while col < w {
+        let mut cp: ptr<u8> = v_addr(p, patch_columnofs(p, col))
+        # step through the posts in a column
+        let mut topdelta: i32 = cp[0] as i32
+        while topdelta != 255 {
+            let length: i32 = cp[1] as i32
+            let src: ptr<u8> = v_addr(cp, 3)
+            let dst: ptr<u8> = v_addr(dest_screen, (py + topdelta) * SCREENWIDTH + px + col)
+            let mut i: i32 = 0
+            while i < length {
+                dst[i * SCREENWIDTH] = tinttable[((dst[i * SCREENWIDTH] as i32) << 8) + (src[i] as i32)]
+                i = i + 1
+            }
+            cp = v_addr(cp, length + 4)
+            topdelta = cp[0] as i32
+        }
+        col = col + 1
+    }
+}
+
+#
+# V_DrawShadowedPatch
+# Masks a column based masked pic to the screen, with a shadow drawn
+# 2,2 offset behind it. (Heretic; no callers in this codebase.)
+#
+@flow_api
+function V_DrawShadowedPatch(x: i32, y: i32, patch: ptr<void>) -> void {
+    let p: ptr<u8> = patch as ptr<u8>
+    let py: i32 = y - patch_topoffset(p)
+    let px: i32 = x - patch_leftoffset(p)
+
+    if px < 0
+        or px + patch_width(p) > SCREENWIDTH
+        or py < 0
+        or py + patch_height(p) > SCREENHEIGHT {
+        I_Error("Bad V_DrawShadowedPatch")
+    }
+
+    let w: i32 = patch_width(p)
+    let mut col: i32 = 0
+    while col < w {
+        let mut cp: ptr<u8> = v_addr(p, patch_columnofs(p, col))
+        # step through the posts in a column
+        let mut topdelta: i32 = cp[0] as i32
+        while topdelta != 255 {
+            let length: i32 = cp[1] as i32
+            let src: ptr<u8> = v_addr(cp, 3)
+            let dst: ptr<u8> = v_addr(dest_screen, (py + topdelta) * SCREENWIDTH + px + col)
+            let dst2: ptr<u8> = v_addr(dest_screen, (py + 2 + topdelta) * SCREENWIDTH + px + col + 2)
+            let mut i: i32 = 0
+            while i < length {
+                dst2[i * SCREENWIDTH] = tinttable[(dst2[i * SCREENWIDTH] as i32) << 8]
+                dst[i * SCREENWIDTH] = src[i]
+                i = i + 1
+            }
+            cp = v_addr(cp, length + 4)
+            topdelta = cp[0] as i32
+        }
+        col = col + 1
+    }
+}
+
+#
+# Load tint table from TINTTAB lump.
+#
+@flow_api
+function V_LoadTintTable() -> void {
+    tinttable = W_CacheLumpName("TINTTAB", V_PU_STATIC) as ptr<u8>
+}
+
+#
+# V_LoadXlaTable
+# villsa [STRIFE] Load xla table from XLATAB lump.
+#
+@flow_api
+function V_LoadXlaTable() -> void {
+    xlatab = W_CacheLumpName("XLATAB", V_PU_STATIC) as ptr<u8>
+}
+
+#
+# V_DrawBlock
+# Draw a linear block of pixels into the view buffer.
+#
+@flow_api
+function V_DrawBlock(x: i32, y: i32, width: i32, height: i32, src: ptr<u8>) -> void {
+    # RANGECHECK
+    if x < 0
+        or x + width > SCREENWIDTH
+        or y < 0
+        or y + height > SCREENHEIGHT {
+        I_Error("Bad V_DrawBlock")
+    }
+
+    V_MarkRect(x, y, width, height)
+
+    let mut s: ptr<u8> = src
+    let mut dest: ptr<u8> = v_addr(dest_screen, y * SCREENWIDTH + x)
+
+    let mut h: i32 = height
+    while h > 0 {
+        memcpy(dest as ptr<void>, s as ptr<void>, width as i64)
+        s = v_addr(s, width)
+        dest = v_addr(dest, SCREENWIDTH)
+        h = h - 1
+    }
+}
+
+# The filled-box / line helpers draw into I_VideoBuffer directly (as in
+# C), regardless of the current dest_screen.
+
+@flow_api
+function V_DrawFilledBox(x: i32, y: i32, w: i32, h: i32, c: i32) -> void {
+    let buf: ptr<u8> = v_addr(VIDEO_buffer(), SCREENWIDTH * y + x)
+    let mut y1: i32 = 0
+    while y1 < h {
+        let mut x1: i32 = 0
+        while x1 < w {
+            buf[y1 * SCREENWIDTH + x1] = c as u8
+            x1 = x1 + 1
+        }
+        y1 = y1 + 1
+    }
+}
+
+@flow_api
+function V_DrawHorizLine(x: i32, y: i32, w: i32, c: i32) -> void {
+    let buf: ptr<u8> = v_addr(VIDEO_buffer(), SCREENWIDTH * y + x)
+    let mut x1: i32 = 0
+    while x1 < w {
+        buf[x1] = c as u8
+        x1 = x1 + 1
+    }
+}
+
+@flow_api
+function V_DrawVertLine(x: i32, y: i32, h: i32, c: i32) -> void {
+    let buf: ptr<u8> = v_addr(VIDEO_buffer(), SCREENWIDTH * y + x)
+    let mut y1: i32 = 0
+    while y1 < h {
+        buf[y1 * SCREENWIDTH] = c as u8
+        y1 = y1 + 1
+    }
+}
+
+@flow_api
+function V_DrawBox(x: i32, y: i32, w: i32, h: i32, c: i32) -> void {
+    V_DrawHorizLine(x, y, w, c)
+    V_DrawHorizLine(x, y + h - 1, w, c)
+    V_DrawVertLine(x, y, h, c)
+    V_DrawVertLine(x + w - 1, y, h, c)
+}
+
+#
+# Draw a "raw" screen (lump containing raw data to blit directly
+# to the screen)
+#
+@flow_api
+function V_DrawRawScreen(raw: ptr<u8>) -> void {
+    memcpy(dest_screen as ptr<void>, raw as ptr<void>, (SCREENWIDTH * SCREENHEIGHT) as i64)
+}
+
+#
+# V_Init
+#
+@flow_api
+function V_Init() -> void {
+    # no-op!
+    # There used to be separate screens that could be drawn to; these are
+    # now handled in the upper layers.
+}
+
+# Set the buffer that the code draws to.
+@flow_api
+function V_UseBuffer(buffer: ptr<u8>) -> void {
+    dest_screen = buffer
+}
+
+# Restore screen buffer to the i_video screen buffer.
+@flow_api
+function V_RestoreBuffer() -> void {
+    dest_screen = VIDEO_buffer()
+}
+
+# ---- SCREEN SHOTS ----------------------------------------------------
+#
+# pcx_t header, written by explicit byte offsets, little-endian
+# (the C struct was PACKEDATTR, 128 bytes to the data field):
+#
+#   0 manufacturer  1 version  2 encoding  3 bits_per_pixel
+#   4 xmin  6 ymin  8 xmax  10 ymax  (u16)
+#   12 hres  14 vres  (u16)
+#   16 palette[48]
+#   64 reserved  65 color_planes
+#   66 bytes_per_line  68 palette_type  (u16)
+#   70 filler[58]
+#   128 data
+
+function pcx_u16(p: ptr<u8>, off: i32, v: i32) -> void {
+    p[off] = (v & 255) as u8
+    p[off + 1] = ((v >> 8) & 255) as u8
+}
+
+#
+# WritePCXfile
+#
+@flow_api
+function WritePCXfile(filename: ptr<u8>, data: ptr<u8>, width: i32, height: i32, palette: ptr<u8>) -> void {
+    let pcx: ptr<u8> = Z_Malloc(width * height * 2 + 1000, V_PU_STATIC, null) as ptr<u8>
+
+    pcx[0] = 10                      # PCX id (0x0a)
+    pcx[1] = 5                       # 256 color
+    pcx[2] = 1                       # uncompressed
+    pcx[3] = 8                       # 256 color
+    pcx_u16(pcx, 4, 0)               # xmin
+    pcx_u16(pcx, 6, 0)               # ymin
+    pcx_u16(pcx, 8, width - 1)       # xmax
+    pcx_u16(pcx, 10, height - 1)     # ymax
+    pcx_u16(pcx, 12, width)          # hres
+    pcx_u16(pcx, 14, height)         # vres
+    memset(v_addr(pcx, 16) as ptr<void>, 0, 48)   # palette
+    pcx[64] = 0                      # reserved (uninitialized in C)
+    pcx[65] = 1                      # color_planes: chunky image
+    pcx_u16(pcx, 66, width)          # bytes_per_line
+    pcx_u16(pcx, 68, 2)              # palette_type: not a grey scale
+    memset(v_addr(pcx, 70) as ptr<void>, 0, 58)   # filler
+
+    # pack the image
+    let mut pack: i32 = 128
+    let mut i: i32 = 0
+    while i < width * height {
+        let v: i32 = data[i] as i32
+        if (v & 192) != 192 {        # 0xc0
+            pcx[pack] = v as u8
+            pack = pack + 1
+        } else {
+            pcx[pack] = 193          # 0xc1
+            pcx[pack + 1] = v as u8
+            pack = pack + 2
+        }
+        i = i + 1
+    }
+
+    # write the palette
+    pcx[pack] = 12                   # palette ID byte (0x0c)
+    pack = pack + 1
+    let mut j: i32 = 0
+    while j < 768 {
+        pcx[pack + j] = palette[j]
+        j = j + 1
+    }
+    pack = pack + 768
+
+    # write output file
+    M_WriteFile(filename, pcx as ptr<void>, pack)
+
+    Z_Free(pcx as ptr<void>)
+}
+
+#
+# V_ScreenShot
+#
+# HAVE_LIBPNG is #undef'd in config.h, so only the PCX path exists.
+#
+@flow_api
+function V_ScreenShot(format: string) -> void {
+    # find a file name to save it to (char lbmname[16] in C; a heap
+    # buffer of the same size here)
+    let lbmname: ptr<u8> = malloc(16) as ptr<u8>
+
+    let mut i: i32 = 0
+    let mut found: bool = false
+    while i <= 99 and !found {
+        vshim_screenshot_name(lbmname, format, i, "pcx")
+        if M_FileExists(lbmname) == 0 {
+            found = true             # file doesn't exist
+        } else {
+            i = i + 1
+        }
+    }
+
+    if i == 100 {
+        I_Error("V_ScreenShot: Couldn't create a PCX")
+    }
+
+    # save the pcx file
+    WritePCXfile(lbmname, VIDEO_buffer(), SCREENWIDTH, SCREENHEIGHT,
+        W_CacheLumpName("PLAYPAL", PU_CACHE) as ptr<u8>)
+
+    free(lbmname as ptr<void>)
+}
+
+const MOUSE_SPEED_BOX_WIDTH: i32 = 120
+const MOUSE_SPEED_BOX_HEIGHT: i32 = 9
+
+@flow_api
+function V_DrawMouseSpeedBox(speed: i32) -> void {
+    # Get palette indices for colors for widget. These depend on the
+    # palette of the game being played.
+    let bgcolor: i32 = I_GetPaletteIndex(119, 119, 119)      # 0x77
+    let bordercolor: i32 = I_GetPaletteIndex(85, 85, 85)     # 0x55
+    let red: i32 = I_GetPaletteIndex(255, 0, 0)
+    let black: i32 = I_GetPaletteIndex(0, 0, 0)
+    let yellow: i32 = I_GetPaletteIndex(255, 255, 0)
+    let white: i32 = I_GetPaletteIndex(255, 255, 255)
+
+    # If the mouse is turned off or acceleration is turned off, don't
+    # draw the box at all.
+    if IVIDEO_usemouse() == 0 or video_mouse_accel_is_off() {
+        return
+    }
+
+    # Calculate box position
+    let box_x: i32 = SCREENWIDTH - MOUSE_SPEED_BOX_WIDTH - 10
+    let box_y: i32 = 15
+
+    V_DrawFilledBox(box_x, box_y, MOUSE_SPEED_BOX_WIDTH, MOUSE_SPEED_BOX_HEIGHT, bgcolor)
+    V_DrawBox(box_x, box_y, MOUSE_SPEED_BOX_WIDTH, MOUSE_SPEED_BOX_HEIGHT, bordercolor)
+
+    # Calculate the position of the red line. This is 1/3 of the way
+    # along the box.
+    let redline_x: i32 = MOUSE_SPEED_BOX_WIDTH / 3
+
+    # Undo acceleration and get back the original mouse speed
+    let mouse_threshold: i32 = IVIDEO_mouse_threshold()
+    let mut original_speed: i32 = 0
+    if speed < mouse_threshold {
+        original_speed = speed
+    } else {
+        original_speed = video_unaccelerate(speed - mouse_threshold)
+        original_speed = original_speed + mouse_threshold
+    }
+
+    # Calculate line length
+    let mut linelen: i32 = (original_speed * redline_x) / mouse_threshold
+
+    # Draw horizontal "thermometer"
+    if linelen > MOUSE_SPEED_BOX_WIDTH - 1 {
+        linelen = MOUSE_SPEED_BOX_WIDTH - 1
+    }
+
+    V_DrawHorizLine(box_x + 1, box_y + 4, MOUSE_SPEED_BOX_WIDTH - 2, black)
+
+    if linelen < redline_x {
+        V_DrawHorizLine(box_x + 1, box_y + MOUSE_SPEED_BOX_HEIGHT / 2, linelen, white)
+    } else {
+        V_DrawHorizLine(box_x + 1, box_y + MOUSE_SPEED_BOX_HEIGHT / 2, redline_x, white)
+        V_DrawHorizLine(box_x + redline_x, box_y + MOUSE_SPEED_BOX_HEIGHT / 2,
+            linelen - redline_x, yellow)
+    }
+
+    # Draw red line
+    V_DrawVertLine(box_x + redline_x, box_y + 1, MOUSE_SPEED_BOX_HEIGHT - 2, red)
+}

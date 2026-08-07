@@ -1,0 +1,863 @@
+# Movement / collision utilities, ported from p_maputl.c to Flow.
+#
+# Shared C globals (opentop/openbottom/openrange/lowfloor, intercepts[],
+# intercept_p, trace) are Flow-owned let mut state with @flow_api MAPUTL_*
+# accessors. Traverser fnptr calls use sysshim_call_* (platform_stub.c).
+# Blockmap iteration uses setupshim_* (@flow_api in setup.flow).
+# Local divline temps use Flow DivLine.
+#
+# LP64 offsetof (verified against doomgeneric headers):
+#
+#   divline_t (sizeof 16): x 0, y 4, dx 8, dy 12
+#   intercept_t (sizeof 16): frac 0, isaline 4, d 8
+#   line_t (sizeof 88): v1 0, v2 8, dx 16, dy 20, sidenum 30,
+#     slopetype 52, frontsector 56, backsector 64, validcount 72
+#   mobj_t (sizeof 224): x 24, y 28, snext 40, sprev 48,
+#     bnext 72, bprev 80, subsector 88, radius 104, flags 160
+#   sector_t: floorheight 0, ceilingheight 4, thinglist 96
+#   subsector_t.sector 0
+#   vertex_t: x 0, y 4
+
+# ---- fixed-point (fixp.flow) ------------------------------------------
+
+extern { function FixedMul(a: i32, b: i32) -> i32 }
+extern { function FixedDiv(a: i32, b: i32) -> i32 }
+
+# ---- engine C ---------------------------------------------------------
+
+extern { function R_PointInSubsector(x: i32, y: i32) -> ptr<void> }
+
+extern { function sysshim_call_line_fn(fn: ptr<void>, line: ptr<void>) -> i32 }
+extern { function sysshim_call_mobj_fn(fn: ptr<void>, mobj: ptr<void>) -> i32 }
+extern { function sysshim_call_intercept_fn(fn: ptr<void>, icpt: ptr<void>) -> i32 }
+
+extern { function setupshim_blockmap_list_start(x: i32, y: i32) -> i32 }
+extern { function setupshim_blockmaplump_index(offset: i32) -> i32 }
+extern { function GEOM_line(i: i32) -> ptr<void> }
+extern { function setupshim_blocklink(x: i32, y: i32) -> ptr<void> }
+extern { function setupshim_set_blocklink(x: i32, y: i32, m: ptr<void>) -> void }
+extern { function setupshim_playerstarts_addr() -> ptr<void> }
+extern { function psprshim_bulletslope_addr() -> ptr<i32> }
+extern { function GEOM_set_bmapwidth(v: i32) -> void }
+extern { function GEOM_set_bmapheight(v: i32) -> void }
+extern { function GEOM_set_bmaporgx(v: i32) -> void }
+extern { function GEOM_set_bmaporgy(v: i32) -> void }
+
+extern { function RMAIN_validcount() -> i32 }
+extern { function RMAIN_set_validcount(v: i32) -> void }
+extern { function GEOM_bmapwidth() -> i32 }
+extern { function GEOM_bmapheight() -> i32 }
+extern { function GEOM_bmaporgx() -> i32 }
+extern { function GEOM_bmaporgy() -> i32 }
+
+extern { function GEOM_sector_floorheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_ceilingheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_thinglist(s: ptr<void>) -> ptr<void> }
+extern { function GEOM_sector_set_thinglist(s: ptr<void>, m: ptr<void>) -> void }
+
+extern { function GEOM_subsector_sector(ss: ptr<void>) -> ptr<void> }
+
+extern { function MOBJ_x(m: ptr<void>) -> i32 }
+extern { function MOBJ_y(m: ptr<void>) -> i32 }
+extern { function MOBJ_radius(m: ptr<void>) -> i32 }
+extern { function MOBJ_flags(m: ptr<void>) -> i32 }
+extern { function MOBJ_snext(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_sprev(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_bnext(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_bprev(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_subsector(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_set_snext(m: ptr<void>, v: ptr<void>) -> void }
+extern { function MOBJ_set_sprev(m: ptr<void>, v: ptr<void>) -> void }
+extern { function MOBJ_set_bnext(m: ptr<void>, v: ptr<void>) -> void }
+extern { function MOBJ_set_bprev(m: ptr<void>, v: ptr<void>) -> void }
+extern { function MOBJ_set_subsector(m: ptr<void>, ss: ptr<void>) -> void }
+extern { function GEOM_line_backsector(ld: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_dx(ld: ptr<void>) -> i32 }
+extern { function GEOM_line_dy(ld: ptr<void>) -> i32 }
+extern { function GEOM_line_frontsector(ld: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_sidenum(line: ptr<void>, side: i32) -> i32 }
+extern { function GEOM_line_v1(ld: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_v2(ld: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_set_validcount(ld: ptr<void>, v: i32) -> void }
+extern { function GEOM_line_slopetype(ld: ptr<void>) -> i32 }
+extern { function GEOM_line_validcount(ld: ptr<void>) -> i32 }
+extern { function GEOM_vertex_x(v: ptr<void>) -> i32 }
+extern { function GEOM_vertex_y(v: ptr<void>) -> i32 }
+
+# ---- constants (m_fixed.h / m_bbox.h / p_local.h / p_mobj.h / r_defs.h)
+
+const MAPUTL_FRACBITS: i32 = 16
+const MAPUTL_FRACUNIT: i32 = 65536
+const MAPUTL_INT_MAX: i32 = 2147483647
+const MAPUTL_SIGNBIT: i32 = 0 - 2147483648   # 0x80000000
+
+const MAPUTL_BOXTOP: i32 = 0
+const MAPUTL_BOXBOTTOM: i32 = 1
+const MAPUTL_BOXLEFT: i32 = 2
+const MAPUTL_BOXRIGHT: i32 = 3
+
+const MAPUTL_ST_HORIZONTAL: i32 = 0
+const MAPUTL_ST_VERTICAL: i32 = 1
+const MAPUTL_ST_POSITIVE: i32 = 2
+const MAPUTL_ST_NEGATIVE: i32 = 3
+
+const MAPUTL_MF_NOSECTOR: i32 = 8
+const MAPUTL_MF_NOBLOCKMAP: i32 = 16
+
+const MAPUTL_MAPBLOCKSHIFT: i32 = 23
+const MAPUTL_MAPBTOFRAC: i32 = 7
+const MAPUTL_MAPBLOCKSIZE: i32 = 8388608
+
+const MAPUTL_PT_ADDLINES: i32 = 1
+const MAPUTL_PT_ADDTHINGS: i32 = 2
+const MAPUTL_PT_EARLYOUT: i32 = 4
+
+# Local divline temps (layout matches C divline_t).
+struct DivLine {
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32
+}
+
+const MAPUTL_MAXINTERCEPTS_ORIGINAL: i32 = 128
+const MAPUTL_MAXINTERCEPTS: i32 = 189
+const MAPUTL_SIZEOF_INTERCEPT: i32 = 16
+
+# earlyout is private to this module (overrun table leaves it NULL).
+let mut earlyout: i32 = 0
+
+let mut opentop: i32 = 0
+let mut openbottom: i32 = 0
+let mut openrange: i32 = 0
+let mut lowfloor: i32 = 0
+let mut maputl_trace: DivLine = DivLine { x: 0, y: 0, dx: 0, dy: 0 }
+let mut maputl_intercepts: ptr<u8> = null
+let mut maputl_intercept_p: i32 = 0
+
+function maputl_ensure_intercepts() -> void {
+    if (maputl_intercepts as i64) == 0 {
+        maputl_intercepts = calloc(MAPUTL_MAXINTERCEPTS as i64, MAPUTL_SIZEOF_INTERCEPT as i64) as ptr<u8>
+    }
+}
+
+function maputl_icpt_at(i: i32) -> ptr<void> {
+    return ((maputl_intercepts as i64) + (i as i64) * (MAPUTL_SIZEOF_INTERCEPT as i64)) as ptr<void>
+}
+
+function maputl_icpt_frac(i: i32) -> i32 {
+    return (maputl_icpt_at(i) as ptr<i32>)[0]
+}
+
+function maputl_set_icpt_frac(i: i32, v: i32) -> void {
+    (maputl_icpt_at(i) as ptr<i32>)[0] = v
+}
+
+function maputl_overrun_poke_i32(addr: ptr<i32>, index: i32, value: i32) -> void {
+    if (addr as i64) != 0 {
+        addr[index] = value
+    }
+}
+
+function maputl_overrun_poke_i16_pair(addr: ptr<i16>, index: i32, value: i32) -> void {
+    if (addr as i64) != 0 {
+        addr[index] = (value & 0xffff) as i16
+        addr[index + 1] = ((value >> 16) & 0xffff) as i16
+    }
+}
+
+function maputl_intercepts_memory_overrun(location: i32, value: i32, is_i16: i32) -> void {
+    # Vanilla intercepts overrun emulation (PrBoom-plus / Chocolate Doom).
+    if location >= 12 and location < 16 {
+        lowfloor = value
+    } elif location >= 16 and location < 20 {
+        openbottom = value
+    } elif location >= 20 and location < 24 {
+        opentop = value
+    } elif location >= 24 and location < 28 {
+        openrange = value
+    } elif location >= 44 and location < 48 {
+        psprshim_bulletslope_addr()[0] = value
+    } elif location >= 64 and location < 104 and is_i16 != 0 {
+        maputl_overrun_poke_i16_pair(setupshim_playerstarts_addr() as ptr<i16>, (location - 64) / 2, value)
+    }
+}
+
+function maputl_intercepts_overrun(num: i32, icpt: ptr<void>) -> void {
+    if num <= MAPUTL_MAXINTERCEPTS_ORIGINAL {
+        return
+    }
+    let location: i32 = (num - MAPUTL_MAXINTERCEPTS_ORIGINAL - 1) * 12
+    let icpt_i32: ptr<i32> = icpt as ptr<i32>
+    let icpt_d: ptr<i32> = ((icpt as i64) + 8) as ptr<i32>
+    maputl_intercepts_memory_overrun(location, icpt_i32[0], 0)
+    maputl_intercepts_memory_overrun(location + 4, icpt_i32[1], 0)
+    maputl_intercepts_memory_overrun(location + 8, icpt_d[0], 0)
+}
+
+function maputl_add_intercept(frac: i32, isaline: i32, d: ptr<void>) -> void {
+    maputl_ensure_intercepts()
+    let icpt: ptr<void> = ((maputl_intercepts as i64) + maputl_intercept_p as i64) as ptr<void>
+    let icpt_i32: ptr<i32> = icpt as ptr<i32>
+    icpt_i32[0] = frac
+    icpt_i32[1] = isaline
+    let icpt_d: ptr<i64> = ((icpt as i64) + 8) as ptr<i64>
+    icpt_d[0] = d as i64
+    let num: i32 = maputl_intercept_p / MAPUTL_SIZEOF_INTERCEPT
+    maputl_intercepts_overrun(num, icpt)
+    maputl_intercept_p = maputl_intercept_p + MAPUTL_SIZEOF_INTERCEPT
+}
+
+function maputl_abs(a: i32) -> i32 {
+    if a < 0 {
+        return 0 - a
+    }
+    return a
+}
+
+function maputl_bool(cond: i32) -> i32 {
+    if cond != 0 {
+        return 1
+    }
+    return 0
+}
+
+# ---- MAPUTL open*/lowfloor / trace / intercept (shared scratch) -------
+
+@flow_api
+function MAPUTL_opentop() -> i32 { return opentop }
+@flow_api
+function MAPUTL_set_opentop(v: i32) -> void { opentop = v }
+@flow_api
+function MAPUTL_openbottom() -> i32 { return openbottom }
+@flow_api
+function MAPUTL_set_openbottom(v: i32) -> void { openbottom = v }
+@flow_api
+function MAPUTL_openrange() -> i32 { return openrange }
+@flow_api
+function MAPUTL_set_openrange(v: i32) -> void { openrange = v }
+@flow_api
+function MAPUTL_lowfloor() -> i32 { return lowfloor }
+@flow_api
+function MAPUTL_set_lowfloor(v: i32) -> void { lowfloor = v }
+
+@flow_api
+function MAPUTL_trace_x() -> i32 { return maputl_trace.x }
+@flow_api
+function MAPUTL_trace_y() -> i32 { return maputl_trace.y }
+@flow_api
+function MAPUTL_trace_dx() -> i32 { return maputl_trace.dx }
+@flow_api
+function MAPUTL_trace_dy() -> i32 { return maputl_trace.dy }
+
+# Pointer-form intercept accessors for PTR_* traverser callbacks.
+@flow_api
+function MAPUTL_intercept_frac(icpt: ptr<void>) -> i32 {
+    return (icpt as ptr<i32>)[0]
+}
+@flow_api
+function MAPUTL_intercept_isaline(icpt: ptr<void>) -> i32 {
+    return maputl_bool((icpt as ptr<i32>)[1])
+}
+@flow_api
+function MAPUTL_intercept_line(icpt: ptr<void>) -> ptr<void> {
+    let d: ptr<i64> = ((icpt as i64) + 8) as ptr<i64>
+    return d[0] as ptr<void>
+}
+@flow_api
+function MAPUTL_intercept_thing(icpt: ptr<void>) -> ptr<void> {
+    let d: ptr<i64> = ((icpt as i64) + 8) as ptr<i64>
+    return d[0] as ptr<void>
+}
+
+# ---- P_AproxDistance --------------------------------------------------
+
+@flow_api
+function P_AproxDistance(dx: i32, dy: i32) -> i32 {
+    let mut ax: i32 = maputl_abs(dx)
+    let mut ay: i32 = maputl_abs(dy)
+    if ax < ay {
+        return ax + ay - (ax >> 1)
+    }
+    return ax + ay - (ay >> 1)
+}
+
+# ---- P_PointOnLineSide ------------------------------------------------
+
+@flow_api
+function P_PointOnLineSide(x: i32, y: i32, line: ptr<void>) -> i32 {
+    let ldx: i32 = GEOM_line_dx(line)
+    let ldy: i32 = GEOM_line_dy(line)
+    let v1: ptr<void> = GEOM_line_v1(line)
+    let v1x: i32 = GEOM_vertex_x(v1)
+    let v1y: i32 = GEOM_vertex_y(v1)
+
+    if ldx == 0 {
+        if x <= v1x {
+            if ldy > 0 {
+                return 1
+            }
+            return 0
+        }
+        if ldy < 0 {
+            return 1
+        }
+        return 0
+    }
+
+    if ldy == 0 {
+        if y <= v1y {
+            if ldx < 0 {
+                return 1
+            }
+            return 0
+        }
+        if ldx > 0 {
+            return 1
+        }
+        return 0
+    }
+
+    let dx: i32 = x - v1x
+    let dy: i32 = y - v1y
+    let left: i32 = FixedMul(ldy >> MAPUTL_FRACBITS, dx)
+    let right: i32 = FixedMul(dy, ldx >> MAPUTL_FRACBITS)
+    if right < left {
+        return 0
+    }
+    return 1
+}
+
+# ---- P_BoxOnLineSide --------------------------------------------------
+
+@flow_api
+function P_BoxOnLineSide(tmbox: ptr<i32>, ld: ptr<void>) -> i32 {
+    let mut p1: i32 = 0
+    let mut p2: i32 = 0
+    let st: i32 = GEOM_line_slopetype(ld)
+    let v1: ptr<void> = GEOM_line_v1(ld)
+    let v1x: i32 = GEOM_vertex_x(v1)
+    let v1y: i32 = GEOM_vertex_y(v1)
+    let ldx: i32 = GEOM_line_dx(ld)
+    let ldy: i32 = GEOM_line_dy(ld)
+
+    if st == MAPUTL_ST_HORIZONTAL {
+        if tmbox[MAPUTL_BOXTOP] > v1y {
+            p1 = 1
+        } else {
+            p1 = 0
+        }
+        if tmbox[MAPUTL_BOXBOTTOM] > v1y {
+            p2 = 1
+        } else {
+            p2 = 0
+        }
+        if ldx < 0 {
+            p1 = p1 ^ 1
+            p2 = p2 ^ 1
+        }
+    } elif st == MAPUTL_ST_VERTICAL {
+        if tmbox[MAPUTL_BOXRIGHT] < v1x {
+            p1 = 1
+        } else {
+            p1 = 0
+        }
+        if tmbox[MAPUTL_BOXLEFT] < v1x {
+            p2 = 1
+        } else {
+            p2 = 0
+        }
+        if ldy < 0 {
+            p1 = p1 ^ 1
+            p2 = p2 ^ 1
+        }
+    } elif st == MAPUTL_ST_POSITIVE {
+        p1 = P_PointOnLineSide(tmbox[MAPUTL_BOXLEFT], tmbox[MAPUTL_BOXTOP], ld)
+        p2 = P_PointOnLineSide(tmbox[MAPUTL_BOXRIGHT], tmbox[MAPUTL_BOXBOTTOM], ld)
+    } elif st == MAPUTL_ST_NEGATIVE {
+        p1 = P_PointOnLineSide(tmbox[MAPUTL_BOXRIGHT], tmbox[MAPUTL_BOXTOP], ld)
+        p2 = P_PointOnLineSide(tmbox[MAPUTL_BOXLEFT], tmbox[MAPUTL_BOXBOTTOM], ld)
+    }
+
+    if p1 == p2 {
+        return p1
+    }
+    return 0 - 1
+}
+
+# ---- P_PointOnDivlineSide ---------------------------------------------
+
+@flow_api
+function P_PointOnDivlineSide(x: i32, y: i32, line: ptr<void>) -> i32 {
+    let dl: ptr<DivLine> = line as ptr<DivLine>
+    let ldx: i32 = dl.dx
+    let ldy: i32 = dl.dy
+
+    if ldx == 0 {
+        if x <= dl.x {
+            if ldy > 0 {
+                return 1
+            }
+            return 0
+        }
+        if ldy < 0 {
+            return 1
+        }
+        return 0
+    }
+
+    if ldy == 0 {
+        if y <= dl.y {
+            if ldx < 0 {
+                return 1
+            }
+            return 0
+        }
+        if ldx > 0 {
+            return 1
+        }
+        return 0
+    }
+
+    let dx: i32 = x - dl.x
+    let dy: i32 = y - dl.y
+
+    # try to quickly decide by looking at sign bits
+    if ((ldy ^ ldx ^ dx ^ dy) & MAPUTL_SIGNBIT) != 0 {
+        if ((ldy ^ dx) & MAPUTL_SIGNBIT) != 0 {
+            return 1
+        }
+        return 0
+    }
+
+    let left: i32 = FixedMul(ldy >> 8, dx >> 8)
+    let right: i32 = FixedMul(dy >> 8, ldx >> 8)
+    if right < left {
+        return 0
+    }
+    return 1
+}
+
+# ---- P_MakeDivline ----------------------------------------------------
+
+@flow_api
+function P_MakeDivline(li: ptr<void>, dl: ptr<void>) -> void {
+    let d: ptr<DivLine> = dl as ptr<DivLine>
+    let v1: ptr<void> = GEOM_line_v1(li)
+    d.x = GEOM_vertex_x(v1)
+    d.y = GEOM_vertex_y(v1)
+    d.dx = GEOM_line_dx(li)
+    d.dy = GEOM_line_dy(li)
+}
+
+# ---- P_InterceptVector ------------------------------------------------
+
+@flow_api
+function P_InterceptVector(v2: ptr<void>, v1: ptr<void>) -> i32 {
+    let a: ptr<DivLine> = v2 as ptr<DivLine>
+    let b: ptr<DivLine> = v1 as ptr<DivLine>
+    let den: i32 = FixedMul(b.dy >> 8, a.dx) - FixedMul(b.dx >> 8, a.dy)
+    if den == 0 {
+        return 0
+    }
+    let num: i32 = FixedMul((b.x - a.x) >> 8, b.dy) + FixedMul((a.y - b.y) >> 8, b.dx)
+    return FixedDiv(num, den)
+}
+
+# ---- P_LineOpening ----------------------------------------------------
+
+@flow_api
+function P_LineOpening(linedef: ptr<void>) -> void {
+    if GEOM_line_sidenum(linedef, 1) == 0 - 1 {
+        MAPUTL_set_openrange(0)
+        return
+    }
+
+    let front: ptr<void> = GEOM_line_frontsector(linedef)
+    let back: ptr<void> = GEOM_line_backsector(linedef)
+    let fc: i32 = GEOM_sector_ceilingheight(front)
+    let bc: i32 = GEOM_sector_ceilingheight(back)
+    let ff: i32 = GEOM_sector_floorheight(front)
+    let bf: i32 = GEOM_sector_floorheight(back)
+
+    if fc < bc {
+        MAPUTL_set_opentop(fc)
+    } else {
+        MAPUTL_set_opentop(bc)
+    }
+
+    if ff > bf {
+        MAPUTL_set_openbottom(ff)
+        MAPUTL_set_lowfloor(bf)
+    } else {
+        MAPUTL_set_openbottom(bf)
+        MAPUTL_set_lowfloor(ff)
+    }
+
+    MAPUTL_set_openrange(MAPUTL_opentop() - MAPUTL_openbottom())
+}
+
+# ---- P_UnsetThingPosition ---------------------------------------------
+
+@flow_api
+function P_UnsetThingPosition(thing: ptr<void>) -> void {
+    let flags: i32 = MOBJ_flags(thing)
+
+    if (flags & MAPUTL_MF_NOSECTOR) == 0 {
+        let snext: ptr<void> = MOBJ_snext(thing)
+        let sprev: ptr<void> = MOBJ_sprev(thing)
+
+        if (snext as i64) != 0 {
+            MOBJ_set_sprev(snext, sprev)
+        }
+
+        if (sprev as i64) != 0 {
+            MOBJ_set_snext(sprev, snext)
+        } else {
+            let ss: ptr<void> = MOBJ_subsector(thing)
+            let sec: ptr<void> = GEOM_subsector_sector(ss)
+            GEOM_sector_set_thinglist(sec, snext)
+        }
+    }
+
+    if (flags & MAPUTL_MF_NOBLOCKMAP) == 0 {
+        let bnext: ptr<void> = MOBJ_bnext(thing)
+        let bprev: ptr<void> = MOBJ_bprev(thing)
+
+        if (bnext as i64) != 0 {
+            MOBJ_set_bprev(bnext, bprev)
+        }
+
+        if (bprev as i64) != 0 {
+            MOBJ_set_bnext(bprev, bnext)
+        } else {
+            let blockx: i32 = (MOBJ_x(thing) - GEOM_bmaporgx()) >> MAPUTL_MAPBLOCKSHIFT
+            let blocky: i32 = (MOBJ_y(thing) - GEOM_bmaporgy()) >> MAPUTL_MAPBLOCKSHIFT
+            if blockx >= 0 and blockx < GEOM_bmapwidth()
+                and blocky >= 0 and blocky < GEOM_bmapheight() {
+                setupshim_set_blocklink(blockx, blocky, bnext)
+            }
+        }
+    }
+}
+
+# ---- P_SetThingPosition -----------------------------------------------
+
+@flow_api
+function P_SetThingPosition(thing: ptr<void>) -> void {
+    let ss: ptr<void> = R_PointInSubsector(MOBJ_x(thing), MOBJ_y(thing))
+    MOBJ_set_subsector(thing, ss)
+
+    let flags: i32 = MOBJ_flags(thing)
+
+    if (flags & MAPUTL_MF_NOSECTOR) == 0 {
+        let sec: ptr<void> = GEOM_subsector_sector(ss)
+        MOBJ_set_sprev(thing, null)
+        let head: ptr<void> = GEOM_sector_thinglist(sec)
+        MOBJ_set_snext(thing, head)
+        if (head as i64) != 0 {
+            MOBJ_set_sprev(head, thing)
+        }
+        GEOM_sector_set_thinglist(sec, thing)
+    }
+
+    if (flags & MAPUTL_MF_NOBLOCKMAP) == 0 {
+        let blockx: i32 = (MOBJ_x(thing) - GEOM_bmaporgx()) >> MAPUTL_MAPBLOCKSHIFT
+        let blocky: i32 = (MOBJ_y(thing) - GEOM_bmaporgy()) >> MAPUTL_MAPBLOCKSHIFT
+
+        if blockx >= 0 and blockx < GEOM_bmapwidth()
+            and blocky >= 0 and blocky < GEOM_bmapheight() {
+            let link: ptr<void> = setupshim_blocklink(blockx, blocky)
+            MOBJ_set_bprev(thing, null)
+            MOBJ_set_bnext(thing, link)
+            if (link as i64) != 0 {
+                MOBJ_set_bprev(link, thing)
+            }
+            setupshim_set_blocklink(blockx, blocky, thing)
+        } else {
+            MOBJ_set_bnext(thing, null)
+            MOBJ_set_bprev(thing, null)
+        }
+    }
+}
+
+# ---- P_BlockLinesIterator ---------------------------------------------
+
+@flow_api
+function P_BlockLinesIterator(x: i32, y: i32, func: ptr<void>) -> i32 {
+    let mut list_off: i32 = setupshim_blockmap_list_start(x, y)
+    if list_off < 0 {
+        return 1
+    }
+
+    while true {
+        let lnum: i32 = setupshim_blockmaplump_index(list_off)
+        if lnum == 0 - 1 {
+            break
+        }
+
+        let ld: ptr<void> = GEOM_line(lnum)
+        if GEOM_line_validcount(ld) != RMAIN_validcount() {
+            GEOM_line_set_validcount(ld, RMAIN_validcount())
+            if sysshim_call_line_fn(func, ld) == 0 {
+                return 0
+            }
+        }
+
+        list_off = list_off + 1
+    }
+
+    return 1
+}
+
+# ---- P_BlockThingsIterator --------------------------------------------
+
+@flow_api
+function P_BlockThingsIterator(x: i32, y: i32, func: ptr<void>) -> i32 {
+    let mut mobj: ptr<void> = setupshim_blocklink(x, y)
+    while (mobj as i64) != 0 {
+        if sysshim_call_mobj_fn(func, mobj) == 0 {
+            return 0
+        }
+        mobj = MOBJ_bnext(mobj)
+    }
+    return 1
+}
+
+# ---- PIT_AddLineIntercepts --------------------------------------------
+# @flow_api so the function value keeps an unmangled C name when passed
+# into P_BlockLinesIterator from P_PathTraverse.
+
+@flow_api
+function PIT_AddLineIntercepts(ld: ptr<void>) -> i32 {
+    let mut s1: i32 = 0
+    let mut s2: i32 = 0
+    let tdx: i32 = MAPUTL_trace_dx()
+    let tdy: i32 = MAPUTL_trace_dy()
+    let lim: i32 = MAPUTL_FRACUNIT * 16
+
+    if tdx > lim or tdy > lim or tdx < 0 - lim or tdy < 0 - lim {
+        let v1: ptr<void> = GEOM_line_v1(ld)
+        let v2: ptr<void> = GEOM_line_v2(ld)
+        s1 = P_PointOnDivlineSide(GEOM_vertex_x(v1), GEOM_vertex_y(v1), &maputl_trace as ptr<void>)
+        s2 = P_PointOnDivlineSide(GEOM_vertex_x(v2), GEOM_vertex_y(v2), &maputl_trace as ptr<void>)
+    } else {
+        let tx: i32 = MAPUTL_trace_x()
+        let ty: i32 = MAPUTL_trace_y()
+        s1 = P_PointOnLineSide(tx, ty, ld)
+        s2 = P_PointOnLineSide(tx + tdx, ty + tdy, ld)
+    }
+
+    if s1 == s2 {
+        return 1
+    }
+
+    let mut dl: DivLine = DivLine { x: 0, y: 0, dx: 0, dy: 0 }
+    P_MakeDivline(ld, &dl as ptr<void>)
+    let frac: i32 = P_InterceptVector(&maputl_trace as ptr<void>, &dl as ptr<void>)
+
+    if frac < 0 {
+        return 1
+    }
+
+    if earlyout != 0 and frac < MAPUTL_FRACUNIT
+        and (GEOM_line_backsector(ld) as i64) == 0 {
+        return 0
+    }
+
+    maputl_add_intercept(frac, 1, ld)
+    return 1
+}
+
+# ---- PIT_AddThingIntercepts -------------------------------------------
+
+@flow_api
+function PIT_AddThingIntercepts(thing: ptr<void>) -> i32 {
+    let tdx: i32 = MAPUTL_trace_dx()
+    let tdy: i32 = MAPUTL_trace_dy()
+    let tracepositive: i32 = 0
+    if (tdx ^ tdy) > 0 {
+        tracepositive = 1
+    }
+
+    let mx: i32 = MOBJ_x(thing)
+    let my: i32 = MOBJ_y(thing)
+    let rad: i32 = MOBJ_radius(thing)
+    let mut x1: i32 = 0
+    let mut y1: i32 = 0
+    let mut x2: i32 = 0
+    let mut y2: i32 = 0
+
+    if tracepositive != 0 {
+        x1 = mx - rad
+        y1 = my + rad
+        x2 = mx + rad
+        y2 = my - rad
+    } else {
+        x1 = mx - rad
+        y1 = my - rad
+        x2 = mx + rad
+        y2 = my + rad
+    }
+
+    let s1: i32 = P_PointOnDivlineSide(x1, y1, &maputl_trace as ptr<void>)
+    let s2: i32 = P_PointOnDivlineSide(x2, y2, &maputl_trace as ptr<void>)
+    if s1 == s2 {
+        return 1
+    }
+
+    let mut dl: DivLine = DivLine { x: x1, y: y1, dx: x2 - x1, dy: y2 - y1 }
+    let frac: i32 = P_InterceptVector(&maputl_trace as ptr<void>, &dl as ptr<void>)
+    if frac < 0 {
+        return 1
+    }
+
+    maputl_add_intercept(frac, 0, thing)
+    return 1
+}
+
+# ---- P_TraverseIntercepts ---------------------------------------------
+
+function P_TraverseIntercepts(func: ptr<void>, maxfrac: i32) -> i32 {
+    let n: i32 = maputl_intercept_p / MAPUTL_SIZEOF_INTERCEPT
+    let mut count: i32 = n
+
+    while count != 0 {
+        count = count - 1
+
+        let mut dist: i32 = MAPUTL_INT_MAX
+        let mut in_i: i32 = 0
+
+        for scan in 0 to n {
+            let f: i32 = maputl_icpt_frac(scan)
+            if f < dist {
+                dist = f
+                in_i = scan
+            }
+        }
+
+        if dist > maxfrac {
+            return 1
+        }
+
+        if sysshim_call_intercept_fn(func, maputl_icpt_at(in_i)) == 0 {
+            return 0
+        }
+
+        maputl_set_icpt_frac(in_i, MAPUTL_INT_MAX)
+    }
+
+    return 1
+}
+
+# ---- P_PathTraverse ---------------------------------------------------
+
+@flow_api
+function P_PathTraverse(x1_in: i32, y1_in: i32, x2_in: i32, y2_in: i32,
+                        flags: i32, trav: ptr<void>) -> i32 {
+    let mut x1: i32 = x1_in
+    let mut y1: i32 = y1_in
+    let mut x2: i32 = x2_in
+    let mut y2: i32 = y2_in
+
+    earlyout = maputl_bool(flags & MAPUTL_PT_EARLYOUT)
+
+    RMAIN_set_validcount(RMAIN_validcount() + 1)
+    maputl_intercept_p = 0
+
+    let orgx: i32 = GEOM_bmaporgx()
+    let orgy: i32 = GEOM_bmaporgy()
+
+    if ((x1 - orgx) & (MAPUTL_MAPBLOCKSIZE - 1)) == 0 {
+        x1 = x1 + MAPUTL_FRACUNIT
+    }
+    if ((y1 - orgy) & (MAPUTL_MAPBLOCKSIZE - 1)) == 0 {
+        y1 = y1 + MAPUTL_FRACUNIT
+    }
+
+    maputl_trace.x = x1
+    maputl_trace.y = y1
+    maputl_trace.dx = x2 - x1
+    maputl_trace.dy = y2 - y1
+
+    x1 = x1 - orgx
+    y1 = y1 - orgy
+    let xt1: i32 = x1 >> MAPUTL_MAPBLOCKSHIFT
+    let yt1: i32 = y1 >> MAPUTL_MAPBLOCKSHIFT
+
+    x2 = x2 - orgx
+    y2 = y2 - orgy
+    let xt2: i32 = x2 >> MAPUTL_MAPBLOCKSHIFT
+    let yt2: i32 = y2 >> MAPUTL_MAPBLOCKSHIFT
+
+    let mut mapxstep: i32 = 0
+    let mut mapystep: i32 = 0
+    let mut partial: i32 = 0
+    let mut xstep: i32 = 0
+    let mut ystep: i32 = 0
+    let mut xintercept: i32 = 0
+    let mut yintercept: i32 = 0
+
+    if xt2 > xt1 {
+        mapxstep = 1
+        partial = MAPUTL_FRACUNIT - ((x1 >> MAPUTL_MAPBTOFRAC) & (MAPUTL_FRACUNIT - 1))
+        ystep = FixedDiv(y2 - y1, maputl_abs(x2 - x1))
+    } elif xt2 < xt1 {
+        mapxstep = 0 - 1
+        partial = (x1 >> MAPUTL_MAPBTOFRAC) & (MAPUTL_FRACUNIT - 1)
+        ystep = FixedDiv(y2 - y1, maputl_abs(x2 - x1))
+    } else {
+        mapxstep = 0
+        partial = MAPUTL_FRACUNIT
+        ystep = 256 * MAPUTL_FRACUNIT
+    }
+
+    yintercept = (y1 >> MAPUTL_MAPBTOFRAC) + FixedMul(partial, ystep)
+
+    if yt2 > yt1 {
+        mapystep = 1
+        partial = MAPUTL_FRACUNIT - ((y1 >> MAPUTL_MAPBTOFRAC) & (MAPUTL_FRACUNIT - 1))
+        xstep = FixedDiv(x2 - x1, maputl_abs(y2 - y1))
+    } elif yt2 < yt1 {
+        mapystep = 0 - 1
+        partial = (y1 >> MAPUTL_MAPBTOFRAC) & (MAPUTL_FRACUNIT - 1)
+        xstep = FixedDiv(x2 - x1, maputl_abs(y2 - y1))
+    } else {
+        mapystep = 0
+        partial = MAPUTL_FRACUNIT
+        xstep = 256 * MAPUTL_FRACUNIT
+    }
+
+    xintercept = (x1 >> MAPUTL_MAPBTOFRAC) + FixedMul(partial, xstep)
+
+    let mut mapx: i32 = xt1
+    let mut mapy: i32 = yt1
+
+    for count in 0 to 64 {
+        if (flags & MAPUTL_PT_ADDLINES) != 0 {
+            if P_BlockLinesIterator(mapx, mapy, PIT_AddLineIntercepts) == 0 {
+                return 0
+            }
+        }
+
+        if (flags & MAPUTL_PT_ADDTHINGS) != 0 {
+            if P_BlockThingsIterator(mapx, mapy, PIT_AddThingIntercepts) == 0 {
+                return 0
+            }
+        }
+
+        if mapx == xt2 and mapy == yt2 {
+            break
+        }
+
+        if (yintercept >> MAPUTL_FRACBITS) == mapy {
+            yintercept = yintercept + ystep
+            mapx = mapx + mapxstep
+        } elif (xintercept >> MAPUTL_FRACBITS) == mapx {
+            xintercept = xintercept + xstep
+            mapy = mapy + mapystep
+        }
+    }
+
+    return P_TraverseIntercepts(trav, MAPUTL_FRACUNIT)
+}

@@ -1,0 +1,570 @@
+# Floor / ceiling visplane drawing, ported from r_plane.c to Flow.
+#
+# Shared clip / slope / opening buffers and floorplane / ceilingplane
+# pointers are Flow-owned let mut state with @flow_api PLANES_* accessors.
+# Visplane records are module-private. visplane top/bottom use the Flow
+# Visplane struct; spanfunc/colfunc via rmainshim_call_* (rmain.flow).
+
+extern { function memset(dest: ptr<void>, c: i32, n: i64) -> ptr<void> }
+extern { function memcpy(dest: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+extern { function calloc(n: i64, sz: i64) -> ptr<void> }
+extern { function I_Error(msg: string) -> void }
+
+extern { function FixedMul(a: i32, b: i32) -> i32 }
+extern { function FixedDiv(a: i32, b: i32) -> i32 }
+extern { function W_CacheLumpNum(lumpnum: i32, tag: i32) -> ptr<void> }
+extern { function W_ReleaseLumpNum(lumpnum: i32) -> void }
+extern { function R_GetColumn(tex: i32, col: i32) -> ptr<u8> }
+extern { function TABLES_finesine(idx: i32) -> i32 }
+extern { function TABLES_finecosine(idx: i32) -> i32 }
+extern { function TABLES_finetangent(idx: i32) -> i32 }
+extern { function DRAW_viewwidth() -> i32 }
+extern { function DRAW_viewheight() -> i32 }
+extern { function DRAW_set_dc_iscale(v: i32) -> void }
+extern { function DRAW_set_dc_colormap(p: ptr<void>) -> void }
+extern { function DRAW_set_dc_texturemid(v: i32) -> void }
+extern { function DRAW_set_dc_yl(v: i32) -> void }
+extern { function DRAW_set_dc_yh(v: i32) -> void }
+extern { function DRAW_set_dc_x(v: i32) -> void }
+extern { function DRAW_set_dc_source(p: ptr<void>) -> void }
+extern { function RMAIN_viewx() -> i32 }
+extern { function RMAIN_viewy() -> i32 }
+extern { function RMAIN_viewz() -> i32 }
+extern { function RMAIN_viewangle() -> u32 }
+extern { function RMAIN_detailshift() -> i32 }
+extern { function RMAIN_centerxfrac() -> i32 }
+extern { function RMAIN_extralight() -> i32 }
+extern { function RMAIN_fixedcolormap() -> ptr<void> }
+extern { function RMAIN_xtoviewangle(x: i32) -> u32 }
+extern { function SKY_skyflatnum() -> i32 }
+extern { function SKY_skytexture() -> i32 }
+extern { function SKY_skytexturemid() -> i32 }
+
+extern { function RMAIN_zlight(light: i32, index: i32) -> ptr<void> }
+
+extern { function rmainshim_call_spanfunc() -> void }
+extern { function rmainshim_call_colfunc() -> void }
+extern { function BSP_drawsegs_overflow() -> i32 }
+
+extern { function THINGS_pspriteiscale() -> i32 }
+extern { function RDATA_firstflat() -> i32 }
+extern { function RDATA_flattranslation(pic: i32) -> i32 }
+extern { function RDATA_colormaps() -> ptr<void> }
+
+extern { function DRAW_set_ds_xstep(v: i32) -> void }
+extern { function DRAW_set_ds_ystep(v: i32) -> void }
+extern { function DRAW_set_ds_xfrac(v: i32) -> void }
+extern { function DRAW_set_ds_yfrac(v: i32) -> void }
+extern { function DRAW_set_ds_colormap(p: ptr<void>) -> void }
+extern { function DRAW_set_ds_y(v: i32) -> void }
+extern { function DRAW_set_ds_x1(v: i32) -> void }
+extern { function DRAW_set_ds_x2(v: i32) -> void }
+extern { function DRAW_set_ds_source(p: ptr<void>) -> void }
+
+# ---- constants --------------------------------------------------------
+
+# i_video.h / r_defs.h / r_main.h / tables.h / r_sky.h / z_zone.h
+const PLANE_SCREENWIDTH: i32 = 320
+const PLANE_SCREENHEIGHT: i32 = 200
+const PLANE_MAXVISPLANES: i32 = 128
+const PLANE_MAXOPENINGS: i32 = 20480          # SCREENWIDTH*64
+const PLANE_SIZEOF_VISPLANE: i32 = 664
+const PLANE_ANGLETOFINESHIFT: i32 = 19
+const PLANE_ANGLETOSKYSHIFT: i32 = 22
+const PLANE_ANG90: u32 = 1073741824 as u32    # 0x40000000
+const PLANE_LIGHTZSHIFT: i32 = 20
+const PLANE_MAXLIGHTZ: i32 = 128
+const PLANE_LIGHTSEGSHIFT: i32 = 4
+const PLANE_LIGHTLEVELS: i32 = 16
+const PLANE_PU_STATIC: i32 = 1
+
+# Matches C visplane_t (LP64): height..maxx, pad1, top[320], pad2/3, bottom[320], pad4.
+struct Visplane {
+    height: i32,
+    picnum: i32,
+    lightlevel: i32,
+    minx: i32,
+    maxx: i32,
+    pad1: u8,
+    top: array<u8, 320>,
+    pad2: u8,
+    pad3: u8,
+    bottom: array<u8, 320>,
+    pad4: u8
+}
+
+# ---- private module state ---------------------------------------------
+
+let mut plane_openings: ptr<i16> = null
+let mut plane_lastopening: i32 = 0
+let mut plane_floorclip: ptr<i16> = null
+let mut plane_ceilingclip: ptr<i16> = null
+let mut plane_yslope_buf: ptr<i32> = null
+let mut plane_distscale_buf: ptr<i32> = null
+let mut plane_floorplane: ptr<void> = null
+let mut plane_ceilingplane: ptr<void> = null
+
+function plane_ensure_shared() -> void {
+    if (plane_openings as i64) == 0 {
+        plane_openings = calloc(PLANE_MAXOPENINGS as i64, 2) as ptr<i16>
+        plane_floorclip = calloc(PLANE_SCREENWIDTH as i64, 2) as ptr<i16>
+        plane_ceilingclip = calloc(PLANE_SCREENWIDTH as i64, 2) as ptr<i16>
+        plane_yslope_buf = calloc(PLANE_SCREENHEIGHT as i64, 4) as ptr<i32>
+        plane_distscale_buf = calloc(PLANE_SCREENWIDTH as i64, 4) as ptr<i32>
+    }
+}
+
+let mut visplanes: ptr<Visplane> = null
+let mut lastvisplane: i32 = 0
+let mut planeheight: i32 = 0
+let mut basexscale: i32 = 0
+let mut baseyscale: i32 = 0
+let mut planezlight_light: i32 = 0
+let mut spanstart: ptr<i32> = null
+let mut cachedheight: ptr<i32> = null
+let mut cacheddistance: ptr<i32> = null
+let mut cachedxstep: ptr<i32> = null
+let mut cachedystep: ptr<i32> = null
+
+function plane_abs(x: i32) -> i32 {
+    if x < 0 {
+        return 0 - x
+    }
+    return x
+}
+
+function plane_ensure() -> void {
+    if (visplanes as i64) == 0 {
+        visplanes = calloc(PLANE_MAXVISPLANES as i64, PLANE_SIZEOF_VISPLANE as i64) as ptr<Visplane>
+        spanstart = calloc(PLANE_SCREENHEIGHT as i64, 4) as ptr<i32>
+        cachedheight = calloc(PLANE_SCREENHEIGHT as i64, 4) as ptr<i32>
+        cacheddistance = calloc(PLANE_SCREENHEIGHT as i64, 4) as ptr<i32>
+        cachedxstep = calloc(PLANE_SCREENHEIGHT as i64, 4) as ptr<i32>
+        cachedystep = calloc(PLANE_SCREENHEIGHT as i64, 4) as ptr<i32>
+    }
+}
+
+function plane_vp(i: i32) -> ptr<Visplane> {
+    return ((visplanes as i64) + (i as i64) * (PLANE_SIZEOF_VISPLANE as i64)) as ptr<Visplane>
+}
+
+function plane_clear_top(pl: ptr<Visplane>) -> void {
+    memset((&pl[0].top) as ptr<void>, 0xff, PLANE_SCREENWIDTH as i64)
+}
+
+# Shared plane/opening/clip APIs (Flow-owned). Prefer these over
+# per-module clones of the same globals.
+
+@flow_api
+function PLANES_yslope() -> ptr<i32> {
+    plane_ensure_shared()
+    return plane_yslope_buf
+}
+
+@flow_api
+function PLANES_set_yslope(i: i32, v: i32) -> void {
+    plane_ensure_shared()
+    plane_yslope_buf[i] = v
+}
+
+@flow_api
+function PLANES_distscale() -> ptr<i32> {
+    plane_ensure_shared()
+    return plane_distscale_buf
+}
+
+@flow_api
+function PLANES_set_distscale(i: i32, v: i32) -> void {
+    plane_ensure_shared()
+    plane_distscale_buf[i] = v
+}
+
+@flow_api
+function PLANES_floorclip() -> ptr<i16> {
+    plane_ensure_shared()
+    return plane_floorclip
+}
+
+@flow_api
+function PLANES_ceilingclip() -> ptr<i16> {
+    plane_ensure_shared()
+    return plane_ceilingclip
+}
+
+@flow_api
+function PLANES_openings() -> ptr<i16> {
+    plane_ensure_shared()
+    return plane_openings
+}
+
+@flow_api
+function PLANES_set_lastopening(p: ptr<i16>) -> void {
+    plane_ensure_shared()
+    plane_lastopening = 0
+}
+
+@flow_api
+function PLANES_lastopening_count() -> i32 {
+    return plane_lastopening
+}
+
+@flow_api
+function PLANES_maskedcol_from_lastopening(rwx: i32) -> ptr<void> {
+    return (&plane_openings[plane_lastopening - rwx]) as ptr<void>
+}
+
+@flow_api
+function PLANES_lastopening_advance(n: i32) -> void {
+    plane_lastopening = plane_lastopening + n
+}
+
+@flow_api
+function PLANES_save_ceilingclip(start: i32, count: i32) -> ptr<void> {
+    plane_ensure_shared()
+    memcpy(
+        (&plane_openings[plane_lastopening]) as ptr<void>,
+        (&plane_ceilingclip[start]) as ptr<void>,
+        (2 * count) as i64
+    )
+    let ret: ptr<void> = (&plane_openings[plane_lastopening - start]) as ptr<void>
+    plane_lastopening = plane_lastopening + count
+    return ret
+}
+
+@flow_api
+function PLANES_save_floorclip(start: i32, count: i32) -> ptr<void> {
+    plane_ensure_shared()
+    memcpy(
+        (&plane_openings[plane_lastopening]) as ptr<void>,
+        (&plane_floorclip[start]) as ptr<void>,
+        (2 * count) as i64
+    )
+    let ret: ptr<void> = (&plane_openings[plane_lastopening - start]) as ptr<void>
+    plane_lastopening = plane_lastopening + count
+    return ret
+}
+
+@flow_api
+function PLANES_floorplane() -> ptr<void> {
+    return plane_floorplane
+}
+
+@flow_api
+function PLANES_set_floorplane(p: ptr<void>) -> void {
+    plane_floorplane = p
+}
+
+@flow_api
+function PLANES_ceilingplane() -> ptr<void> {
+    return plane_ceilingplane
+}
+
+@flow_api
+function PLANES_set_ceilingplane(p: ptr<void>) -> void {
+    plane_ceilingplane = p
+}
+
+@flow_api
+function PLANES_plane_set_top(pl: ptr<void>, x: i32, v: i32) -> void {
+    let p: ptr<Visplane> = pl as ptr<Visplane>
+    p[0].top[x] = v as u8
+}
+
+@flow_api
+function PLANES_plane_set_bottom(pl: ptr<void>, x: i32, v: i32) -> void {
+    let p: ptr<Visplane> = pl as ptr<Visplane>
+    p[0].bottom[x] = v as u8
+}
+
+#
+# R_InitPlanes
+# Only at game startup.
+#
+@flow_api
+function R_InitPlanes() -> void {
+    # Doh!
+    plane_ensure()
+}
+
+#
+# R_MapPlane
+# BASIC PRIMITIVE
+#
+@flow_api
+function R_MapPlane(y: i32, x1: i32, x2: i32) -> void {
+    # RANGECHECK
+    if x2 < x1 or x1 < 0 or x2 >= DRAW_viewwidth() or y > DRAW_viewheight() {
+        I_Error("R_MapPlane: bad args")
+    }
+
+    let mut distance: i32 = 0
+    if planeheight != cachedheight[y] {
+        cachedheight[y] = planeheight
+        distance = FixedMul(planeheight, PLANES_yslope()[y])
+        cacheddistance[y] = distance
+        let xs: i32 = FixedMul(distance, basexscale)
+        cachedxstep[y] = xs
+        DRAW_set_ds_xstep(xs)
+        let ys: i32 = FixedMul(distance, baseyscale)
+        cachedystep[y] = ys
+        DRAW_set_ds_ystep(ys)
+    } else {
+        distance = cacheddistance[y]
+        DRAW_set_ds_xstep(cachedxstep[y])
+        DRAW_set_ds_ystep(cachedystep[y])
+    }
+
+    let length: i32 = FixedMul(distance, PLANES_distscale()[x1])
+    let angle: i32 = ((RMAIN_viewangle() + RMAIN_xtoviewangle(x1)) >> (PLANE_ANGLETOFINESHIFT as u32)) as i32
+    DRAW_set_ds_xfrac(RMAIN_viewx() + FixedMul(TABLES_finecosine(angle), length))
+    DRAW_set_ds_yfrac(0 - RMAIN_viewy() - FixedMul(TABLES_finesine(angle), length))
+
+    if (RMAIN_fixedcolormap() as i64) != 0 {
+        DRAW_set_ds_colormap(RMAIN_fixedcolormap())
+    } else {
+        let mut index: i32 = distance >> PLANE_LIGHTZSHIFT
+        if index >= PLANE_MAXLIGHTZ {
+            index = PLANE_MAXLIGHTZ - 1
+        }
+        DRAW_set_ds_colormap(RMAIN_zlight(planezlight_light, index))
+    }
+
+    DRAW_set_ds_y(y)
+    DRAW_set_ds_x1(x1)
+    DRAW_set_ds_x2(x2)
+    rmainshim_call_spanfunc()
+}
+
+#
+# R_ClearPlanes
+# At beginning of frame.
+#
+@flow_api
+function R_ClearPlanes() -> void {
+    plane_ensure()
+
+    let vw: i32 = DRAW_viewwidth()
+    let vh: i32 = DRAW_viewheight()
+    let fc: ptr<i16> = PLANES_floorclip()
+    let cc: ptr<i16> = PLANES_ceilingclip()
+    for i in 0 to vw {
+        fc[i] = vh as i16
+        cc[i] = (0 - 1) as i16
+    }
+
+    lastvisplane = 0
+    PLANES_set_lastopening(PLANES_openings())
+
+    memset(cachedheight as ptr<void>, 0, (PLANE_SCREENHEIGHT * 4) as i64)
+
+    let ang: i32 = ((RMAIN_viewangle() - PLANE_ANG90) >> (PLANE_ANGLETOFINESHIFT as u32)) as i32
+    basexscale = FixedDiv(TABLES_finecosine(ang), RMAIN_centerxfrac())
+    baseyscale = 0 - FixedDiv(TABLES_finesine(ang), RMAIN_centerxfrac())
+}
+
+#
+# R_FindPlane
+#
+@flow_api
+function R_FindPlane(height: i32, picnum: i32, lightlevel: i32) -> ptr<void> {
+    plane_ensure()
+
+    let mut h: i32 = height
+    let mut pic: i32 = picnum
+    let mut light: i32 = lightlevel
+    if pic == SKY_skyflatnum() {
+        h = 0
+        light = 0
+    }
+
+    let mut check: i32 = lastvisplane
+    for i in 0 to lastvisplane {
+        let pl: ptr<Visplane> = plane_vp(i)
+        if h == pl[0].height and pic == pl[0].picnum and light == pl[0].lightlevel {
+            check = i
+            break
+        }
+    }
+
+    if check < lastvisplane {
+        return plane_vp(check) as ptr<void>
+    }
+
+    if lastvisplane == PLANE_MAXVISPLANES {
+        I_Error("R_FindPlane: no more visplanes")
+    }
+
+    let pl2: ptr<Visplane> = plane_vp(lastvisplane)
+    lastvisplane = lastvisplane + 1
+
+    pl2[0].height = h
+    pl2[0].picnum = pic
+    pl2[0].lightlevel = light
+    pl2[0].minx = PLANE_SCREENWIDTH
+    pl2[0].maxx = 0 - 1
+    plane_clear_top(pl2)
+
+    return pl2 as ptr<void>
+}
+
+#
+# R_CheckPlane
+#
+@flow_api
+function R_CheckPlane(pl: ptr<void>, start: i32, stop: i32) -> ptr<void> {
+    let p: ptr<Visplane> = pl as ptr<Visplane>
+    let mut intrl: i32 = 0
+    let mut intrh: i32 = 0
+    let mut unionl: i32 = 0
+    let mut unionh: i32 = 0
+
+    if start < p[0].minx {
+        intrl = p[0].minx
+        unionl = start
+    } else {
+        unionl = p[0].minx
+        intrl = start
+    }
+
+    if stop > p[0].maxx {
+        intrh = p[0].maxx
+        unionh = stop
+    } else {
+        unionh = p[0].maxx
+        intrh = stop
+    }
+
+    let mut x: i32 = intrh + 1
+    for i in intrl to (intrh + 1) {
+        if (p[0].top[i] as i32) != 255 {
+            x = i
+            break
+        }
+    }
+
+    if x > intrh {
+        p[0].minx = unionl
+        p[0].maxx = unionh
+        return pl
+    }
+
+    # make a new visplane
+    let np: ptr<Visplane> = plane_vp(lastvisplane)
+    np[0].height = p[0].height
+    np[0].picnum = p[0].picnum
+    np[0].lightlevel = p[0].lightlevel
+    lastvisplane = lastvisplane + 1
+
+    np[0].minx = start
+    np[0].maxx = stop
+    plane_clear_top(np)
+
+    return np as ptr<void>
+}
+
+#
+# R_MakeSpans
+#
+@flow_api
+function R_MakeSpans(x: i32, t1: i32, b1: i32, t2: i32, b2: i32) -> void {
+    let mut a: i32 = t1
+    let mut b: i32 = b1
+    let mut c: i32 = t2
+    let mut d: i32 = b2
+
+    while a < c and a <= b {
+        R_MapPlane(a, spanstart[a], x - 1)
+        a = a + 1
+    }
+    while b > d and b >= a {
+        R_MapPlane(b, spanstart[b], x - 1)
+        b = b - 1
+    }
+
+    while c < a and c <= d {
+        spanstart[c] = x
+        c = c + 1
+    }
+    while d > b and d >= c {
+        spanstart[d] = x
+        d = d - 1
+    }
+}
+
+#
+# R_DrawPlanes
+# At the end of each frame.
+#
+@flow_api
+function R_DrawPlanes() -> void {
+    plane_ensure()
+
+    # RANGECHECK
+    if BSP_drawsegs_overflow() != 0 {
+        I_Error("R_DrawPlanes: drawsegs overflow")
+    }
+    if lastvisplane > PLANE_MAXVISPLANES {
+        I_Error("R_DrawPlanes: visplane overflow")
+    }
+    if PLANES_lastopening_count() > PLANE_MAXOPENINGS {
+        I_Error("R_DrawPlanes: opening overflow")
+    }
+
+    for pli in 0 to lastvisplane {
+        let pl: ptr<Visplane> = plane_vp(pli)
+        if pl[0].minx > pl[0].maxx {
+            continue
+        }
+
+        # sky flat
+        if pl[0].picnum == SKY_skyflatnum() {
+            DRAW_set_dc_iscale(THINGS_pspriteiscale() >> RMAIN_detailshift())
+            DRAW_set_dc_colormap(RDATA_colormaps())
+            DRAW_set_dc_texturemid(SKY_skytexturemid())
+
+            let xend: i32 = pl[0].maxx + 1
+            for x in pl[0].minx to xend {
+                let yl: i32 = pl[0].top[x] as i32
+                let yh: i32 = pl[0].bottom[x] as i32
+                if yl <= yh {
+                    DRAW_set_dc_yl(yl)
+                    DRAW_set_dc_yh(yh)
+                    let ang: i32 = ((RMAIN_viewangle() + RMAIN_xtoviewangle(x)) >> (PLANE_ANGLETOSKYSHIFT as u32)) as i32
+                    DRAW_set_dc_x(x)
+                    DRAW_set_dc_source(R_GetColumn(SKY_skytexture(), ang) as ptr<void>)
+                    rmainshim_call_colfunc()
+                }
+            }
+            continue
+        }
+
+        # regular flat
+        let lumpnum: i32 = RDATA_firstflat() + RDATA_flattranslation(pl[0].picnum)
+        DRAW_set_ds_source(W_CacheLumpNum(lumpnum, PLANE_PU_STATIC))
+
+        planeheight = plane_abs(pl[0].height - RMAIN_viewz())
+        let mut light: i32 = (pl[0].lightlevel >> PLANE_LIGHTSEGSHIFT) + RMAIN_extralight()
+        if light >= PLANE_LIGHTLEVELS {
+            light = PLANE_LIGHTLEVELS - 1
+        }
+        if light < 0 {
+            light = 0
+        }
+        planezlight_light = light
+
+        pl[0].top[pl[0].maxx + 1] = 255 as u8
+        pl[0].top[pl[0].minx - 1] = 255 as u8
+
+        let stop: i32 = pl[0].maxx + 1
+        for x in pl[0].minx to (stop + 1) {
+            R_MakeSpans(
+                x,
+                pl[0].top[x - 1] as i32,
+                pl[0].bottom[x - 1] as i32,
+                pl[0].top[x] as i32,
+                pl[0].bottom[x] as i32)
+        }
+
+        W_ReleaseLumpNum(lumpnum)
+    }
+}

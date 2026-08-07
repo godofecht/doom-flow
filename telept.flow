@@ -1,0 +1,169 @@
+# Teleportation, ported from p_telept.c to Flow.
+#
+# EV_Teleport keeps its exact C name via @flow_api. Engine struct access
+# (mobj_t, line_t, sector_t, player_t, thinker_t) and thinkercap are
+# Flow-owned (setup.flow / tick.flow). This module wires teleports through
+# MOBJ_*/GEOM_*/THINKER_* / PLAYER_* APIs.
+#
+# ---- engine C ---------------------------------------------------------
+
+extern { function P_TeleportMove(thing: ptr<void>, x: i32, y: i32) -> i32 }
+extern { function P_SpawnMobj(x: i32, y: i32, z: i32, typ: i32) -> ptr<void> }
+extern { function S_StartSound(origin: ptr<void>, sound_id: i32) -> void }
+extern { function TABLES_finesine(idx: i32) -> i32 }
+extern { function TABLES_finecosine(idx: i32) -> i32 }
+extern { function TABLES_finetangent(idx: i32) -> i32 }
+
+# ---- engine accessors -------------------------------------------------
+
+extern { function THINKER_cap() -> ptr<void> }
+extern { function THINKER_next(th: ptr<void>) -> ptr<void> }
+extern { function THINKER_is_mobj(th: ptr<void>) -> i32 }
+extern { function GEOM_numsectors() -> i32 }
+extern { function GEOM_sector(i: i32) -> ptr<void> }
+extern { function GEOM_sector_tag(s: ptr<void>) -> i32 }
+extern { function MOBJ_sector(m: ptr<void>) -> ptr<void> }
+extern { function GEOM_sector_index(sec: ptr<void>) -> i32 }
+extern { function MOBJ_flags(m: ptr<void>) -> i32 }
+extern { function MOBJ_x(m: ptr<void>) -> i32 }
+extern { function MOBJ_y(m: ptr<void>) -> i32 }
+extern { function MOBJ_z(m: ptr<void>) -> i32 }
+extern { function MOBJ_floorz(m: ptr<void>) -> i32 }
+extern { function MOBJ_type(m: ptr<void>) -> i32 }
+extern { function MOBJ_angle(m: ptr<void>) -> u32 }
+extern { function MOBJ_player(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_set_z(m: ptr<void>, z: i32) -> void }
+extern { function MOBJ_set_angle(m: ptr<void>, a: u32) -> void }
+extern { function PLAYER_viewheight(p: ptr<void>) -> i32 }
+extern { function PLAYER_set_viewz(p: ptr<void>, v: i32) -> void }
+
+extern { function GEOM_line_tag(ld: ptr<void>) -> i32 }
+extern { function MOBJ_set_reactiontime(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_zero_mom(m: ptr<void>) -> void }
+
+# ---- constants from C headers -----------------------------------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+# p_mobj.h mobjflag_t
+const TELEPT_MF_MISSILE: i32 = 65536        # 0x10000
+
+# info.h mobjtype_t
+const TELEPT_MT_TFOG: i32 = 39
+const TELEPT_MT_TELEPORTMAN: i32 = 41
+
+# sounds.h sfxenum_t
+const TELEPT_SFX_TELEPT: i32 = 35
+
+# tables.h
+const TELEPT_ANGLETOFINESHIFT: i32 = 19
+
+# d_mode.h GameVersion_t
+const TELEPT_EXE_FINAL: i32 = 7
+
+# ---- TELEPORTATION ----------------------------------------------------
+
+@flow_api
+function EV_Teleport(line: ptr<void>, side: i32, thing: ptr<void>) -> i32 {
+    # don't teleport missiles
+    if (MOBJ_flags(thing) & TELEPT_MF_MISSILE) != 0 {
+        return 0
+    }
+
+    # Don't teleport if hit back of line, so you can get out of teleporter.
+    if side == 1 {
+        return 0
+    }
+
+    let tag: i32 = GEOM_line_tag(line)
+    let mut i: i32 = 0
+    let nsec: i32 = GEOM_numsectors()
+
+    while i < nsec {
+        if GEOM_sector_tag(GEOM_sector(i)) == tag {
+            let cap: ptr<void> = THINKER_cap()
+            let mut thinker: ptr<void> = THINKER_next(cap)
+
+            while (thinker as i64) != (cap as i64) {
+                # not a mobj
+                if THINKER_is_mobj(thinker) != 0 {
+                    let m: ptr<void> = thinker
+
+                    # not a teleportman
+                    if MOBJ_type(m) == TELEPT_MT_TELEPORTMAN {
+                        let sector: ptr<void> = MOBJ_sector(m)
+
+                        # wrong sector
+                        if GEOM_sector_index(sector) == i {
+                            let oldx: i32 = MOBJ_x(thing)
+                            let oldy: i32 = MOBJ_y(thing)
+                            let oldz: i32 = MOBJ_z(thing)
+
+                            if P_TeleportMove(thing, MOBJ_x(m), MOBJ_y(m)) == 0 {
+                                return 0
+                            }
+
+                            # The first Final Doom executable does not set
+                            # thing->z when teleporting.
+                            if STAT_gameversion() != TELEPT_EXE_FINAL {
+                                MOBJ_set_z(thing, MOBJ_floorz(thing))
+                            }
+
+                            if (MOBJ_player(thing) as i64) != 0 {
+                                let pl: ptr<void> = MOBJ_player(thing)
+                                PLAYER_set_viewz(pl, MOBJ_z(thing) + PLAYER_viewheight(pl))
+                            }
+
+                            # spawn teleport fog at source and destination
+                            let fog1: ptr<void> = P_SpawnMobj(oldx, oldy, oldz, TELEPT_MT_TFOG)
+                            S_StartSound(fog1, TELEPT_SFX_TELEPT)
+
+                            let an: u32 = MOBJ_angle(m) >> TELEPT_ANGLETOFINESHIFT
+                            let fog2: ptr<void> = P_SpawnMobj(
+                                MOBJ_x(m) + 20 * TABLES_finecosine(an as i32),
+                                MOBJ_y(m) + 20 * TABLES_finesine(an as i32),
+                                MOBJ_z(thing),
+                                TELEPT_MT_TFOG)
+
+                            # emit sound, where?
+                            S_StartSound(fog2, TELEPT_SFX_TELEPT)
+
+                            # don't move for a bit
+                            if (MOBJ_player(thing) as i64) != 0 {
+                                MOBJ_set_reactiontime(thing, 18)
+                            }
+
+                            MOBJ_set_angle(thing, MOBJ_angle(m))
+                            MOBJ_zero_mom(thing)
+                            return 1
+                        }
+                    }
+                }
+
+                thinker = THINKER_next(thinker)
+            }
+        }
+
+        i = i + 1
+    }
+
+    return 0
+}

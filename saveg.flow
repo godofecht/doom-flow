@@ -1,0 +1,1213 @@
+# Savegame I/O / archiving, ported from p_saveg.c to Flow.
+#
+# Endian-safe byte stream + structure serializers live here. Globals
+# save_stream / savegame_error are Flow-owned. Path / error helpers too.
+#
+# LP64 offsetof (verified against doomgeneric headers):
+#
+#   thinker_t: prev 0, next 8, function 16  SIZEOF 24
+#   mapthing_t: x 0, y 2, angle 4, type 6, options 8  SIZEOF 10
+#   mobj_t SIZEOF 224 — see sight.flow / user.flow
+#   ticcmd_t: fm 0, sm 1, angleturn 2, chatchar 4, buttons 5,
+#             consistancy 6  SIZEOF 16
+#   pspdef_t: state 0, tics 8, sx 12, sy 16  SIZEOF 24
+#   player_t SIZEOF 328 — see user.flow
+#   sector_t: floorheight 0, ceilingheight 4, floorpic 8, ceilingpic 10,
+#             lightlevel 12, special 14, tag 16, specialdata 104,
+#             soundtarget 24  SIZEOF 128
+#   line_t: flags 24, special 26, tag 28, sidenum 30  SIZEOF 88
+#   side_t: textureoffset 0, rowoffset 4, top 8, bot 10, mid 12 SIZEOF 24
+#   ceiling_t 72, vldoor_t 64, floormove_t 64, plat_t 72,
+#   lightflash_t 56, strobe_t 56, glow_t 48 — see ceiling/doors/floor/
+#   plats/lights.flow
+
+extern { function fread(dest: ptr<void>, size: i64, n: i64, f: ptr<void>) -> i64 }
+extern { function fwrite(src: ptr<void>, size: i64, n: i64, f: ptr<void>) -> i64 }
+extern { function ftell(f: ptr<void>) -> i64 }
+extern { function malloc(n: i64) -> ptr<void> }
+extern { function free(p: ptr<void>) -> void }
+extern { function memset(dest: ptr<void>, c: i32, n: i64) -> ptr<void> }
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+extern { function strcmp(a: string, b: string) -> i32 }
+extern { function strlen(s: string) -> i64 }
+extern { function printf(fmt: string, s: string) -> i32 }
+extern { function snprintf(buf: string, n: i64, fmt: string, a: i32) -> i32 }
+extern { function snprintf(buf: string, n: i64, fmt: string, a: string, b: string) -> i32 }
+extern { function I_Error(msg: string) -> void }
+extern { function dmain_savegamedir() -> string }
+extern { function G_VanillaVersionCode() -> i32 }
+
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function Z_Free(p: ptr<void>) -> void }
+extern { function P_RemoveMobj(mobj: ptr<void>) -> void }
+extern { function P_InitThinkers() -> void }
+extern { function P_SetThingPosition(mobj: ptr<void>) -> void }
+extern { function P_AddThinker(thinker: ptr<void>) -> void }
+extern { function P_AddActiveCeiling(c: ptr<void>) -> void }
+extern { function P_AddActivePlat(plat: ptr<void>) -> void }
+
+let mut save_stream: ptr<void> = null
+let mut savegame_error: i32 = 0
+
+@flow_api
+function savegshim_save_stream() -> ptr<void> { return save_stream }
+
+@flow_api
+function savegshim_set_save_stream(p: ptr<void>) -> void { save_stream = p }
+
+@flow_api
+function savegshim_savegame_error() -> i32 { return savegame_error }
+
+@flow_api
+function savegshim_set_savegame_error(v: i32) -> void { savegame_error = v }
+
+@flow_api
+function savegshim_stderr_msg(msg: string) -> void {
+    printf("%s", msg)
+}
+
+extern { function STAT_gameskill() -> i32 }
+extern { function STAT_set_gameskill(v: i32) -> void }
+
+extern { function GEOM_numsectors() -> i32 }
+extern { function GEOM_numlines() -> i32 }
+extern { function GEOM_sector(i: i32) -> ptr<void> }
+extern { function GEOM_line(i: i32) -> ptr<void> }
+extern { function GEOM_side(i: i32) -> ptr<void> }
+extern { function THINKER_cap() -> ptr<void> }
+extern { function THINKER_next(th: ptr<void>) -> ptr<void> }
+extern { function THINKER_acp1(th: ptr<void>) -> ptr<void> }
+extern { function THINKER_is_mobj(th: ptr<void>) -> i32 }
+extern { function THINKER_is_null(th: ptr<void>) -> i32 }
+extern { function THINKER_is_vertical_door(th: ptr<void>) -> i32 }
+extern { function THINKER_is_plat_raise(th: ptr<void>) -> i32 }
+extern { function THINKER_set_mobj(th: ptr<void>) -> void }
+extern { function THINKER_set_move_ceiling(th: ptr<void>) -> void }
+extern { function THINKER_set_vertical_door(th: ptr<void>) -> void }
+extern { function THINKER_set_move_floor(th: ptr<void>) -> void }
+extern { function THINKER_set_plat_raise(th: ptr<void>) -> void }
+
+extern { function STATE_at(i: i32) -> ptr<void> }
+extern { function STATE_index(st: ptr<void>) -> i32 }
+extern { function PLAYER_index_plus1(pl: ptr<void>) -> i32 }
+extern { function GEOM_sector_index(sec: ptr<void>) -> i32 }
+extern { function GEOM_sector_floorheight(sec: ptr<void>) -> i32 }
+extern { function GEOM_sector_ceilingheight(sec: ptr<void>) -> i32 }
+extern { function GEOM_subsector_sector(ss: ptr<void>) -> ptr<void> }
+extern { function MOBJ_subsector(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_set_floorz(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_ceilingz(m: ptr<void>, v: i32) -> void }
+extern { function INFO_mobjinfo_at(t: i32) -> ptr<void> }
+extern { function P_ActiveCeilingIndex(th: ptr<void>) -> i32 }
+
+# Thinker type checks / setters live in tick.flow (THINKER_*).
+extern { function THINKER_is_move_ceiling(th: ptr<void>) -> i32 }
+extern { function THINKER_is_move_floor(th: ptr<void>) -> i32 }
+extern { function THINKER_is_light_flash(th: ptr<void>) -> i32 }
+extern { function THINKER_is_strobe_flash(th: ptr<void>) -> i32 }
+extern { function THINKER_is_glow(th: ptr<void>) -> i32 }
+extern { function THINKER_set_light_flash(th: ptr<void>) -> void }
+extern { function THINKER_set_strobe_flash(th: ptr<void>) -> void }
+extern { function THINKER_set_glow(th: ptr<void>) -> void }
+
+let mut saveg_temp_filename: string = null as string
+let mut saveg_filename: ptr<u8> = null
+let mut saveg_filename_size: i64 = 0
+let mut saveg_errbuf: array<u8, 128> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+let mut saveg_basename: array<u8, 32> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+function saveg_string_join2(a: string, b: string) -> string {
+    let la: i64 = strlen(a)
+    let lb: i64 = strlen(b)
+    let result: ptr<u8> = malloc(la + lb + 1) as ptr<u8>
+    memcpy(result as ptr<void>, a as ptr<void>, la)
+    memcpy(((result as i64) + la) as ptr<void>, b as ptr<void>, lb)
+    result[la + lb] = 0 as u8
+    return result as string
+}
+
+@flow_api
+function savegshim_temp_savegame_file() -> string {
+    if (saveg_temp_filename as i64) == 0 {
+        saveg_temp_filename = saveg_string_join2(dmain_savegamedir(), "temp.dsg")
+    }
+    return saveg_temp_filename
+}
+
+@flow_api
+function savegshim_savegame_file(slot: i32) -> string {
+    let savegamedir: string = dmain_savegamedir()
+    if (saveg_filename as i64) == 0 {
+        saveg_filename_size = strlen(savegamedir) + 32
+        saveg_filename = malloc(saveg_filename_size) as ptr<u8>
+    }
+    snprintf((&saveg_basename[0]) as string, 32, "doomsav%d.dsg", slot)
+    snprintf(saveg_filename as string, saveg_filename_size, "%s%s",
+             savegamedir, (&saveg_basename[0]) as string)
+    return saveg_filename as string
+}
+
+@flow_api
+function savegshim_fill_version_string(buf: ptr<u8>, buflen: i32) -> void {
+    memset(buf as ptr<void>, 0, buflen as i64)
+    snprintf(buf as string, buflen as i64, "version %i", G_VanillaVersionCode())
+}
+
+@flow_api
+function savegshim_error_unknown_tclass(tclass: i32) -> void {
+    snprintf((&saveg_errbuf[0]) as string, 128, "Unknown tclass %i in savegame", tclass)
+    I_Error((&saveg_errbuf[0]) as string)
+}
+
+@flow_api
+function savegshim_error_unknown_special_tclass(tclass: i32) -> void {
+    snprintf((&saveg_errbuf[0]) as string, 128,
+             "P_UnarchiveSpecials:Unknown tclass %i in savegame", tclass)
+    I_Error((&saveg_errbuf[0]) as string)
+}
+
+extern { function PLAYER_at(i: i32) -> ptr<void> }
+extern { function PLAYER_set_mo(p: ptr<void>, m: ptr<void>) -> void }
+
+extern { function MTHING_x(mt: ptr<void>) -> i32 }
+extern { function MTHING_y(mt: ptr<void>) -> i32 }
+extern { function MTHING_angle(mt: ptr<void>) -> i32 }
+extern { function MTHING_type(mt: ptr<void>) -> i32 }
+extern { function MTHING_options(mt: ptr<void>) -> i32 }
+extern { function MTHING_set_x(mt: ptr<void>, v: i32) -> void }
+extern { function MTHING_set_y(mt: ptr<void>, v: i32) -> void }
+extern { function MTHING_set_angle(mt: ptr<void>, v: i32) -> void }
+extern { function MTHING_set_type(mt: ptr<void>, v: i32) -> void }
+extern { function MTHING_set_options(mt: ptr<void>, v: i32) -> void }
+
+# ---- constants (prefixed SAVEG_) --------------------------------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+const SAVEG_EOF: i32 = 29                    # 0x1d
+const SAVEG_VERSIONSIZE: i32 = 16
+const SAVEG_SAVESTRINGSIZE: i32 = 24         # p_saveg.h
+const SAVEG_MAXPLAYERS: i32 = 4
+const SAVEG_NUMPOWERS: i32 = 6
+const SAVEG_NUMCARDS: i32 = 6
+const SAVEG_NUMWEAPONS: i32 = 9
+const SAVEG_NUMAMMO: i32 = 4
+const SAVEG_NUMPSPRITES: i32 = 2
+const SAVEG_MAXCEILINGS: i32 = 30
+const SAVEG_FRACBITS: i32 = 16
+const SAVEG_PU_LEVEL: i32 = 5
+
+const SAVEG_SIZEOF_MOBJ: i32 = 224
+const SAVEG_SIZEOF_CEILING: i32 = 72
+const SAVEG_SIZEOF_VLDOOR: i32 = 64
+const SAVEG_SIZEOF_FLOORMOVE: i32 = 64
+const SAVEG_SIZEOF_PLAT: i32 = 72
+const SAVEG_SIZEOF_LIGHTFLASH: i32 = 56
+const SAVEG_SIZEOF_STROBE: i32 = 56
+const SAVEG_SIZEOF_GLOW: i32 = 48
+
+# thinkerclass_t / specials_e
+const SAVEG_TC_END: i32 = 0
+const SAVEG_TC_MOBJ: i32 = 1
+const SAVEG_TC_CEILING: i32 = 0
+const SAVEG_TC_DOOR: i32 = 1
+const SAVEG_TC_FLOOR: i32 = 2
+const SAVEG_TC_PLAT: i32 = 3
+const SAVEG_TC_FLASH: i32 = 4
+const SAVEG_TC_STROBE: i32 = 5
+const SAVEG_TC_GLOW: i32 = 6
+const SAVEG_TC_ENDSPECIALS: i32 = 7
+
+# ---- offset helpers for C-owned records -------------------------------
+
+function sg_base(p: ptr<void>) -> i64 {
+    return p as i64
+}
+
+function sg_i8(base: i64, off: i32) -> i32 {
+    let p: ptr<i8> = (base + off as i64) as ptr<i8>
+    return p[0] as i32
+}
+
+function sg_set_i8(base: i64, off: i32, v: i32) -> void {
+    let p: ptr<i8> = (base + off as i64) as ptr<i8>
+    p[0] = v as i8
+}
+
+function sg_u8(base: i64, off: i32) -> i32 {
+    let p: ptr<u8> = (base + off as i64) as ptr<u8>
+    return p[0] as i32
+}
+
+function sg_set_u8(base: i64, off: i32, v: i32) -> void {
+    let p: ptr<u8> = (base + off as i64) as ptr<u8>
+    p[0] = v as u8
+}
+
+function sg_i16(base: i64, off: i32) -> i32 {
+    let p: ptr<i16> = (base + off as i64) as ptr<i16>
+    return p[0] as i32
+}
+
+function sg_set_i16(base: i64, off: i32, v: i32) -> void {
+    let p: ptr<i16> = (base + off as i64) as ptr<i16>
+    p[0] = v as i16
+}
+
+function sg_i32(base: i64, off: i32) -> i32 {
+    let p: ptr<i32> = (base + off as i64) as ptr<i32>
+    return p[0]
+}
+
+function sg_set_i32(base: i64, off: i32, v: i32) -> void {
+    let p: ptr<i32> = (base + off as i64) as ptr<i32>
+    p[0] = v
+}
+
+function sg_u32(base: i64, off: i32) -> u32 {
+    let p: ptr<u32> = (base + off as i64) as ptr<u32>
+    return p[0]
+}
+
+function sg_set_u32(base: i64, off: i32, v: u32) -> void {
+    let p: ptr<u32> = (base + off as i64) as ptr<u32>
+    p[0] = v
+}
+
+function sg_ptr(base: i64, off: i32) -> ptr<void> {
+    let p: ptr<i64> = (base + off as i64) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+function sg_set_ptr(base: i64, off: i32, v: ptr<void>) -> void {
+    let p: ptr<i64> = (base + off as i64) as ptr<i64>
+    p[0] = v as i64
+}
+
+# ---- endian-safe stream I/O -------------------------------------------
+
+function saveg_read8() -> u8 {
+    let mut result: u8 = 0
+    let stream: ptr<void> = savegshim_save_stream()
+    if fread((&result) as ptr<void>, 1, 1, stream) < 1 {
+        if savegshim_savegame_error() == 0 {
+            savegshim_stderr_msg("saveg_read8: Unexpected end of file while reading save game\n")
+            savegshim_set_savegame_error(1)
+        }
+    }
+    return result
+}
+
+function saveg_write8(value: u8) -> void {
+    let mut v: u8 = value
+    let stream: ptr<void> = savegshim_save_stream()
+    if fwrite((&v) as ptr<void>, 1, 1, stream) < 1 {
+        if savegshim_savegame_error() == 0 {
+            savegshim_stderr_msg("saveg_write8: Error while writing save game\n")
+            savegshim_set_savegame_error(1)
+        }
+    }
+}
+
+function saveg_read16() -> i32 {
+    let mut result: i32 = saveg_read8() as i32
+    result = result | ((saveg_read8() as i32) << 8)
+    return (result as i16) as i32
+}
+
+function saveg_write16(value: i32) -> void {
+    saveg_write8((value & 255) as u8)
+    saveg_write8(((value >> 8) & 255) as u8)
+}
+
+function saveg_read32() -> i32 {
+    let mut result: i32 = saveg_read8() as i32
+    result = result | ((saveg_read8() as i32) << 8)
+    result = result | ((saveg_read8() as i32) << 16)
+    result = result | ((saveg_read8() as i32) << 24)
+    return result
+}
+
+function saveg_write32(value: i32) -> void {
+    saveg_write8((value & 255) as u8)
+    saveg_write8(((value >> 8) & 255) as u8)
+    saveg_write8(((value >> 16) & 255) as u8)
+    saveg_write8(((value >> 24) & 255) as u8)
+}
+
+function saveg_read_pad() -> void {
+    let pos: i64 = ftell(savegshim_save_stream())
+    let padding: i32 = (4 - ((pos as i32) & 3)) & 3
+    for _i in 0 to padding {
+        let _b: u8 = saveg_read8()
+    }
+}
+
+function saveg_write_pad() -> void {
+    let pos: i64 = ftell(savegshim_save_stream())
+    let padding: i32 = (4 - ((pos as i32) & 3)) & 3
+    for _i in 0 to padding {
+        saveg_write8(0 as u8)
+    }
+}
+
+function saveg_readp() -> ptr<void> {
+    return (saveg_read32() as i64) as ptr<void>
+}
+
+function saveg_writep(p: ptr<void>) -> void {
+    saveg_write32((p as i64) as i32)
+}
+
+# ---- mapthing_t (via shared MTHING_* from mobj.flow) ------------------
+
+function saveg_read_mapthing_t(str: ptr<void>) -> void {
+    MTHING_set_x(str, saveg_read16())
+    MTHING_set_y(str, saveg_read16())
+    MTHING_set_angle(str, saveg_read16())
+    MTHING_set_type(str, saveg_read16())
+    MTHING_set_options(str, saveg_read16())
+}
+
+function saveg_write_mapthing_t(str: ptr<void>) -> void {
+    saveg_write16(MTHING_x(str))
+    saveg_write16(MTHING_y(str))
+    saveg_write16(MTHING_angle(str))
+    saveg_write16(MTHING_type(str))
+    saveg_write16(MTHING_options(str))
+}
+
+# ---- thinker_t / actionf_t --------------------------------------------
+
+function saveg_read_thinker_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    sg_set_ptr(b, 0, saveg_readp())
+    sg_set_ptr(b, 8, saveg_readp())
+    sg_set_ptr(b, 16, saveg_readp())
+}
+
+function saveg_write_thinker_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_writep(sg_ptr(b, 0))
+    saveg_writep(sg_ptr(b, 8))
+    saveg_writep(sg_ptr(b, 16))
+}
+
+# ---- mobj_t -----------------------------------------------------------
+
+function saveg_read_mobj_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_read_thinker_t(str)
+
+    sg_set_i32(b, 24, saveg_read32())
+    sg_set_i32(b, 28, saveg_read32())
+    sg_set_i32(b, 32, saveg_read32())
+    sg_set_ptr(b, 40, saveg_readp())
+    sg_set_ptr(b, 48, saveg_readp())
+    sg_set_u32(b, 56, saveg_read32() as u32)
+    sg_set_i32(b, 60, saveg_read32())
+    sg_set_i32(b, 64, saveg_read32())
+    sg_set_ptr(b, 72, saveg_readp())
+    sg_set_ptr(b, 80, saveg_readp())
+    sg_set_ptr(b, 88, saveg_readp())
+    sg_set_i32(b, 96, saveg_read32())
+    sg_set_i32(b, 100, saveg_read32())
+    sg_set_i32(b, 104, saveg_read32())
+    sg_set_i32(b, 108, saveg_read32())
+    sg_set_i32(b, 112, saveg_read32())
+    sg_set_i32(b, 116, saveg_read32())
+    sg_set_i32(b, 120, saveg_read32())
+    sg_set_i32(b, 124, saveg_read32())
+    sg_set_i32(b, 128, saveg_read32())
+    sg_set_ptr(b, 136, saveg_readp())
+    sg_set_i32(b, 144, saveg_read32())
+    sg_set_ptr(b, 152, STATE_at(saveg_read32()))
+    sg_set_i32(b, 160, saveg_read32())
+    sg_set_i32(b, 164, saveg_read32())
+    sg_set_i32(b, 168, saveg_read32())
+    sg_set_i32(b, 172, saveg_read32())
+    sg_set_ptr(b, 176, saveg_readp())
+    sg_set_i32(b, 184, saveg_read32())
+    sg_set_i32(b, 188, saveg_read32())
+
+    let pl: i32 = saveg_read32()
+    if pl > 0 {
+        let player: ptr<void> = PLAYER_at(pl - 1)
+        sg_set_ptr(b, 192, player)
+        PLAYER_set_mo(player, str)
+    } else {
+        sg_set_ptr(b, 192, null)
+    }
+
+    sg_set_i32(b, 200, saveg_read32())
+    saveg_read_mapthing_t(((b + 204) as ptr<void>))
+    sg_set_ptr(b, 216, saveg_readp())
+}
+
+function saveg_write_mobj_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_write_thinker_t(str)
+
+    saveg_write32(sg_i32(b, 24))
+    saveg_write32(sg_i32(b, 28))
+    saveg_write32(sg_i32(b, 32))
+    saveg_writep(sg_ptr(b, 40))
+    saveg_writep(sg_ptr(b, 48))
+    saveg_write32(sg_u32(b, 56) as i32)
+    saveg_write32(sg_i32(b, 60))
+    saveg_write32(sg_i32(b, 64))
+    saveg_writep(sg_ptr(b, 72))
+    saveg_writep(sg_ptr(b, 80))
+    saveg_writep(sg_ptr(b, 88))
+    saveg_write32(sg_i32(b, 96))
+    saveg_write32(sg_i32(b, 100))
+    saveg_write32(sg_i32(b, 104))
+    saveg_write32(sg_i32(b, 108))
+    saveg_write32(sg_i32(b, 112))
+    saveg_write32(sg_i32(b, 116))
+    saveg_write32(sg_i32(b, 120))
+    saveg_write32(sg_i32(b, 124))
+    saveg_write32(sg_i32(b, 128))
+    saveg_writep(sg_ptr(b, 136))
+    saveg_write32(sg_i32(b, 144))
+    saveg_write32(STATE_index(sg_ptr(b, 152)))
+    saveg_write32(sg_i32(b, 160))
+    saveg_write32(sg_i32(b, 164))
+    saveg_write32(sg_i32(b, 168))
+    saveg_write32(sg_i32(b, 172))
+    saveg_writep(sg_ptr(b, 176))
+    saveg_write32(sg_i32(b, 184))
+    saveg_write32(sg_i32(b, 188))
+    saveg_write32(PLAYER_index_plus1(sg_ptr(b, 192)))
+    saveg_write32(sg_i32(b, 200))
+    saveg_write_mapthing_t(((b + 204) as ptr<void>))
+    saveg_writep(sg_ptr(b, 216))
+}
+
+# ---- ticcmd_t (embedded at player+12) ---------------------------------
+
+function saveg_read_ticcmd_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    sg_set_i8(b, 0, saveg_read8() as i32)
+    sg_set_i8(b, 1, saveg_read8() as i32)
+    sg_set_i16(b, 2, saveg_read16())
+    # save format: consistancy as 16-bit, then chatchar, buttons
+    let cons: i32 = saveg_read16()
+    sg_set_u8(b, 6, cons & 255)
+    sg_set_u8(b, 4, saveg_read8() as i32)
+    sg_set_u8(b, 5, saveg_read8() as i32)
+}
+
+function saveg_write_ticcmd_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_write8(sg_i8(b, 0) as u8)
+    saveg_write8(sg_i8(b, 1) as u8)
+    saveg_write16(sg_i16(b, 2))
+    saveg_write16(sg_u8(b, 6))
+    saveg_write8(sg_u8(b, 4) as u8)
+    saveg_write8(sg_u8(b, 5) as u8)
+}
+
+# ---- pspdef_t ---------------------------------------------------------
+
+function saveg_read_pspdef_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    let state: i32 = saveg_read32()
+    if state > 0 {
+        sg_set_ptr(b, 0, STATE_at(state))
+    } else {
+        sg_set_ptr(b, 0, null)
+    }
+    sg_set_i32(b, 8, saveg_read32())
+    sg_set_i32(b, 12, saveg_read32())
+    sg_set_i32(b, 16, saveg_read32())
+}
+
+function saveg_write_pspdef_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    let st: ptr<void> = sg_ptr(b, 0)
+    if (st as i64) != 0 {
+        saveg_write32(STATE_index(st))
+    } else {
+        saveg_write32(0)
+    }
+    saveg_write32(sg_i32(b, 8))
+    saveg_write32(sg_i32(b, 12))
+    saveg_write32(sg_i32(b, 16))
+}
+
+# ---- player_t ---------------------------------------------------------
+
+function saveg_read_player_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    sg_set_ptr(b, 0, saveg_readp())
+    sg_set_i32(b, 8, saveg_read32())
+    saveg_read_ticcmd_t(((b + 12) as ptr<void>))
+    sg_set_i32(b, 28, saveg_read32())
+    sg_set_i32(b, 32, saveg_read32())
+    sg_set_i32(b, 36, saveg_read32())
+    sg_set_i32(b, 40, saveg_read32())
+    sg_set_i32(b, 44, saveg_read32())
+    sg_set_i32(b, 48, saveg_read32())
+    sg_set_i32(b, 52, saveg_read32())
+
+    for i in 0 to SAVEG_NUMPOWERS {
+        sg_set_i32(b, 56 + i * 4, saveg_read32())
+    }
+    for i in 0 to SAVEG_NUMCARDS {
+        sg_set_i32(b, 80 + i * 4, saveg_read32())
+    }
+    sg_set_i32(b, 104, saveg_read32())
+    for i in 0 to SAVEG_MAXPLAYERS {
+        sg_set_i32(b, 108 + i * 4, saveg_read32())
+    }
+    sg_set_i32(b, 124, saveg_read32())
+    sg_set_i32(b, 128, saveg_read32())
+    for i in 0 to SAVEG_NUMWEAPONS {
+        sg_set_i32(b, 132 + i * 4, saveg_read32())
+    }
+    for i in 0 to SAVEG_NUMAMMO {
+        sg_set_i32(b, 168 + i * 4, saveg_read32())
+    }
+    for i in 0 to SAVEG_NUMAMMO {
+        sg_set_i32(b, 184 + i * 4, saveg_read32())
+    }
+    sg_set_i32(b, 200, saveg_read32())
+    sg_set_i32(b, 204, saveg_read32())
+    sg_set_i32(b, 208, saveg_read32())
+    sg_set_i32(b, 212, saveg_read32())
+    sg_set_i32(b, 216, saveg_read32())
+    sg_set_i32(b, 220, saveg_read32())
+    sg_set_i32(b, 224, saveg_read32())
+    sg_set_ptr(b, 232, saveg_readp())
+    sg_set_i32(b, 240, saveg_read32())
+    sg_set_i32(b, 244, saveg_read32())
+    sg_set_ptr(b, 248, saveg_readp())
+    sg_set_i32(b, 256, saveg_read32())
+    sg_set_i32(b, 260, saveg_read32())
+    sg_set_i32(b, 264, saveg_read32())
+    for i in 0 to SAVEG_NUMPSPRITES {
+        saveg_read_pspdef_t(((b + 272 + i * 24) as ptr<void>))
+    }
+    sg_set_i32(b, 320, saveg_read32())
+}
+
+function saveg_write_player_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_writep(sg_ptr(b, 0))
+    saveg_write32(sg_i32(b, 8))
+    saveg_write_ticcmd_t(((b + 12) as ptr<void>))
+    saveg_write32(sg_i32(b, 28))
+    saveg_write32(sg_i32(b, 32))
+    saveg_write32(sg_i32(b, 36))
+    saveg_write32(sg_i32(b, 40))
+    saveg_write32(sg_i32(b, 44))
+    saveg_write32(sg_i32(b, 48))
+    saveg_write32(sg_i32(b, 52))
+    for i in 0 to SAVEG_NUMPOWERS {
+        saveg_write32(sg_i32(b, 56 + i * 4))
+    }
+    for i in 0 to SAVEG_NUMCARDS {
+        saveg_write32(sg_i32(b, 80 + i * 4))
+    }
+    saveg_write32(sg_i32(b, 104))
+    for i in 0 to SAVEG_MAXPLAYERS {
+        saveg_write32(sg_i32(b, 108 + i * 4))
+    }
+    saveg_write32(sg_i32(b, 124))
+    saveg_write32(sg_i32(b, 128))
+    for i in 0 to SAVEG_NUMWEAPONS {
+        saveg_write32(sg_i32(b, 132 + i * 4))
+    }
+    for i in 0 to SAVEG_NUMAMMO {
+        saveg_write32(sg_i32(b, 168 + i * 4))
+    }
+    for i in 0 to SAVEG_NUMAMMO {
+        saveg_write32(sg_i32(b, 184 + i * 4))
+    }
+    saveg_write32(sg_i32(b, 200))
+    saveg_write32(sg_i32(b, 204))
+    saveg_write32(sg_i32(b, 208))
+    saveg_write32(sg_i32(b, 212))
+    saveg_write32(sg_i32(b, 216))
+    saveg_write32(sg_i32(b, 220))
+    saveg_write32(sg_i32(b, 224))
+    saveg_writep(sg_ptr(b, 232))
+    saveg_write32(sg_i32(b, 240))
+    saveg_write32(sg_i32(b, 244))
+    saveg_writep(sg_ptr(b, 248))
+    saveg_write32(sg_i32(b, 256))
+    saveg_write32(sg_i32(b, 260))
+    saveg_write32(sg_i32(b, 264))
+    for i in 0 to SAVEG_NUMPSPRITES {
+        saveg_write_pspdef_t(((b + 272 + i * 24) as ptr<void>))
+    }
+    saveg_write32(sg_i32(b, 320))
+}
+
+# ---- specials ---------------------------------------------------------
+
+function saveg_read_ceiling_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_read_thinker_t(str)
+    sg_set_i32(b, 24, saveg_read32())
+    let sector: i32 = saveg_read32()
+    sg_set_ptr(b, 32, GEOM_sector(sector))
+    sg_set_i32(b, 40, saveg_read32())
+    sg_set_i32(b, 44, saveg_read32())
+    sg_set_i32(b, 48, saveg_read32())
+    sg_set_i32(b, 52, saveg_read32())
+    sg_set_i32(b, 56, saveg_read32())
+    sg_set_i32(b, 60, saveg_read32())
+    sg_set_i32(b, 64, saveg_read32())
+}
+
+function saveg_write_ceiling_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_write_thinker_t(str)
+    saveg_write32(sg_i32(b, 24))
+    saveg_write32(GEOM_sector_index(sg_ptr(b, 32)))
+    saveg_write32(sg_i32(b, 40))
+    saveg_write32(sg_i32(b, 44))
+    saveg_write32(sg_i32(b, 48))
+    saveg_write32(sg_i32(b, 52))
+    saveg_write32(sg_i32(b, 56))
+    saveg_write32(sg_i32(b, 60))
+    saveg_write32(sg_i32(b, 64))
+}
+
+function saveg_read_vldoor_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_read_thinker_t(str)
+    sg_set_i32(b, 24, saveg_read32())
+    let sector: i32 = saveg_read32()
+    sg_set_ptr(b, 32, GEOM_sector(sector))
+    sg_set_i32(b, 40, saveg_read32())
+    sg_set_i32(b, 44, saveg_read32())
+    sg_set_i32(b, 48, saveg_read32())
+    sg_set_i32(b, 52, saveg_read32())
+    sg_set_i32(b, 56, saveg_read32())
+}
+
+function saveg_write_vldoor_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_write_thinker_t(str)
+    saveg_write32(sg_i32(b, 24))
+    saveg_write32(GEOM_sector_index(sg_ptr(b, 32)))
+    saveg_write32(sg_i32(b, 40))
+    saveg_write32(sg_i32(b, 44))
+    saveg_write32(sg_i32(b, 48))
+    saveg_write32(sg_i32(b, 52))
+    saveg_write32(sg_i32(b, 56))
+}
+
+function saveg_read_floormove_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_read_thinker_t(str)
+    sg_set_i32(b, 24, saveg_read32())
+    sg_set_i32(b, 28, saveg_read32())
+    let sector: i32 = saveg_read32()
+    sg_set_ptr(b, 32, GEOM_sector(sector))
+    sg_set_i32(b, 40, saveg_read32())
+    sg_set_i32(b, 44, saveg_read32())
+    sg_set_i16(b, 48, saveg_read16())
+    sg_set_i32(b, 52, saveg_read32())
+    sg_set_i32(b, 56, saveg_read32())
+}
+
+function saveg_write_floormove_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_write_thinker_t(str)
+    saveg_write32(sg_i32(b, 24))
+    saveg_write32(sg_i32(b, 28))
+    saveg_write32(GEOM_sector_index(sg_ptr(b, 32)))
+    saveg_write32(sg_i32(b, 40))
+    saveg_write32(sg_i32(b, 44))
+    saveg_write16(sg_i16(b, 48))
+    saveg_write32(sg_i32(b, 52))
+    saveg_write32(sg_i32(b, 56))
+}
+
+function saveg_read_plat_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_read_thinker_t(str)
+    let sector: i32 = saveg_read32()
+    sg_set_ptr(b, 24, GEOM_sector(sector))
+    sg_set_i32(b, 32, saveg_read32())
+    sg_set_i32(b, 36, saveg_read32())
+    sg_set_i32(b, 40, saveg_read32())
+    sg_set_i32(b, 44, saveg_read32())
+    sg_set_i32(b, 48, saveg_read32())
+    sg_set_i32(b, 52, saveg_read32())
+    sg_set_i32(b, 56, saveg_read32())
+    sg_set_i32(b, 60, saveg_read32())
+    sg_set_i32(b, 64, saveg_read32())
+    sg_set_i32(b, 68, saveg_read32())
+}
+
+function saveg_write_plat_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_write_thinker_t(str)
+    saveg_write32(GEOM_sector_index(sg_ptr(b, 24)))
+    saveg_write32(sg_i32(b, 32))
+    saveg_write32(sg_i32(b, 36))
+    saveg_write32(sg_i32(b, 40))
+    saveg_write32(sg_i32(b, 44))
+    saveg_write32(sg_i32(b, 48))
+    saveg_write32(sg_i32(b, 52))
+    saveg_write32(sg_i32(b, 56))
+    saveg_write32(sg_i32(b, 60))
+    saveg_write32(sg_i32(b, 64))
+    saveg_write32(sg_i32(b, 68))
+}
+
+function saveg_read_lightflash_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_read_thinker_t(str)
+    let sector: i32 = saveg_read32()
+    sg_set_ptr(b, 24, GEOM_sector(sector))
+    sg_set_i32(b, 32, saveg_read32())
+    sg_set_i32(b, 36, saveg_read32())
+    sg_set_i32(b, 40, saveg_read32())
+    sg_set_i32(b, 44, saveg_read32())
+    sg_set_i32(b, 48, saveg_read32())
+}
+
+function saveg_write_lightflash_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_write_thinker_t(str)
+    saveg_write32(GEOM_sector_index(sg_ptr(b, 24)))
+    saveg_write32(sg_i32(b, 32))
+    saveg_write32(sg_i32(b, 36))
+    saveg_write32(sg_i32(b, 40))
+    saveg_write32(sg_i32(b, 44))
+    saveg_write32(sg_i32(b, 48))
+}
+
+function saveg_read_strobe_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_read_thinker_t(str)
+    let sector: i32 = saveg_read32()
+    sg_set_ptr(b, 24, GEOM_sector(sector))
+    sg_set_i32(b, 32, saveg_read32())
+    sg_set_i32(b, 36, saveg_read32())
+    sg_set_i32(b, 40, saveg_read32())
+    sg_set_i32(b, 44, saveg_read32())
+    sg_set_i32(b, 48, saveg_read32())
+}
+
+function saveg_write_strobe_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_write_thinker_t(str)
+    saveg_write32(GEOM_sector_index(sg_ptr(b, 24)))
+    saveg_write32(sg_i32(b, 32))
+    saveg_write32(sg_i32(b, 36))
+    saveg_write32(sg_i32(b, 40))
+    saveg_write32(sg_i32(b, 44))
+    saveg_write32(sg_i32(b, 48))
+}
+
+function saveg_read_glow_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_read_thinker_t(str)
+    let sector: i32 = saveg_read32()
+    sg_set_ptr(b, 24, GEOM_sector(sector))
+    sg_set_i32(b, 32, saveg_read32())
+    sg_set_i32(b, 36, saveg_read32())
+    sg_set_i32(b, 40, saveg_read32())
+}
+
+function saveg_write_glow_t(str: ptr<void>) -> void {
+    let b: i64 = sg_base(str)
+    saveg_write_thinker_t(str)
+    saveg_write32(GEOM_sector_index(sg_ptr(b, 24)))
+    saveg_write32(sg_i32(b, 32))
+    saveg_write32(sg_i32(b, 36))
+    saveg_write32(sg_i32(b, 40))
+}
+
+# ---- public ABI -------------------------------------------------------
+
+@flow_api
+function P_TempSaveGameFile() -> string {
+    return savegshim_temp_savegame_file()
+}
+
+@flow_api
+function P_SaveGameFile(slot: i32) -> string {
+    return savegshim_savegame_file(slot)
+}
+
+@flow_api
+function P_WriteSaveGameHeader(description: string) -> void {
+    let desc: ptr<u8> = description as ptr<u8>
+    let mut i: i32 = 0
+    while desc[i] as i32 != 0 {
+        saveg_write8(desc[i])
+        i = i + 1
+    }
+    while i < SAVEG_SAVESTRINGSIZE {
+        saveg_write8(0 as u8)
+        i = i + 1
+    }
+
+    let name: ptr<u8> = malloc(SAVEG_VERSIONSIZE as i64) as ptr<u8>
+    savegshim_fill_version_string(name, SAVEG_VERSIONSIZE)
+    for j in 0 to SAVEG_VERSIONSIZE {
+        saveg_write8(name[j])
+    }
+    free(name as ptr<void>)
+
+    saveg_write8(STAT_gameskill() as u8)
+    saveg_write8(STAT_gameepisode() as u8)
+    saveg_write8(STAT_gamemap() as u8)
+
+    for k in 0 to SAVEG_MAXPLAYERS {
+        saveg_write8(STAT_playeringame(k) as u8)
+    }
+
+    let lt: i32 = STAT_leveltime()
+    saveg_write8(((lt >> 16) & 255) as u8)
+    saveg_write8(((lt >> 8) & 255) as u8)
+    saveg_write8((lt & 255) as u8)
+}
+
+@flow_api
+function P_ReadSaveGameHeader() -> i32 {
+    for _i in 0 to SAVEG_SAVESTRINGSIZE {
+        let _b: u8 = saveg_read8()
+    }
+
+    let read_vcheck: ptr<u8> = malloc(SAVEG_VERSIONSIZE as i64) as ptr<u8>
+    for i in 0 to SAVEG_VERSIONSIZE {
+        read_vcheck[i] = saveg_read8()
+    }
+
+    let vcheck: ptr<u8> = malloc(SAVEG_VERSIONSIZE as i64) as ptr<u8>
+    savegshim_fill_version_string(vcheck, SAVEG_VERSIONSIZE)
+    if strcmp(read_vcheck as string, vcheck as string) != 0 {
+        free(read_vcheck as ptr<void>)
+        free(vcheck as ptr<void>)
+        return 0
+    }
+    free(read_vcheck as ptr<void>)
+    free(vcheck as ptr<void>)
+
+    STAT_set_gameskill(saveg_read8() as i32)
+    STAT_set_gameepisode(saveg_read8() as i32)
+    STAT_set_gamemap(saveg_read8() as i32)
+
+    for i in 0 to SAVEG_MAXPLAYERS {
+        STAT_set_playeringame(i, saveg_read8() as i32)
+    }
+
+    let a: i32 = saveg_read8() as i32
+    let b: i32 = saveg_read8() as i32
+    let c: i32 = saveg_read8() as i32
+    STAT_set_leveltime((a << 16) + (b << 8) + c)
+    return 1
+}
+
+@flow_api
+function P_ReadSaveGameEOF() -> i32 {
+    let value: i32 = saveg_read8() as i32
+    if value == SAVEG_EOF {
+        return 1
+    }
+    return 0
+}
+
+@flow_api
+function P_WriteSaveGameEOF() -> void {
+    saveg_write8(SAVEG_EOF as u8)
+}
+
+@flow_api
+function P_ArchivePlayers() -> void {
+    for i in 0 to SAVEG_MAXPLAYERS {
+        if STAT_playeringame(i) != 0 {
+            saveg_write_pad()
+            saveg_write_player_t(PLAYER_at(i))
+        }
+    }
+}
+
+@flow_api
+function P_UnArchivePlayers() -> void {
+    for i in 0 to SAVEG_MAXPLAYERS {
+        if STAT_playeringame(i) != 0 {
+            saveg_read_pad()
+            let pl: ptr<void> = PLAYER_at(i)
+            saveg_read_player_t(pl)
+            let b: i64 = sg_base(pl)
+            sg_set_ptr(b, 0, null)
+            sg_set_ptr(b, 232, null)
+            sg_set_ptr(b, 248, null)
+        }
+    }
+}
+
+@flow_api
+function P_ArchiveWorld() -> void {
+    let nsec: i32 = GEOM_numsectors()
+    for i in 0 to nsec {
+        let sec: i64 = sg_base(GEOM_sector(i))
+        saveg_write16(sg_i32(sec, 0) >> SAVEG_FRACBITS)
+        saveg_write16(sg_i32(sec, 4) >> SAVEG_FRACBITS)
+        saveg_write16(sg_i16(sec, 8))
+        saveg_write16(sg_i16(sec, 10))
+        saveg_write16(sg_i16(sec, 12))
+        saveg_write16(sg_i16(sec, 14))
+        saveg_write16(sg_i16(sec, 16))
+    }
+
+    let nlines: i32 = GEOM_numlines()
+    for i in 0 to nlines {
+        let li: i64 = sg_base(GEOM_line(i))
+        saveg_write16(sg_i16(li, 24))
+        saveg_write16(sg_i16(li, 26))
+        saveg_write16(sg_i16(li, 28))
+        for j in 0 to 2 {
+            let sidenum: i32 = sg_i16(li, 30 + j * 2)
+            if sidenum != 0 - 1 {
+                let si: i64 = sg_base(GEOM_side(sidenum))
+                saveg_write16(sg_i32(si, 0) >> SAVEG_FRACBITS)
+                saveg_write16(sg_i32(si, 4) >> SAVEG_FRACBITS)
+                saveg_write16(sg_i16(si, 8))
+                saveg_write16(sg_i16(si, 10))
+                saveg_write16(sg_i16(si, 12))
+            }
+        }
+    }
+}
+
+@flow_api
+function P_UnArchiveWorld() -> void {
+    let nsec: i32 = GEOM_numsectors()
+    for i in 0 to nsec {
+        let sec: i64 = sg_base(GEOM_sector(i))
+        sg_set_i32(sec, 0, saveg_read16() << SAVEG_FRACBITS)
+        sg_set_i32(sec, 4, saveg_read16() << SAVEG_FRACBITS)
+        sg_set_i16(sec, 8, saveg_read16())
+        sg_set_i16(sec, 10, saveg_read16())
+        sg_set_i16(sec, 12, saveg_read16())
+        sg_set_i16(sec, 14, saveg_read16())
+        sg_set_i16(sec, 16, saveg_read16())
+        sg_set_ptr(sec, 104, null)
+        sg_set_ptr(sec, 24, null)
+    }
+
+    let nlines: i32 = GEOM_numlines()
+    for i in 0 to nlines {
+        let li: i64 = sg_base(GEOM_line(i))
+        sg_set_i16(li, 24, saveg_read16())
+        sg_set_i16(li, 26, saveg_read16())
+        sg_set_i16(li, 28, saveg_read16())
+        for j in 0 to 2 {
+            let sidenum: i32 = sg_i16(li, 30 + j * 2)
+            if sidenum != 0 - 1 {
+                let si: i64 = sg_base(GEOM_side(sidenum))
+                sg_set_i32(si, 0, saveg_read16() << SAVEG_FRACBITS)
+                sg_set_i32(si, 4, saveg_read16() << SAVEG_FRACBITS)
+                sg_set_i16(si, 8, saveg_read16())
+                sg_set_i16(si, 10, saveg_read16())
+                sg_set_i16(si, 12, saveg_read16())
+            }
+        }
+    }
+}
+
+@flow_api
+function P_ArchiveThinkers() -> void {
+    let cap: ptr<void> = THINKER_cap()
+    let mut th: ptr<void> = THINKER_next(cap)
+    while (th as i64) != (cap as i64) {
+        if THINKER_is_mobj(th) != 0 {
+            saveg_write8(SAVEG_TC_MOBJ as u8)
+            saveg_write_pad()
+            saveg_write_mobj_t(th)
+        }
+        th = THINKER_next(th)
+    }
+    saveg_write8(SAVEG_TC_END as u8)
+}
+
+@flow_api
+function P_UnArchiveThinkers() -> void {
+    let cap: ptr<void> = THINKER_cap()
+    let mut currentthinker: ptr<void> = THINKER_next(cap)
+    while (currentthinker as i64) != (cap as i64) {
+        let next: ptr<void> = THINKER_next(currentthinker)
+        if THINKER_is_mobj(currentthinker) != 0 {
+            P_RemoveMobj(currentthinker)
+        } else {
+            Z_Free(currentthinker)
+        }
+        currentthinker = next
+    }
+    P_InitThinkers()
+
+    while 1 == 1 {
+        let tclass: i32 = saveg_read8() as i32
+        if tclass == SAVEG_TC_END {
+            return
+        } elif tclass == SAVEG_TC_MOBJ {
+            saveg_read_pad()
+            let mobj: ptr<void> = Z_Malloc(SAVEG_SIZEOF_MOBJ, SAVEG_PU_LEVEL, null)
+            saveg_read_mobj_t(mobj)
+            let mb: i64 = sg_base(mobj)
+            sg_set_ptr(mb, 176, null)
+            sg_set_ptr(mb, 216, null)
+            P_SetThingPosition(mobj)
+            sg_set_ptr(mb, 136, INFO_mobjinfo_at(sg_i32(mb, 128)))
+            let sec: ptr<void> = GEOM_subsector_sector(MOBJ_subsector(mobj))
+            MOBJ_set_floorz(mobj, GEOM_sector_floorheight(sec))
+            MOBJ_set_ceilingz(mobj, GEOM_sector_ceilingheight(sec))
+            THINKER_set_mobj(mobj)
+            P_AddThinker(mobj)
+        } else {
+            savegshim_error_unknown_tclass(tclass)
+        }
+    }
+}
+
+@flow_api
+function P_ArchiveSpecials() -> void {
+    let cap: ptr<void> = THINKER_cap()
+    let mut th: ptr<void> = THINKER_next(cap)
+    while (th as i64) != (cap as i64) {
+        if THINKER_is_null(th) != 0 {
+            let idx: i32 = P_ActiveCeilingIndex(th)
+            if idx >= 0 {
+                saveg_write8(SAVEG_TC_CEILING as u8)
+                saveg_write_pad()
+                saveg_write_ceiling_t(th)
+            }
+        } elif THINKER_is_move_ceiling(th) != 0 {
+            saveg_write8(SAVEG_TC_CEILING as u8)
+            saveg_write_pad()
+            saveg_write_ceiling_t(th)
+        } elif THINKER_is_vertical_door(th) != 0 {
+            saveg_write8(SAVEG_TC_DOOR as u8)
+            saveg_write_pad()
+            saveg_write_vldoor_t(th)
+        } elif THINKER_is_move_floor(th) != 0 {
+            saveg_write8(SAVEG_TC_FLOOR as u8)
+            saveg_write_pad()
+            saveg_write_floormove_t(th)
+        } elif THINKER_is_plat_raise(th) != 0 {
+            saveg_write8(SAVEG_TC_PLAT as u8)
+            saveg_write_pad()
+            saveg_write_plat_t(th)
+        } elif THINKER_is_light_flash(th) != 0 {
+            saveg_write8(SAVEG_TC_FLASH as u8)
+            saveg_write_pad()
+            saveg_write_lightflash_t(th)
+        } elif THINKER_is_strobe_flash(th) != 0 {
+            saveg_write8(SAVEG_TC_STROBE as u8)
+            saveg_write_pad()
+            saveg_write_strobe_t(th)
+        } elif THINKER_is_glow(th) != 0 {
+            saveg_write8(SAVEG_TC_GLOW as u8)
+            saveg_write_pad()
+            saveg_write_glow_t(th)
+        }
+        th = THINKER_next(th)
+    }
+    saveg_write8(SAVEG_TC_ENDSPECIALS as u8)
+}
+
+@flow_api
+function P_UnArchiveSpecials() -> void {
+    while 1 == 1 {
+        let tclass: i32 = saveg_read8() as i32
+        if tclass == SAVEG_TC_ENDSPECIALS {
+            return
+        } elif tclass == SAVEG_TC_CEILING {
+            saveg_read_pad()
+            let ceiling: ptr<void> = Z_Malloc(SAVEG_SIZEOF_CEILING, SAVEG_PU_LEVEL, null)
+            saveg_read_ceiling_t(ceiling)
+            let cb: i64 = sg_base(ceiling)
+            let sec: ptr<void> = sg_ptr(cb, 32)
+            sg_set_ptr(sg_base(sec), 104, ceiling)
+            if (THINKER_acp1(ceiling) as i64) != 0 {
+                THINKER_set_move_ceiling(ceiling)
+            }
+            P_AddThinker(ceiling)
+            P_AddActiveCeiling(ceiling)
+        } elif tclass == SAVEG_TC_DOOR {
+            saveg_read_pad()
+            let door: ptr<void> = Z_Malloc(SAVEG_SIZEOF_VLDOOR, SAVEG_PU_LEVEL, null)
+            saveg_read_vldoor_t(door)
+            let db: i64 = sg_base(door)
+            sg_set_ptr(sg_base(sg_ptr(db, 32)), 104, door)
+            THINKER_set_vertical_door(door)
+            P_AddThinker(door)
+        } elif tclass == SAVEG_TC_FLOOR {
+            saveg_read_pad()
+            let floor: ptr<void> = Z_Malloc(SAVEG_SIZEOF_FLOORMOVE, SAVEG_PU_LEVEL, null)
+            saveg_read_floormove_t(floor)
+            let fb: i64 = sg_base(floor)
+            sg_set_ptr(sg_base(sg_ptr(fb, 32)), 104, floor)
+            THINKER_set_move_floor(floor)
+            P_AddThinker(floor)
+        } elif tclass == SAVEG_TC_PLAT {
+            saveg_read_pad()
+            let plat: ptr<void> = Z_Malloc(SAVEG_SIZEOF_PLAT, SAVEG_PU_LEVEL, null)
+            saveg_read_plat_t(plat)
+            let pb: i64 = sg_base(plat)
+            sg_set_ptr(sg_base(sg_ptr(pb, 24)), 104, plat)
+            if (THINKER_acp1(plat) as i64) != 0 {
+                THINKER_set_plat_raise(plat)
+            }
+            P_AddThinker(plat)
+            P_AddActivePlat(plat)
+        } elif tclass == SAVEG_TC_FLASH {
+            saveg_read_pad()
+            let flash: ptr<void> = Z_Malloc(SAVEG_SIZEOF_LIGHTFLASH, SAVEG_PU_LEVEL, null)
+            saveg_read_lightflash_t(flash)
+            THINKER_set_light_flash(flash)
+            P_AddThinker(flash)
+        } elif tclass == SAVEG_TC_STROBE {
+            saveg_read_pad()
+            let strobe: ptr<void> = Z_Malloc(SAVEG_SIZEOF_STROBE, SAVEG_PU_LEVEL, null)
+            saveg_read_strobe_t(strobe)
+            THINKER_set_strobe_flash(strobe)
+            P_AddThinker(strobe)
+        } elif tclass == SAVEG_TC_GLOW {
+            saveg_read_pad()
+            let glow: ptr<void> = Z_Malloc(SAVEG_SIZEOF_GLOW, SAVEG_PU_LEVEL, null)
+            saveg_read_glow_t(glow)
+            THINKER_set_glow(glow)
+            P_AddThinker(glow)
+        } else {
+            savegshim_error_unknown_special_tclass(tclass)
+        }
+    }
+}

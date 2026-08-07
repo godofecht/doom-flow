@@ -1,0 +1,42 @@
+# WAD command-line loading, ported from w_main.c to Flow.
+#
+# FEATURE_WAD_MERGE is #undef in doomfeatures.h, so the -merge / -nwtmerge
+# / -af / -as / -aa branches are dead. Only the vanilla -file PWAD path
+# remains. myargc/myargv live in argv.flow; this module reads them
+# through argvflow_* like argv.flow.
+
+extern { function printf(fmt: string, s: string) -> i32 }
+
+extern { function M_CheckParmWithArgs(check: string, num_args: i32) -> i32 }
+extern { function W_AddFile(filename: string) -> ptr<void> }
+extern { function D_TryFindWADByName(filename: string) -> string }
+
+# argv.flow accessors for myargc/myargv.
+extern { function argvflow_argc() -> i32 }
+extern { function argvflow_argv() -> ptr<i64> }
+
+function wm_argv_at(i: i32) -> ptr<u8> {
+    let words: ptr<i64> = argvflow_argv()
+    return words[i] as ptr<u8>
+}
+
+# boolean in doomtype.h is a C int (0 / 1).
+@flow_api
+function W_ParseCommandLine() -> i32 {
+    let mut modifiedgame: i32 = 0
+
+    # -file <files>: load PWAD files until the next '-' argument.
+    let mut p: i32 = M_CheckParmWithArgs("-file", 1)
+    if p != 0 {
+        modifiedgame = 1
+        p = p + 1
+        while p != argvflow_argc() and wm_argv_at(p)[0] as i32 != 45 {
+            let filename: string = D_TryFindWADByName(wm_argv_at(p) as string)
+            printf(" adding %s\n", filename)
+            W_AddFile(filename)
+            p = p + 1
+        }
+    }
+
+    return modifiedgame
+}

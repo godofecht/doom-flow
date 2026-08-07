@@ -1,0 +1,282 @@
+# SHA-1 digest, ported from sha1.c to Flow.
+#
+# Callers (w_checksum, and anything that includes sha1.h) pass a
+# sha1_context_t by pointer, so the layout must match sha1.h on LP64:
+#
+#   offset  size  field
+#   0       4     h0
+#   4       4     h1
+#   8       4     h2
+#   12      4     h3
+#   16      4     h4
+#   20      4     nblocks
+#   24     64     buf
+#   88      4     count
+#                 sizeof = 92
+#
+# Transform is the standard 80-round SHA-1; the C source unrolls it with
+# macros, this version loops with identical F/K/rol and message schedule.
+
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+extern { function memset(dest: ptr<void>, c: i32, n: i64) -> ptr<void> }
+extern { function strlen(s: string) -> i64 }
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+
+const SHA1_SIZEOF_CTX: i32 = 92
+
+# Scratch for SHA1_UpdateInt32; Flow cannot take the address of a local array.
+let mut sha1_intbuf: ptr<u8> = null
+
+# ---- sha1_context_t field access --------------------------------------
+
+function sha1_h(hd: ptr<u8>, i: i32) -> u32 {
+    let p: ptr<u32> = hd as ptr<u32>
+    return p[i]
+}
+
+function sha1_set_h(hd: ptr<u8>, i: i32, v: u32) -> void {
+    let p: ptr<u32> = hd as ptr<u32>
+    p[i] = v
+}
+
+function sha1_nblocks(hd: ptr<u8>) -> u32 {
+    let p: ptr<u32> = hd as ptr<u32>
+    return p[5]
+}
+
+function sha1_set_nblocks(hd: ptr<u8>, v: u32) -> void {
+    let p: ptr<u32> = hd as ptr<u32>
+    p[5] = v
+}
+
+function sha1_buf(hd: ptr<u8>) -> ptr<u8> {
+    return ((hd as i64) + 24) as ptr<u8>
+}
+
+function sha1_count(hd: ptr<u8>) -> i32 {
+    let p: ptr<i32> = ((hd as i64) + 88) as ptr<i32>
+    return p[0]
+}
+
+function sha1_set_count(hd: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((hd as i64) + 88) as ptr<i32>
+    p[0] = v
+}
+
+function sha1_rol(x: u32, n: i32) -> u32 {
+    return (x << n) | (x >> (32 - n))
+}
+
+function sha1_f(t: i32, b: u32, c: u32, d: u32) -> u32 {
+    if t < 20 {
+        return d ^ (b & (c ^ d))
+    } elif t < 40 {
+        return b ^ c ^ d
+    } elif t < 60 {
+        return (b & c) | (d & (b | c))
+    }
+    return b ^ c ^ d
+}
+
+function sha1_k(t: i32) -> u32 {
+    if t < 20 {
+        return 1518500249 as u32   # 0x5A827999
+    } elif t < 40 {
+        return 1859775393 as u32   # 0x6ED9EBA1
+    } elif t < 60 {
+        return 2400959708 as u32   # 0x8F1BBCDC
+    }
+    return 3395469782 as u32       # 0xCA62C1D6
+}
+
+# Transform one 64-byte block. Little-endian host: load words big-endian
+# from the wire bytes, same as the #else branch in sha1.c.
+function sha1_Transform(hd: ptr<u8>, data: ptr<u8>) -> void {
+    let mut x: array<u32, 16> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    for i in 0 to 16 {
+        let off: i32 = i * 4
+        x[i] = ((data[off] as u32) << 24)
+            | ((data[off + 1] as u32) << 16)
+            | ((data[off + 2] as u32) << 8)
+            | (data[off + 3] as u32)
+    }
+
+    let mut a: u32 = sha1_h(hd, 0)
+    let mut b: u32 = sha1_h(hd, 1)
+    let mut c: u32 = sha1_h(hd, 2)
+    let mut d: u32 = sha1_h(hd, 3)
+    let mut e: u32 = sha1_h(hd, 4)
+
+    for t in 0 to 80 {
+        let mut m: u32 = 0
+        if t < 16 {
+            m = x[t]
+        } else {
+            let tm: u32 = x[t & 15]
+                ^ x[(t - 14) & 15]
+                ^ x[(t - 8) & 15]
+                ^ x[(t - 3) & 15]
+            m = sha1_rol(tm, 1)
+            x[t & 15] = m
+        }
+
+        let temp: u32 = sha1_rol(a, 5) + sha1_f(t, b, c, d) + e + sha1_k(t) + m
+        e = d
+        d = c
+        c = sha1_rol(b, 30)
+        b = a
+        a = temp
+    }
+
+    sha1_set_h(hd, 0, sha1_h(hd, 0) + a)
+    sha1_set_h(hd, 1, sha1_h(hd, 1) + b)
+    sha1_set_h(hd, 2, sha1_h(hd, 2) + c)
+    sha1_set_h(hd, 3, sha1_h(hd, 3) + d)
+    sha1_set_h(hd, 4, sha1_h(hd, 4) + e)
+}
+
+# Flush a full buffer (count == 64). Separated out of SHA1_Update so the
+# recursive "flush" call in the C source becomes a straight call.
+function sha1_flush(hd: ptr<u8>) -> void {
+    if sha1_count(hd) == 64 {
+        sha1_Transform(hd, sha1_buf(hd))
+        sha1_set_count(hd, 0)
+        sha1_set_nblocks(hd, sha1_nblocks(hd) + (1 as u32))
+    }
+}
+
+@flow_api
+function SHA1_Init(hd: ptr<u8>) -> void {
+    sha1_set_h(hd, 0, 1732584193 as u32)       # 0x67452301
+    sha1_set_h(hd, 1, 4023233417 as u32)       # 0xefcdab89
+    sha1_set_h(hd, 2, 2562383102 as u32)       # 0x98badcfe
+    sha1_set_h(hd, 3, 271733878 as u32)        # 0x10325476
+    sha1_set_h(hd, 4, 3285377520 as u32)       # 0xc3d2e1f0
+    sha1_set_nblocks(hd, 0 as u32)
+    sha1_set_count(hd, 0)
+}
+
+@flow_api
+function SHA1_Update(hd: ptr<u8>, inbuf: ptr<u8>, inlen: i64) -> void {
+    let mut len: i64 = inlen
+    let mut buf: ptr<u8> = inbuf
+
+    sha1_flush(hd)
+    if (buf as i64) == 0 {
+        return
+    }
+
+    if sha1_count(hd) != 0 {
+        while len > 0 and sha1_count(hd) < 64 {
+            let b: ptr<u8> = sha1_buf(hd)
+            let c: i32 = sha1_count(hd)
+            b[c] = buf[0]
+            sha1_set_count(hd, c + 1)
+            buf = ((buf as i64) + 1) as ptr<u8>
+            len = len - 1
+        }
+        sha1_flush(hd)
+        if len == 0 {
+            return
+        }
+    }
+
+    while len >= 64 {
+        sha1_Transform(hd, buf)
+        sha1_set_count(hd, 0)
+        sha1_set_nblocks(hd, sha1_nblocks(hd) + (1 as u32))
+        len = len - 64
+        buf = ((buf as i64) + 64) as ptr<u8>
+    }
+
+    while len > 0 and sha1_count(hd) < 64 {
+        let b2: ptr<u8> = sha1_buf(hd)
+        let c2: i32 = sha1_count(hd)
+        b2[c2] = buf[0]
+        sha1_set_count(hd, c2 + 1)
+        buf = ((buf as i64) + 1) as ptr<u8>
+        len = len - 1
+    }
+}
+
+@flow_api
+function SHA1_Final(digest: ptr<u8>, hd: ptr<u8>) -> void {
+    SHA1_Update(hd, null, 0)
+
+    let mut t: u32 = sha1_nblocks(hd)
+    # multiply by 64 to make a byte count
+    let mut lsb: u32 = t << 6
+    let mut msb: u32 = t >> 26
+    # add the count
+    t = lsb
+    lsb = lsb + (sha1_count(hd) as u32)
+    if lsb < t {
+        msb = msb + (1 as u32)
+    }
+    # multiply by 8 to make a bit count
+    t = lsb
+    lsb = lsb << 3
+    msb = msb << 3
+    msb = msb | (t >> 29)
+
+    let b: ptr<u8> = sha1_buf(hd)
+    if sha1_count(hd) < 56 {
+        let c: i32 = sha1_count(hd)
+        b[c] = 0x80 as u8
+        sha1_set_count(hd, c + 1)
+        while sha1_count(hd) < 56 {
+            let c2: i32 = sha1_count(hd)
+            b[c2] = 0 as u8
+            sha1_set_count(hd, c2 + 1)
+        }
+    } else {
+        let c3: i32 = sha1_count(hd)
+        b[c3] = 0x80 as u8
+        sha1_set_count(hd, c3 + 1)
+        while sha1_count(hd) < 64 {
+            let c4: i32 = sha1_count(hd)
+            b[c4] = 0 as u8
+            sha1_set_count(hd, c4 + 1)
+        }
+        SHA1_Update(hd, null, 0)
+        memset(b as ptr<void>, 0, 56)
+    }
+
+    b[56] = (msb >> 24) as u8
+    b[57] = (msb >> 16) as u8
+    b[58] = (msb >> 8) as u8
+    b[59] = msb as u8
+    b[60] = (lsb >> 24) as u8
+    b[61] = (lsb >> 16) as u8
+    b[62] = (lsb >> 8) as u8
+    b[63] = lsb as u8
+    sha1_Transform(hd, b)
+
+    # Write digest big-endian into buf, then copy out (LE host path).
+    for hi in 0 to 5 {
+        let v: u32 = sha1_h(hd, hi)
+        let p: i32 = hi * 4
+        b[p] = (v >> 24) as u8
+        b[p + 1] = (v >> 16) as u8
+        b[p + 2] = (v >> 8) as u8
+        b[p + 3] = v as u8
+    }
+    memcpy(digest as ptr<void>, b as ptr<void>, 20)
+}
+
+@flow_api
+function SHA1_UpdateInt32(context: ptr<u8>, val: u32) -> void {
+    if (sha1_intbuf as i64) == 0 {
+        sha1_intbuf = calloc(4, 1) as ptr<u8>
+    }
+    sha1_intbuf[0] = ((val >> 24) & (255 as u32)) as u8
+    sha1_intbuf[1] = ((val >> 16) & (255 as u32)) as u8
+    sha1_intbuf[2] = ((val >> 8) & (255 as u32)) as u8
+    sha1_intbuf[3] = (val & (255 as u32)) as u8
+    SHA1_Update(context, sha1_intbuf, 4)
+}
+
+@flow_api
+function SHA1_UpdateString(context: ptr<u8>, str: ptr<u8>) -> void {
+    SHA1_Update(context, str, strlen(str as string) + 1)
+}

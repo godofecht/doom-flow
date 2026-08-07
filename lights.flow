@@ -1,0 +1,497 @@
+# Sector lighting effects, ported from p_lights.c to Flow.
+#
+# Thinker structs (fireflicker_t, lightflash_t, strobe_t, glow_t) are
+# allocated here with Z_Malloc and accessed by explicit LP64 offsets
+# measured against p_spec.h. Engine sector_t / line_t fields and the
+# sectors[] / sector fields go through GEOM_sector_* (setup.flow).
+#
+# Layouts (offsetof / sizeof on LP64):
+#
+#   thinker_t: prev=0 next=8 function=16  SIZEOF=24
+#
+#   fireflicker_t: thinker=0 sector=24 count=32 maxlight=36
+#                  minlight=40  SIZEOF=48
+#   lightflash_t:  thinker=0 sector=24 count=32 maxlight=36
+#                  minlight=40 maxtime=44 mintime=48  SIZEOF=56
+#   strobe_t:      thinker=0 sector=24 count=32 minlight=36
+#                  maxlight=40 darktime=44 brighttime=48  SIZEOF=56
+#   glow_t:        thinker=0 sector=24 minlight=32 maxlight=36
+#                  direction=40  SIZEOF=48
+
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function P_Random() -> i32 }
+extern { function P_AddThinker(thinker: ptr<void>) -> void }
+extern { function P_FindMinSurroundingLight(sector: ptr<void>, max: i32) -> i32 }
+extern { function P_FindSectorFromLineTag(line: ptr<void>, start: i32) -> i32 }
+extern { function getNextSector(line: ptr<void>, sec: ptr<void>) -> ptr<void> }
+
+extern { function GEOM_numsectors() -> i32 }
+extern { function GEOM_sector(i: i32) -> ptr<void> }
+extern { function GEOM_sector_lightlevel(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_set_lightlevel(s: ptr<void>, v: i32) -> void }
+extern { function GEOM_sector_set_special(s: ptr<void>, v: i32) -> void }
+extern { function GEOM_sector_tag(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_linecount(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_line(s: ptr<void>, i: i32) -> ptr<void> }
+extern { function GEOM_sector_specialdata(s: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_tag(ld: ptr<void>) -> i32 }
+
+# Constants from p_spec.h / z_zone.h.
+const LIGHT_GLOWSPEED: i32 = 8
+const LIGHT_STROBEBRIGHT: i32 = 5
+const LIGHT_FASTDARK: i32 = 15
+const LIGHT_SLOWDARK: i32 = 35
+const LIGHT_PU_LEVSPEC: i32 = 6
+
+const LIGHT_SIZEOF_FIREFLICKER: i32 = 48
+const LIGHT_SIZEOF_LIGHTFLASH: i32 = 56
+const LIGHT_SIZEOF_STROBE: i32 = 56
+const LIGHT_SIZEOF_GLOW: i32 = 48
+
+# ---- thinker.function.acp1 at offset 16 --------------------------------
+
+function light_set_acp1(obj: i64, fn: i64) -> void {
+    let p: ptr<i64> = (obj + 16) as ptr<i64>
+    p[0] = fn
+}
+
+# ---- fireflicker_t ----------------------------------------------------
+
+function ff_sector(f: i64) -> ptr<void> {
+    let p: ptr<i64> = (f + 24) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+function ff_set_sector(f: i64, s: ptr<void>) -> void {
+    let p: ptr<i64> = (f + 24) as ptr<i64>
+    p[0] = s as i64
+}
+
+function ff_count(f: i64) -> i32 {
+    let p: ptr<i32> = (f + 32) as ptr<i32>
+    return p[0]
+}
+
+function ff_set_count(f: i64, v: i32) -> void {
+    let p: ptr<i32> = (f + 32) as ptr<i32>
+    p[0] = v
+}
+
+function ff_maxlight(f: i64) -> i32 {
+    let p: ptr<i32> = (f + 36) as ptr<i32>
+    return p[0]
+}
+
+function ff_set_maxlight(f: i64, v: i32) -> void {
+    let p: ptr<i32> = (f + 36) as ptr<i32>
+    p[0] = v
+}
+
+function ff_minlight(f: i64) -> i32 {
+    let p: ptr<i32> = (f + 40) as ptr<i32>
+    return p[0]
+}
+
+function ff_set_minlight(f: i64, v: i32) -> void {
+    let p: ptr<i32> = (f + 40) as ptr<i32>
+    p[0] = v
+}
+
+# ---- lightflash_t -----------------------------------------------------
+
+function lf_sector(f: i64) -> ptr<void> {
+    let p: ptr<i64> = (f + 24) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+function lf_set_sector(f: i64, s: ptr<void>) -> void {
+    let p: ptr<i64> = (f + 24) as ptr<i64>
+    p[0] = s as i64
+}
+
+function lf_count(f: i64) -> i32 {
+    let p: ptr<i32> = (f + 32) as ptr<i32>
+    return p[0]
+}
+
+function lf_set_count(f: i64, v: i32) -> void {
+    let p: ptr<i32> = (f + 32) as ptr<i32>
+    p[0] = v
+}
+
+function lf_maxlight(f: i64) -> i32 {
+    let p: ptr<i32> = (f + 36) as ptr<i32>
+    return p[0]
+}
+
+function lf_set_maxlight(f: i64, v: i32) -> void {
+    let p: ptr<i32> = (f + 36) as ptr<i32>
+    p[0] = v
+}
+
+function lf_minlight(f: i64) -> i32 {
+    let p: ptr<i32> = (f + 40) as ptr<i32>
+    return p[0]
+}
+
+function lf_set_minlight(f: i64, v: i32) -> void {
+    let p: ptr<i32> = (f + 40) as ptr<i32>
+    p[0] = v
+}
+
+function lf_maxtime(f: i64) -> i32 {
+    let p: ptr<i32> = (f + 44) as ptr<i32>
+    return p[0]
+}
+
+function lf_set_maxtime(f: i64, v: i32) -> void {
+    let p: ptr<i32> = (f + 44) as ptr<i32>
+    p[0] = v
+}
+
+function lf_mintime(f: i64) -> i32 {
+    let p: ptr<i32> = (f + 48) as ptr<i32>
+    return p[0]
+}
+
+function lf_set_mintime(f: i64, v: i32) -> void {
+    let p: ptr<i32> = (f + 48) as ptr<i32>
+    p[0] = v
+}
+
+# ---- strobe_t ---------------------------------------------------------
+
+function st_sector(f: i64) -> ptr<void> {
+    let p: ptr<i64> = (f + 24) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+function st_set_sector(f: i64, s: ptr<void>) -> void {
+    let p: ptr<i64> = (f + 24) as ptr<i64>
+    p[0] = s as i64
+}
+
+function st_count(f: i64) -> i32 {
+    let p: ptr<i32> = (f + 32) as ptr<i32>
+    return p[0]
+}
+
+function st_set_count(f: i64, v: i32) -> void {
+    let p: ptr<i32> = (f + 32) as ptr<i32>
+    p[0] = v
+}
+
+function st_minlight(f: i64) -> i32 {
+    let p: ptr<i32> = (f + 36) as ptr<i32>
+    return p[0]
+}
+
+function st_set_minlight(f: i64, v: i32) -> void {
+    let p: ptr<i32> = (f + 36) as ptr<i32>
+    p[0] = v
+}
+
+function st_maxlight(f: i64) -> i32 {
+    let p: ptr<i32> = (f + 40) as ptr<i32>
+    return p[0]
+}
+
+function st_set_maxlight(f: i64, v: i32) -> void {
+    let p: ptr<i32> = (f + 40) as ptr<i32>
+    p[0] = v
+}
+
+function st_darktime(f: i64) -> i32 {
+    let p: ptr<i32> = (f + 44) as ptr<i32>
+    return p[0]
+}
+
+function st_set_darktime(f: i64, v: i32) -> void {
+    let p: ptr<i32> = (f + 44) as ptr<i32>
+    p[0] = v
+}
+
+function st_brighttime(f: i64) -> i32 {
+    let p: ptr<i32> = (f + 48) as ptr<i32>
+    return p[0]
+}
+
+function st_set_brighttime(f: i64, v: i32) -> void {
+    let p: ptr<i32> = (f + 48) as ptr<i32>
+    p[0] = v
+}
+
+# ---- glow_t -----------------------------------------------------------
+
+function gl_sector(g: i64) -> ptr<void> {
+    let p: ptr<i64> = (g + 24) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+function gl_set_sector(g: i64, s: ptr<void>) -> void {
+    let p: ptr<i64> = (g + 24) as ptr<i64>
+    p[0] = s as i64
+}
+
+function gl_minlight(g: i64) -> i32 {
+    let p: ptr<i32> = (g + 32) as ptr<i32>
+    return p[0]
+}
+
+function gl_set_minlight(g: i64, v: i32) -> void {
+    let p: ptr<i32> = (g + 32) as ptr<i32>
+    p[0] = v
+}
+
+function gl_maxlight(g: i64) -> i32 {
+    let p: ptr<i32> = (g + 36) as ptr<i32>
+    return p[0]
+}
+
+function gl_set_maxlight(g: i64, v: i32) -> void {
+    let p: ptr<i32> = (g + 36) as ptr<i32>
+    p[0] = v
+}
+
+function gl_direction(g: i64) -> i32 {
+    let p: ptr<i32> = (g + 40) as ptr<i32>
+    return p[0]
+}
+
+function gl_set_direction(g: i64, v: i32) -> void {
+    let p: ptr<i32> = (g + 40) as ptr<i32>
+    p[0] = v
+}
+
+# ---- thinkers / spawns ------------------------------------------------
+
+@flow_api
+function T_FireFlicker(flick: ptr<void>) -> void {
+    let f: i64 = flick as i64
+    let c: i32 = ff_count(f) - 1
+    ff_set_count(f, c)
+    if c != 0 {
+        return
+    }
+
+    let amount: i32 = (P_Random() & 3) * 16
+    let sec: ptr<void> = ff_sector(f)
+    if GEOM_sector_lightlevel(sec) - amount < ff_minlight(f) {
+        GEOM_sector_set_lightlevel(sec, ff_minlight(f))
+    } else {
+        GEOM_sector_set_lightlevel(sec, ff_maxlight(f) - amount)
+    }
+    ff_set_count(f, 4)
+}
+
+@flow_api
+function P_SpawnFireFlicker(sector: ptr<void>) -> void {
+    GEOM_sector_set_special(sector, 0)
+
+    let flick: ptr<void> = Z_Malloc(LIGHT_SIZEOF_FIREFLICKER, LIGHT_PU_LEVSPEC, 0 as ptr<void>)
+    P_AddThinker(flick)
+
+    let f: i64 = flick as i64
+    light_set_acp1(f, T_FireFlicker as i64)
+    ff_set_sector(f, sector)
+    ff_set_maxlight(f, GEOM_sector_lightlevel(sector))
+    ff_set_minlight(f, P_FindMinSurroundingLight(sector, GEOM_sector_lightlevel(sector)) + 16)
+    ff_set_count(f, 4)
+}
+
+@flow_api
+function T_LightFlash(flash: ptr<void>) -> void {
+    let f: i64 = flash as i64
+    let c: i32 = lf_count(f) - 1
+    lf_set_count(f, c)
+    if c != 0 {
+        return
+    }
+
+    let sec: ptr<void> = lf_sector(f)
+    if GEOM_sector_lightlevel(sec) == lf_maxlight(f) {
+        GEOM_sector_set_lightlevel(sec, lf_minlight(f))
+        lf_set_count(f, (P_Random() & lf_mintime(f)) + 1)
+    } else {
+        GEOM_sector_set_lightlevel(sec, lf_maxlight(f))
+        lf_set_count(f, (P_Random() & lf_maxtime(f)) + 1)
+    }
+}
+
+@flow_api
+function P_SpawnLightFlash(sector: ptr<void>) -> void {
+    GEOM_sector_set_special(sector, 0)
+
+    let flash: ptr<void> = Z_Malloc(LIGHT_SIZEOF_LIGHTFLASH, LIGHT_PU_LEVSPEC, 0 as ptr<void>)
+    P_AddThinker(flash)
+
+    let f: i64 = flash as i64
+    light_set_acp1(f, T_LightFlash as i64)
+    lf_set_sector(f, sector)
+    lf_set_maxlight(f, GEOM_sector_lightlevel(sector))
+    lf_set_minlight(f, P_FindMinSurroundingLight(sector, GEOM_sector_lightlevel(sector)))
+    lf_set_maxtime(f, 64)
+    lf_set_mintime(f, 7)
+    lf_set_count(f, (P_Random() & lf_maxtime(f)) + 1)
+}
+
+@flow_api
+function T_StrobeFlash(flash: ptr<void>) -> void {
+    let f: i64 = flash as i64
+    let c: i32 = st_count(f) - 1
+    st_set_count(f, c)
+    if c != 0 {
+        return
+    }
+
+    let sec: ptr<void> = st_sector(f)
+    if GEOM_sector_lightlevel(sec) == st_minlight(f) {
+        GEOM_sector_set_lightlevel(sec, st_maxlight(f))
+        st_set_count(f, st_brighttime(f))
+    } else {
+        GEOM_sector_set_lightlevel(sec, st_minlight(f))
+        st_set_count(f, st_darktime(f))
+    }
+}
+
+@flow_api
+function P_SpawnStrobeFlash(sector: ptr<void>, fastOrSlow: i32, inSync: i32) -> void {
+    let flash: ptr<void> = Z_Malloc(LIGHT_SIZEOF_STROBE, LIGHT_PU_LEVSPEC, 0 as ptr<void>)
+    P_AddThinker(flash)
+
+    let f: i64 = flash as i64
+    st_set_sector(f, sector)
+    st_set_darktime(f, fastOrSlow)
+    st_set_brighttime(f, LIGHT_STROBEBRIGHT)
+    light_set_acp1(f, T_StrobeFlash as i64)
+    st_set_maxlight(f, GEOM_sector_lightlevel(sector))
+    st_set_minlight(f, P_FindMinSurroundingLight(sector, GEOM_sector_lightlevel(sector)))
+
+    if st_minlight(f) == st_maxlight(f) {
+        st_set_minlight(f, 0)
+    }
+
+    GEOM_sector_set_special(sector, 0)
+
+    if inSync == 0 {
+        st_set_count(f, (P_Random() & 7) + 1)
+    } else {
+        st_set_count(f, 1)
+    }
+}
+
+@flow_api
+function EV_StartLightStrobing(line: ptr<void>) -> void {
+    let mut secnum: i32 = 0 - 1
+    let mut looping: bool = true
+    while looping {
+        secnum = P_FindSectorFromLineTag(line, secnum)
+        if secnum < 0 {
+            looping = false
+        } else {
+            let sec: ptr<void> = GEOM_sector(secnum)
+            if (GEOM_sector_specialdata(sec) as i64) == 0 {
+                P_SpawnStrobeFlash(sec, LIGHT_SLOWDARK, 0)
+            }
+        }
+    }
+}
+
+@flow_api
+function EV_TurnTagLightsOff(line: ptr<void>) -> void {
+    let ltag: i32 = GEOM_line_tag(line)
+    let n: i32 = GEOM_numsectors()
+    let mut j: i32 = 0
+    while j < n {
+        let sector: ptr<void> = GEOM_sector(j)
+        if GEOM_sector_tag(sector) == ltag {
+            let mut min: i32 = GEOM_sector_lightlevel(sector)
+            let mut i: i32 = 0
+            let lc: i32 = GEOM_sector_linecount(sector)
+            while i < lc {
+                let templine: ptr<void> = GEOM_sector_line(sector, i)
+                let tsec: ptr<void> = getNextSector(templine, sector)
+                if (tsec as i64) != 0 {
+                    if GEOM_sector_lightlevel(tsec) < min {
+                        min = GEOM_sector_lightlevel(tsec)
+                    }
+                }
+                i = i + 1
+            }
+            GEOM_sector_set_lightlevel(sector, min)
+        }
+        j = j + 1
+    }
+}
+
+@flow_api
+function EV_LightTurnOn(line: ptr<void>, bright: i32) -> void {
+    let ltag: i32 = GEOM_line_tag(line)
+    let mut bright_mut: i32 = bright
+    let n: i32 = GEOM_numsectors()
+    let mut i: i32 = 0
+    while i < n {
+        let sector: ptr<void> = GEOM_sector(i)
+        if GEOM_sector_tag(sector) == ltag {
+            # bright == 0 means search for highest surrounding light.
+            # Quirk preserved: once found, bright_mut stays non-zero for
+            # later matching sectors (vanilla Doom behaviour).
+            if bright_mut == 0 {
+                let mut j: i32 = 0
+                let lc: i32 = GEOM_sector_linecount(sector)
+                while j < lc {
+                    let templine: ptr<void> = GEOM_sector_line(sector, j)
+                    let temp: ptr<void> = getNextSector(templine, sector)
+                    if (temp as i64) != 0 {
+                        if GEOM_sector_lightlevel(temp) > bright_mut {
+                            bright_mut = GEOM_sector_lightlevel(temp)
+                        }
+                    }
+                    j = j + 1
+                }
+            }
+            GEOM_sector_set_lightlevel(sector, bright_mut)
+        }
+        i = i + 1
+    }
+}
+
+@flow_api
+function T_Glow(g: ptr<void>) -> void {
+    let gi: i64 = g as i64
+    let sec: ptr<void> = gl_sector(gi)
+    let dir: i32 = gl_direction(gi)
+
+    if dir == (0 - 1) {
+        # DOWN
+        GEOM_sector_set_lightlevel(sec, GEOM_sector_lightlevel(sec) - LIGHT_GLOWSPEED)
+        if GEOM_sector_lightlevel(sec) <= gl_minlight(gi) {
+            GEOM_sector_set_lightlevel(sec, GEOM_sector_lightlevel(sec) + LIGHT_GLOWSPEED)
+            gl_set_direction(gi, 1)
+        }
+    } else {
+        if dir == 1 {
+            # UP
+            GEOM_sector_set_lightlevel(sec, GEOM_sector_lightlevel(sec) + LIGHT_GLOWSPEED)
+            if GEOM_sector_lightlevel(sec) >= gl_maxlight(gi) {
+                GEOM_sector_set_lightlevel(sec, GEOM_sector_lightlevel(sec) - LIGHT_GLOWSPEED)
+                gl_set_direction(gi, 0 - 1)
+            }
+        }
+    }
+}
+
+@flow_api
+function P_SpawnGlowingLight(sector: ptr<void>) -> void {
+    let g: ptr<void> = Z_Malloc(LIGHT_SIZEOF_GLOW, LIGHT_PU_LEVSPEC, 0 as ptr<void>)
+    P_AddThinker(g)
+
+    let gi: i64 = g as i64
+    gl_set_sector(gi, sector)
+    gl_set_minlight(gi, P_FindMinSurroundingLight(sector, GEOM_sector_lightlevel(sector)))
+    gl_set_maxlight(gi, GEOM_sector_lightlevel(sector))
+    light_set_acp1(gi, T_Glow as i64)
+    gl_set_direction(gi, 0 - 1)
+
+    GEOM_sector_set_special(sector, 0)
+}

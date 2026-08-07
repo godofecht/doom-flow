@@ -1,0 +1,12 @@
+# Network/sound stubs, ported from dummy.c to Flow.
+#
+# Provides I_InitTimidityConfig when FEATURE_SOUND is off (this build:
+# doomfeatures.h never #defines FEATURE_SOUND). net_client_connected stays
+# false in loop_shim; drone is STAT_drone() in dmain.flow (always 0).
+
+const DUMMY_FALSE: i32 = 0
+
+@flow_api
+function I_InitTimidityConfig() -> void {
+    return
+}

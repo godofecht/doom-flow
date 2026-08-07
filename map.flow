@@ -1,0 +1,1437 @@
+# Movement / collision / aiming / shooting, ported from p_map.c to Flow.
+#
+# tm* scalars, floatok, crushchange/nofit, tmbbox, and pointer globals
+# (tmthing, ceilingline, spechit, linetarget) are Flow-owned.
+# open*/lowfloor/trace/intercepts stay maputl-owned.
+#
+# PIT_*/PTR_* keep exact C names via @flow_api so P_Block*Iterator /
+# P_PathTraverse can take their addresses.
+#
+# Prefer GEOM_/MOBJ_/MAPUTL_ shared APIs.
+#
+# LP64 offsetof notes (same as sight.flow / user.flow):
+#   mobj_t 224; line_t 88; sector_t 128; intercept_t 16
+#     intercept: frac 0, isaline 4, d 8
+#     line: special 26, bbox 36, slopetype 52, frontsector 56, backsector 64
+#     sector: ceilingpic 10, blockbox 32
+#     mobj: radius 104, height 108, momz 120, type 128, info 136,
+#           health 164, target 176, player 192
+
+# ---- fixed-point ------------------------------------------------------
+
+extern { function FixedMul(a: i32, b: i32) -> i32 }
+extern { function FixedDiv(a: i32, b: i32) -> i32 }
+extern { function TABLES_finesine(idx: i32) -> i32 }
+extern { function TABLES_finecosine(idx: i32) -> i32 }
+extern { function TABLES_finetangent(idx: i32) -> i32 }
+extern { function SKY_skyflatnum() -> i32 }
+
+# ---- engine C (still unported or other Flow modules) ------------------
+
+extern { function P_Random() -> i32 }
+extern { function I_Error(msg: string) -> void }
+extern { function R_PointInSubsector(x: i32, y: i32) -> ptr<void> }
+extern { function R_PointToAngle2(x1: i32, y1: i32, x2: i32, y2: i32) -> u32 }
+extern { function P_UnsetThingPosition(thing: ptr<void>) -> void }
+extern { function P_SetThingPosition(thing: ptr<void>) -> void }
+extern { function P_BoxOnLineSide(tmbox: ptr<i32>, ld: ptr<void>) -> i32 }
+extern { function P_LineOpening(linedef: ptr<void>) -> void }
+extern { function P_BlockLinesIterator(x: i32, y: i32, func: ptr<void>) -> i32 }
+extern { function P_BlockThingsIterator(x: i32, y: i32, func: ptr<void>) -> i32 }
+extern { function P_PathTraverse(x1: i32, y1: i32, x2: i32, y2: i32, flags: i32, trav: ptr<void>) -> i32 }
+extern { function P_PointOnLineSide(x: i32, y: i32, line: ptr<void>) -> i32 }
+extern { function P_AproxDistance(dx: i32, dy: i32) -> i32 }
+extern { function P_CrossSpecialLine(linenum: i32, side: i32, thing: ptr<void>) -> void }
+extern { function P_ShootSpecialLine(thing: ptr<void>, line: ptr<void>) -> void }
+extern { function P_UseSpecialLine(thing: ptr<void>, line: ptr<void>, side: i32) -> i32 }
+extern { function P_DamageMobj(target: ptr<void>, inflictor: ptr<void>, source: ptr<void>, damage: i32) -> void }
+extern { function P_TouchSpecialThing(special: ptr<void>, toucher: ptr<void>) -> void }
+extern { function P_SetMobjState(mobj: ptr<void>, state: i32) -> i32 }
+extern { function P_RemoveMobj(th: ptr<void>) -> void }
+extern { function P_SpawnMobj(x: i32, y: i32, z: i32, typ: i32) -> ptr<void> }
+extern { function P_SpawnPuff(x: i32, y: i32, z: i32) -> void }
+extern { function P_SpawnBlood(x: i32, y: i32, z: i32, damage: i32) -> void }
+extern { function P_CheckSight(t1: ptr<void>, t2: ptr<void>) -> i32 }
+extern { function P_SubstNullMobj(th: ptr<void>) -> ptr<void> }
+extern { function S_StartSound(origin: ptr<void>, sound_id: i32) -> void }
+
+# ---- rmain (validcount) + sight (aim slopes) --------------------------
+
+extern { function RMAIN_validcount() -> i32 }
+extern { function RMAIN_set_validcount(v: i32) -> void }
+extern { function SIGHT_topslope() -> i32 }
+extern { function SIGHT_set_topslope(v: i32) -> void }
+extern { function SIGHT_bottomslope() -> i32 }
+extern { function SIGHT_set_bottomslope(v: i32) -> void }
+
+# ---- usershim (shared mobj field access) ------------------------------
+
+extern { function MOBJ_x(m: ptr<void>) -> i32 }
+extern { function MOBJ_y(m: ptr<void>) -> i32 }
+extern { function MOBJ_z(m: ptr<void>) -> i32 }
+extern { function MOBJ_angle(m: ptr<void>) -> u32 }
+extern { function MOBJ_floorz(m: ptr<void>) -> i32 }
+extern { function MOBJ_ceilingz(m: ptr<void>) -> i32 }
+extern { function MOBJ_momx(m: ptr<void>) -> i32 }
+extern { function MOBJ_momy(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_momx(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_momy(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_flags(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_flags(m: ptr<void>, v: i32) -> void }
+
+# ---- pointer globals + spechit overrun (was map_shim.c) ---------------
+
+extern { function M_CheckParmWithArgs(check: string, num_args: i32) -> i32 }
+extern { function argvflow_argv() -> ptr<i64> }
+extern { function printf(fmt: string, a: i32) -> i32 }
+
+@flow_api
+function mapshim_overrun_warn(numspechit: i32) -> void {
+    printf("SpechitOverrun: Warning: unable to emulatean overrun where numspechit=%i\n",
+           numspechit)
+}
+
+let mut map_tmthing: ptr<void> = null
+let mut map_ceilingline: ptr<void> = null
+let mut map_spechit: array<ptr<void>, 20> = [
+    null, null, null, null, null, null, null, null, null, null,
+    null, null, null, null, null, null, null, null, null, null
+]
+let mut map_numspechit: i32 = 0
+let mut map_linetarget: ptr<void> = null
+let mut map_attackrange: i32 = 0
+
+@flow_api
+function mapshim_tmthing() -> ptr<void> { return map_tmthing }
+
+@flow_api
+function mapshim_set_tmthing(m: ptr<void>) -> void { map_tmthing = m }
+
+@flow_api
+function mapshim_ceilingline() -> ptr<void> { return map_ceilingline }
+
+@flow_api
+function mapshim_set_ceilingline(l: ptr<void>) -> void { map_ceilingline = l }
+
+@flow_api
+function mapshim_numspechit() -> i32 { return map_numspechit }
+
+@flow_api
+function mapshim_set_numspechit(v: i32) -> void { map_numspechit = v }
+
+@flow_api
+function mapshim_spechit(i: i32) -> ptr<void> { return map_spechit[i] }
+
+@flow_api
+function mapshim_set_spechit(i: i32, l: ptr<void>) -> void { map_spechit[i] = l }
+
+@flow_api
+function mapshim_linetarget() -> ptr<void> { return map_linetarget }
+
+@flow_api
+function mapshim_set_linetarget(m: ptr<void>) -> void { map_linetarget = m }
+
+@flow_api
+function mapshim_attackrange() -> i32 { return map_attackrange }
+
+@flow_api
+function mapshim_set_attackrange(v: i32) -> void { map_attackrange = v }
+
+# Mirrors M_StrToInt: "0x"/"0X" prefix means hex, else decimal.
+function map_strtouint(s: ptr<u8>) -> u32 {
+    let mut i: i32 = 0
+    let mut base: i32 = 10
+    if s[0] as i32 == 48 and (s[1] as i32 == 120 or s[1] as i32 == 88) {
+        base = 16
+        i = 2
+    }
+    let mut v: u32 = 0
+    let mut c: i32 = s[i] as i32
+    while (c >= 48 and c < 48 + base) or (base == 16 and ((c >= 97 and c <= 102) or (c >= 65 and c <= 70))) {
+        let mut digit: i32 = 0
+        if c >= 48 and c <= 57 {
+            digit = c - 48
+        } elif c >= 97 and c <= 102 {
+            digit = c - 97 + 10
+        } else {
+            digit = c - 65 + 10
+        }
+        v = v * (base as u32) + (digit as u32)
+        i = i + 1
+        c = s[i] as i32
+    }
+    return v
+}
+
+let mut map_spechit_baseaddr: u32 = 0
+
+extern { function MOBJ_type(m: ptr<void>) -> i32 }
+
+extern { function MAPUTL_opentop() -> i32 }
+extern { function MAPUTL_openbottom() -> i32 }
+extern { function MAPUTL_openrange() -> i32 }
+extern { function MAPUTL_lowfloor() -> i32 }
+extern { function MAPUTL_trace_x() -> i32 }
+extern { function MAPUTL_trace_y() -> i32 }
+extern { function MAPUTL_trace_dx() -> i32 }
+extern { function MAPUTL_trace_dy() -> i32 }
+extern { function MAPUTL_intercept_frac(icpt: ptr<void>) -> i32 }
+extern { function MAPUTL_intercept_isaline(icpt: ptr<void>) -> i32 }
+extern { function MAPUTL_intercept_line(icpt: ptr<void>) -> ptr<void> }
+extern { function MAPUTL_intercept_thing(icpt: ptr<void>) -> ptr<void> }
+
+extern { function GEOM_bmaporgx() -> i32 }
+extern { function GEOM_bmaporgy() -> i32 }
+
+extern { function GEOM_line_index(line: ptr<void>) -> i32 }
+
+extern { function GEOM_line_bbox(line: ptr<void>, i: i32) -> i32 }
+
+extern { function GEOM_sector_floorheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_ceilingheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_ceilingpic(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_blockbox(s: ptr<void>, i: i32) -> i32 }
+extern { function GEOM_subsector_sector(ss: ptr<void>) -> ptr<void> }
+
+extern { function MOBJ_radius(m: ptr<void>) -> i32 }
+extern { function MOBJ_height(m: ptr<void>) -> i32 }
+extern { function MOBJ_health(m: ptr<void>) -> i32 }
+extern { function MOBJ_momz(m: ptr<void>) -> i32 }
+extern { function MOBJ_player(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_target(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_info_damage(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_spawnstate(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_x(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_y(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_z(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_floorz(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_ceilingz(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_momz(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_height(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_radius(m: ptr<void>, v: i32) -> void }
+
+extern { function GEOM_line_backsector(ld: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_dx(ld: ptr<void>) -> i32 }
+extern { function GEOM_line_dy(ld: ptr<void>) -> i32 }
+extern { function GEOM_line_flags(ld: ptr<void>) -> i32 }
+extern { function GEOM_line_frontsector(ld: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_special(ld: ptr<void>) -> i32 }
+extern { function GEOM_line_slopetype(ld: ptr<void>) -> i32 }
+extern { function MOBJ_zero_mom(m: ptr<void>) -> void }
+extern { function PLAYER_mo(p: ptr<void>) -> ptr<void> }
+
+# ---- shared scalars (were DEFINEd in map_shim.c / p_map.c) ------------
+
+let mut tmbbox: array<i32, 4> = [0, 0, 0, 0]
+let mut tmflags: i32 = 0
+let mut tmx: i32 = 0
+let mut tmy: i32 = 0
+let mut floatok: i32 = 0
+let mut tmfloorz: i32 = 0
+let mut tmceilingz: i32 = 0
+let mut tmdropoffz: i32 = 0
+let mut crushchange: i32 = 0
+let mut nofit: i32 = 0
+
+@flow_api
+function mapshim_tmbbox_addr() -> ptr<i32> { return &tmbbox[0] }
+
+@flow_api
+function mapshim_tmbbox(i: i32) -> i32 { return tmbbox[i] }
+
+@flow_api
+function mapshim_set_tmbbox(i: i32, v: i32) -> void { tmbbox[i] = v }
+
+@flow_api
+function mapshim_tmflags() -> i32 { return tmflags }
+
+@flow_api
+function mapshim_set_tmflags(v: i32) -> void { tmflags = v }
+
+@flow_api
+function mapshim_tmx() -> i32 { return tmx }
+
+@flow_api
+function mapshim_set_tmx(v: i32) -> void { tmx = v }
+
+@flow_api
+function mapshim_tmy() -> i32 { return tmy }
+
+@flow_api
+function mapshim_set_tmy(v: i32) -> void { tmy = v }
+
+@flow_api
+function mapshim_floatok() -> i32 { return floatok }
+
+@flow_api
+function mapshim_set_floatok(v: i32) -> void { floatok = v }
+
+@flow_api
+function mapshim_tmfloorz() -> i32 { return tmfloorz }
+
+@flow_api
+function mapshim_set_tmfloorz(v: i32) -> void { tmfloorz = v }
+
+@flow_api
+function mapshim_tmceilingz() -> i32 { return tmceilingz }
+
+@flow_api
+function mapshim_set_tmceilingz(v: i32) -> void { tmceilingz = v }
+
+@flow_api
+function mapshim_tmdropoffz() -> i32 { return tmdropoffz }
+
+@flow_api
+function mapshim_set_tmdropoffz(v: i32) -> void { tmdropoffz = v }
+
+@flow_api
+function mapshim_crushchange() -> i32 { return crushchange }
+
+@flow_api
+function mapshim_set_crushchange(v: i32) -> void { crushchange = v }
+
+@flow_api
+function mapshim_nofit() -> i32 { return nofit }
+
+@flow_api
+function mapshim_set_nofit(v: i32) -> void { nofit = v }
+
+# ---- MAP_tm* / floatok / spechit / aim scratch ------------------------
+
+@flow_api
+function MAP_tmbbox_addr() -> ptr<i32> { return &tmbbox[0] }
+@flow_api
+function MAP_tmbbox(i: i32) -> i32 { return tmbbox[i] }
+@flow_api
+function MAP_set_tmbbox(i: i32, v: i32) -> void { tmbbox[i] = v }
+
+@flow_api
+function MAP_tmthing() -> ptr<void> { return map_tmthing }
+@flow_api
+function MAP_set_tmthing(m: ptr<void>) -> void { map_tmthing = m }
+@flow_api
+function MAP_tmflags() -> i32 { return tmflags }
+@flow_api
+function MAP_set_tmflags(v: i32) -> void { tmflags = v }
+@flow_api
+function MAP_tmx() -> i32 { return tmx }
+@flow_api
+function MAP_set_tmx(v: i32) -> void { tmx = v }
+@flow_api
+function MAP_tmy() -> i32 { return tmy }
+@flow_api
+function MAP_set_tmy(v: i32) -> void { tmy = v }
+
+@flow_api
+function MAP_floatok() -> i32 { return floatok }
+@flow_api
+function MAP_set_floatok(v: i32) -> void { floatok = v }
+@flow_api
+function MAP_tmfloorz() -> i32 { return tmfloorz }
+@flow_api
+function MAP_set_tmfloorz(v: i32) -> void { tmfloorz = v }
+@flow_api
+function MAP_tmceilingz() -> i32 { return tmceilingz }
+@flow_api
+function MAP_set_tmceilingz(v: i32) -> void { tmceilingz = v }
+@flow_api
+function MAP_tmdropoffz() -> i32 { return tmdropoffz }
+@flow_api
+function MAP_set_tmdropoffz(v: i32) -> void { tmdropoffz = v }
+@flow_api
+function MAP_crushchange() -> i32 { return crushchange }
+@flow_api
+function MAP_set_crushchange(v: i32) -> void { crushchange = v }
+@flow_api
+function MAP_nofit() -> i32 { return nofit }
+@flow_api
+function MAP_set_nofit(v: i32) -> void { nofit = v }
+
+@flow_api
+function MAP_ceilingline() -> ptr<void> { return map_ceilingline }
+@flow_api
+function MAP_set_ceilingline(l: ptr<void>) -> void { map_ceilingline = l }
+@flow_api
+function MAP_numspechit() -> i32 { return map_numspechit }
+@flow_api
+function MAP_set_numspechit(v: i32) -> void { map_numspechit = v }
+@flow_api
+function MAP_spechit(i: i32) -> ptr<void> { return map_spechit[i] }
+@flow_api
+function MAP_set_spechit(i: i32, l: ptr<void>) -> void { map_spechit[i] = l }
+
+@flow_api
+function MAP_linetarget() -> ptr<void> { return map_linetarget }
+@flow_api
+function MAP_set_linetarget(m: ptr<void>) -> void { map_linetarget = m }
+@flow_api
+function MAP_attackrange() -> i32 { return map_attackrange }
+@flow_api
+function MAP_set_attackrange(v: i32) -> void { map_attackrange = v }
+
+# PrBoom-plus / Chocolate Doom SpechitOverrun vanilla-emulation address poke.
+@flow_api
+function mapshim_SpechitOverrun(ld: ptr<void>) -> void {
+    if map_spechit_baseaddr == 0 {
+        let p: i32 = M_CheckParmWithArgs("-spechit", 1)
+        if p > 0 {
+            let words: ptr<i64> = argvflow_argv()
+            map_spechit_baseaddr = map_strtouint(words[p + 1] as ptr<u8>)
+        } else {
+            map_spechit_baseaddr = 0x01C09C98 as u32
+        }
+    }
+
+    let line_idx: i32 = GEOM_line_index(ld)
+    let addr: u32 = map_spechit_baseaddr + ((line_idx as u32) * (0x3E as u32))
+
+    if map_numspechit == 9 or map_numspechit == 10 or map_numspechit == 11 or map_numspechit == 12 {
+        MAP_set_tmbbox(map_numspechit - 9, addr as i32)
+    } elif map_numspechit == 13 {
+        MAP_set_crushchange(addr as i32)
+    } elif map_numspechit == 14 {
+        MAP_set_nofit(addr as i32)
+    } else {
+        mapshim_overrun_warn(map_numspechit)
+    }
+}
+
+# ---- constants (MAP_ prefix; avoid maputl collisions) -----------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+const MAP_FRACUNIT: i32 = 65536
+const MAP_FRACBITS: i32 = 16
+const MAP_MAPBLOCKSHIFT: i32 = 23
+const MAP_MAXRADIUS: i32 = 2097152
+const MAP_USERANGE: i32 = 4194304
+const MAP_STEP: i32 = 1572864            # 24*FRACUNIT
+
+const MAP_BOXTOP: i32 = 0
+const MAP_BOXBOTTOM: i32 = 1
+const MAP_BOXLEFT: i32 = 2
+const MAP_BOXRIGHT: i32 = 3
+
+const MAP_ML_BLOCKING: i32 = 1
+const MAP_ML_BLOCKMONSTERS: i32 = 2
+const MAP_ML_TWOSIDED: i32 = 4
+
+const MAP_ST_HORIZONTAL: i32 = 0
+const MAP_ST_VERTICAL: i32 = 1
+
+const MAP_PT_ADDLINES: i32 = 1
+const MAP_PT_ADDTHINGS: i32 = 2
+
+const MAP_MAXSPECIALCROSS_ORIGINAL: i32 = 8
+
+const MAP_ANGLETOFINESHIFT: u32 = 19
+const MAP_ANG180: u32 = 2147483648
+
+const MAP_MF_SPECIAL: i32 = 1
+const MAP_MF_SOLID: i32 = 2
+const MAP_MF_SHOOTABLE: i32 = 4
+const MAP_MF_DROPOFF: i32 = 1024
+const MAP_MF_PICKUP: i32 = 2048
+const MAP_MF_NOCLIP: i32 = 4096
+const MAP_MF_FLOAT: i32 = 16384
+const MAP_MF_TELEPORT: i32 = 32768
+const MAP_MF_MISSILE: i32 = 65536
+const MAP_MF_DROPPED: i32 = 131072
+const MAP_MF_NOBLOOD: i32 = 524288
+const MAP_MF_SKULLFLY: i32 = 16777216
+
+const MAP_MT_PLAYER: i32 = 0
+const MAP_MT_BRUISER: i32 = 15
+const MAP_MT_KNIGHT: i32 = 17
+const MAP_MT_SPIDER: i32 = 19
+const MAP_MT_CYBORG: i32 = 21
+const MAP_MT_BLOOD: i32 = 38
+
+const MAP_S_GIBS: i32 = 895
+const MAP_SFX_NOWAY: i32 = 81
+
+# deh_misc.h with FEATURE_DEHACKED undefined
+const MAP_DEH_SPECIES_INFIGHTING: i32 = 0
+
+# ---- private module state (was file-static / file-scope in p_map.c) ---
+
+let mut bestslidefrac: i32 = 0
+let mut secondslidefrac: i32 = 0
+let mut bestslideline: ptr<void> = null
+let mut secondslideline: ptr<void> = null
+let mut slidemo: ptr<void> = null
+let mut tmxmove: i32 = 0
+let mut tmymove: i32 = 0
+
+let mut shootthing: ptr<void> = null
+let mut shootz: i32 = 0
+let mut la_damage: i32 = 0
+let mut aimslope: i32 = 0
+
+let mut usething: ptr<void> = null
+
+let mut bombsource: ptr<void> = null
+let mut bombspot: ptr<void> = null
+let mut bombdamage: i32 = 0
+
+# ---- helpers ----------------------------------------------------------
+
+function map_abs(x: i32) -> i32 {
+    if x < 0 {
+        return 0 - x
+    }
+    return x
+}
+
+# ---- PIT_StompThing ---------------------------------------------------
+
+@flow_api
+function PIT_StompThing(thing: ptr<void>) -> i32 {
+    if (MOBJ_flags(thing) & MAP_MF_SHOOTABLE) == 0 {
+        return 1
+    }
+
+    let tm: ptr<void> = MAP_tmthing()
+    let blockdist: i32 = MOBJ_radius(thing) + MOBJ_radius(tm)
+
+    if map_abs(MOBJ_x(thing) - MAP_tmx()) >= blockdist
+        or map_abs(MOBJ_y(thing) - MAP_tmy()) >= blockdist {
+        return 1
+    }
+
+    if (thing as i64) == (tm as i64) {
+        return 1
+    }
+
+    # monsters don't stomp things except on boss level
+    if (MOBJ_player(tm) as i64) == 0 and STAT_gamemap() != 30 {
+        return 0
+    }
+
+    P_DamageMobj(thing, tm, tm, 10000)
+    return 1
+}
+
+# ---- P_TeleportMove ---------------------------------------------------
+
+@flow_api
+function P_TeleportMove(thing: ptr<void>, x: i32, y: i32) -> i32 {
+    MAP_set_tmthing(thing)
+    MAP_set_tmflags(MOBJ_flags(thing))
+    MAP_set_tmx(x)
+    MAP_set_tmy(y)
+
+    let r: i32 = MOBJ_radius(thing)
+    MAP_set_tmbbox(MAP_BOXTOP, y + r)
+    MAP_set_tmbbox(MAP_BOXBOTTOM, y - r)
+    MAP_set_tmbbox(MAP_BOXRIGHT, x + r)
+    MAP_set_tmbbox(MAP_BOXLEFT, x - r)
+
+    let newsubsec: ptr<void> = R_PointInSubsector(x, y)
+    MAP_set_ceilingline(null)
+
+    let sec: ptr<void> = GEOM_subsector_sector(newsubsec)
+    let fh: i32 = GEOM_sector_floorheight(sec)
+    MAP_set_tmfloorz(fh)
+    MAP_set_tmdropoffz(fh)
+    MAP_set_tmceilingz(GEOM_sector_ceilingheight(sec))
+
+    RMAIN_set_validcount(RMAIN_validcount() + 1)
+    MAP_set_numspechit(0)
+
+    let xl: i32 = (MAP_tmbbox(MAP_BOXLEFT) - GEOM_bmaporgx() - MAP_MAXRADIUS) >> MAP_MAPBLOCKSHIFT
+    let xh: i32 = (MAP_tmbbox(MAP_BOXRIGHT) - GEOM_bmaporgx() + MAP_MAXRADIUS) >> MAP_MAPBLOCKSHIFT
+    let yl: i32 = (MAP_tmbbox(MAP_BOXBOTTOM) - GEOM_bmaporgy() - MAP_MAXRADIUS) >> MAP_MAPBLOCKSHIFT
+    let yh: i32 = (MAP_tmbbox(MAP_BOXTOP) - GEOM_bmaporgy() + MAP_MAXRADIUS) >> MAP_MAPBLOCKSHIFT
+
+    for bx in xl to (xh + 1) {
+        for by in yl to (yh + 1) {
+            if P_BlockThingsIterator(bx, by, PIT_StompThing) == 0 {
+                return 0
+            }
+        }
+    }
+
+    P_UnsetThingPosition(thing)
+    MOBJ_set_floorz(thing, MAP_tmfloorz())
+    MOBJ_set_ceilingz(thing, MAP_tmceilingz())
+    MOBJ_set_x(thing, x)
+    MOBJ_set_y(thing, y)
+    P_SetThingPosition(thing)
+    return 1
+}
+
+# ---- PIT_CheckLine ----------------------------------------------------
+
+@flow_api
+function PIT_CheckLine(ld: ptr<void>) -> i32 {
+    if MAP_tmbbox(MAP_BOXRIGHT) <= GEOM_line_bbox(ld, MAP_BOXLEFT)
+        or MAP_tmbbox(MAP_BOXLEFT) >= GEOM_line_bbox(ld, MAP_BOXRIGHT)
+        or MAP_tmbbox(MAP_BOXTOP) <= GEOM_line_bbox(ld, MAP_BOXBOTTOM)
+        or MAP_tmbbox(MAP_BOXBOTTOM) >= GEOM_line_bbox(ld, MAP_BOXTOP) {
+        return 1
+    }
+
+    if P_BoxOnLineSide(MAP_tmbbox_addr(), ld) != (0 - 1) {
+        return 1
+    }
+
+    if (GEOM_line_backsector(ld) as i64) == 0 {
+        return 0
+    }
+
+    let tm: ptr<void> = MAP_tmthing()
+    if (MOBJ_flags(tm) & MAP_MF_MISSILE) == 0 {
+        if (GEOM_line_flags(ld) & MAP_ML_BLOCKING) != 0 {
+            return 0
+        }
+        if (MOBJ_player(tm) as i64) == 0
+            and (GEOM_line_flags(ld) & MAP_ML_BLOCKMONSTERS) != 0 {
+            return 0
+        }
+    }
+
+    P_LineOpening(ld)
+
+    if MAPUTL_opentop() < MAP_tmceilingz() {
+        MAP_set_tmceilingz(MAPUTL_opentop())
+        MAP_set_ceilingline(ld)
+    }
+
+    if MAPUTL_openbottom() > MAP_tmfloorz() {
+        MAP_set_tmfloorz(MAPUTL_openbottom())
+    }
+
+    if MAPUTL_lowfloor() < MAP_tmdropoffz() {
+        MAP_set_tmdropoffz(MAPUTL_lowfloor())
+    }
+
+    if GEOM_line_special(ld) != 0 {
+        let n: i32 = MAP_numspechit()
+        MAP_set_spechit(n, ld)
+        MAP_set_numspechit(n + 1)
+        if MAP_numspechit() > MAP_MAXSPECIALCROSS_ORIGINAL {
+            mapshim_SpechitOverrun(ld)
+        }
+    }
+
+    return 1
+}
+
+# ---- PIT_CheckThing ---------------------------------------------------
+
+@flow_api
+function PIT_CheckThing(thing: ptr<void>) -> i32 {
+    let thingflags: i32 = MOBJ_flags(thing)
+    if (thingflags & (MAP_MF_SOLID | MAP_MF_SPECIAL | MAP_MF_SHOOTABLE)) == 0 {
+        return 1
+    }
+
+    let tm: ptr<void> = MAP_tmthing()
+    let blockdist: i32 = MOBJ_radius(thing) + MOBJ_radius(tm)
+
+    if map_abs(MOBJ_x(thing) - MAP_tmx()) >= blockdist
+        or map_abs(MOBJ_y(thing) - MAP_tmy()) >= blockdist {
+        return 1
+    }
+
+    if (thing as i64) == (tm as i64) {
+        return 1
+    }
+
+    let tmflags_m: i32 = MOBJ_flags(tm)
+
+    if (tmflags_m & MAP_MF_SKULLFLY) != 0 {
+        let damage: i32 = ((P_Random() % 8) + 1) * MOBJ_info_damage(tm)
+        P_DamageMobj(thing, tm, tm, damage)
+        MOBJ_set_flags(tm, tmflags_m & (0 - 1 - MAP_MF_SKULLFLY))
+        MOBJ_zero_mom(tm)
+        P_SetMobjState(tm, MOBJ_info_spawnstate(tm))
+        return 0
+    }
+
+    if (tmflags_m & MAP_MF_MISSILE) != 0 {
+        if MOBJ_z(tm) > MOBJ_z(thing) + MOBJ_height(thing) {
+            return 1
+        }
+        if MOBJ_z(tm) + MOBJ_height(tm) < MOBJ_z(thing) {
+            return 1
+        }
+
+        let target: ptr<void> = MOBJ_target(tm)
+        if (target as i64) != 0 {
+            let ttype: i32 = MOBJ_type(target)
+            let otype: i32 = MOBJ_type(thing)
+            if ttype == otype
+                or (ttype == MAP_MT_KNIGHT and otype == MAP_MT_BRUISER)
+                or (ttype == MAP_MT_BRUISER and otype == MAP_MT_KNIGHT) {
+                if (thing as i64) == (target as i64) {
+                    return 1
+                }
+                if otype != MAP_MT_PLAYER and MAP_DEH_SPECIES_INFIGHTING == 0 {
+                    return 0
+                }
+            }
+        }
+
+        if (thingflags & MAP_MF_SHOOTABLE) == 0 {
+            if (thingflags & MAP_MF_SOLID) != 0 {
+                return 0
+            }
+            return 1
+        }
+
+        let damage2: i32 = ((P_Random() % 8) + 1) * MOBJ_info_damage(tm)
+        P_DamageMobj(thing, tm, MOBJ_target(tm), damage2)
+        return 0
+    }
+
+    if (thingflags & MAP_MF_SPECIAL) != 0 {
+        let solid: i32 = thingflags & MAP_MF_SOLID
+        if (MAP_tmflags() & MAP_MF_PICKUP) != 0 {
+            P_TouchSpecialThing(thing, tm)
+        }
+        if solid != 0 {
+            return 0
+        }
+        return 1
+    }
+
+    if (thingflags & MAP_MF_SOLID) != 0 {
+        return 0
+    }
+    return 1
+}
+
+# ---- P_CheckPosition --------------------------------------------------
+
+@flow_api
+function P_CheckPosition(thing: ptr<void>, x: i32, y: i32) -> i32 {
+    MAP_set_tmthing(thing)
+    MAP_set_tmflags(MOBJ_flags(thing))
+    MAP_set_tmx(x)
+    MAP_set_tmy(y)
+
+    let r: i32 = MOBJ_radius(thing)
+    MAP_set_tmbbox(MAP_BOXTOP, y + r)
+    MAP_set_tmbbox(MAP_BOXBOTTOM, y - r)
+    MAP_set_tmbbox(MAP_BOXRIGHT, x + r)
+    MAP_set_tmbbox(MAP_BOXLEFT, x - r)
+
+    let newsubsec: ptr<void> = R_PointInSubsector(x, y)
+    MAP_set_ceilingline(null)
+
+    let sec: ptr<void> = GEOM_subsector_sector(newsubsec)
+    let fh: i32 = GEOM_sector_floorheight(sec)
+    MAP_set_tmfloorz(fh)
+    MAP_set_tmdropoffz(fh)
+    MAP_set_tmceilingz(GEOM_sector_ceilingheight(sec))
+
+    RMAIN_set_validcount(RMAIN_validcount() + 1)
+    MAP_set_numspechit(0)
+
+    if (MAP_tmflags() & MAP_MF_NOCLIP) != 0 {
+        return 1
+    }
+
+    let xl: i32 = (MAP_tmbbox(MAP_BOXLEFT) - GEOM_bmaporgx() - MAP_MAXRADIUS) >> MAP_MAPBLOCKSHIFT
+    let xh: i32 = (MAP_tmbbox(MAP_BOXRIGHT) - GEOM_bmaporgx() + MAP_MAXRADIUS) >> MAP_MAPBLOCKSHIFT
+    let yl: i32 = (MAP_tmbbox(MAP_BOXBOTTOM) - GEOM_bmaporgy() - MAP_MAXRADIUS) >> MAP_MAPBLOCKSHIFT
+    let yh: i32 = (MAP_tmbbox(MAP_BOXTOP) - GEOM_bmaporgy() + MAP_MAXRADIUS) >> MAP_MAPBLOCKSHIFT
+
+    for bx in xl to (xh + 1) {
+        for by in yl to (yh + 1) {
+            if P_BlockThingsIterator(bx, by, PIT_CheckThing) == 0 {
+                return 0
+            }
+        }
+    }
+
+    let xl2: i32 = (MAP_tmbbox(MAP_BOXLEFT) - GEOM_bmaporgx()) >> MAP_MAPBLOCKSHIFT
+    let xh2: i32 = (MAP_tmbbox(MAP_BOXRIGHT) - GEOM_bmaporgx()) >> MAP_MAPBLOCKSHIFT
+    let yl2: i32 = (MAP_tmbbox(MAP_BOXBOTTOM) - GEOM_bmaporgy()) >> MAP_MAPBLOCKSHIFT
+    let yh2: i32 = (MAP_tmbbox(MAP_BOXTOP) - GEOM_bmaporgy()) >> MAP_MAPBLOCKSHIFT
+
+    for bx2 in xl2 to (xh2 + 1) {
+        for by2 in yl2 to (yh2 + 1) {
+            if P_BlockLinesIterator(bx2, by2, PIT_CheckLine) == 0 {
+                return 0
+            }
+        }
+    }
+
+    return 1
+}
+
+# ---- P_TryMove --------------------------------------------------------
+
+@flow_api
+function P_TryMove(thing: ptr<void>, x: i32, y: i32) -> i32 {
+    MAP_set_floatok(0)
+    if P_CheckPosition(thing, x, y) == 0 {
+        return 0
+    }
+
+    if (MOBJ_flags(thing) & MAP_MF_NOCLIP) == 0 {
+        if MAP_tmceilingz() - MAP_tmfloorz() < MOBJ_height(thing) {
+            return 0
+        }
+
+        MAP_set_floatok(1)
+
+        if (MOBJ_flags(thing) & MAP_MF_TELEPORT) == 0
+            and MAP_tmceilingz() - MOBJ_z(thing) < MOBJ_height(thing) {
+            return 0
+        }
+
+        if (MOBJ_flags(thing) & MAP_MF_TELEPORT) == 0
+            and MAP_tmfloorz() - MOBJ_z(thing) > MAP_STEP {
+            return 0
+        }
+
+        if (MOBJ_flags(thing) & (MAP_MF_DROPOFF | MAP_MF_FLOAT)) == 0
+            and MAP_tmfloorz() - MAP_tmdropoffz() > MAP_STEP {
+            return 0
+        }
+    }
+
+    P_UnsetThingPosition(thing)
+
+    let oldx: i32 = MOBJ_x(thing)
+    let oldy: i32 = MOBJ_y(thing)
+    MOBJ_set_floorz(thing, MAP_tmfloorz())
+    MOBJ_set_ceilingz(thing, MAP_tmceilingz())
+    MOBJ_set_x(thing, x)
+    MOBJ_set_y(thing, y)
+
+    P_SetThingPosition(thing)
+
+    if (MOBJ_flags(thing) & (MAP_MF_TELEPORT | MAP_MF_NOCLIP)) == 0 {
+        # Match C while (numspechit--): body uses post-decremented index;
+        # after the loop numspechit is -1.
+        let mut keep_going: i32 = 1
+        while keep_going != 0 {
+            let cur: i32 = MAP_numspechit()
+            MAP_set_numspechit(cur - 1)
+            if cur == 0 {
+                keep_going = 0
+            } else {
+                let ld: ptr<void> = MAP_spechit(MAP_numspechit())
+                let side: i32 = P_PointOnLineSide(MOBJ_x(thing), MOBJ_y(thing), ld)
+                let oldside: i32 = P_PointOnLineSide(oldx, oldy, ld)
+                if side != oldside {
+                    if GEOM_line_special(ld) != 0 {
+                        P_CrossSpecialLine(GEOM_line_index(ld), oldside, thing)
+                    }
+                }
+            }
+        }
+    }
+
+    return 1
+}
+
+# ---- P_ThingHeightClip ------------------------------------------------
+
+function P_ThingHeightClip(thing: ptr<void>) -> i32 {
+    let mut onfloor: i32 = 0
+    if MOBJ_z(thing) == MOBJ_floorz(thing) {
+        onfloor = 1
+    }
+
+    P_CheckPosition(thing, MOBJ_x(thing), MOBJ_y(thing))
+
+    MOBJ_set_floorz(thing, MAP_tmfloorz())
+    MOBJ_set_ceilingz(thing, MAP_tmceilingz())
+
+    if onfloor != 0 {
+        MOBJ_set_z(thing, MOBJ_floorz(thing))
+    } else {
+        if MOBJ_z(thing) + MOBJ_height(thing) > MOBJ_ceilingz(thing) {
+            MOBJ_set_z(thing, MOBJ_ceilingz(thing) - MOBJ_height(thing))
+        }
+    }
+
+    if MOBJ_ceilingz(thing) - MOBJ_floorz(thing) < MOBJ_height(thing) {
+        return 0
+    }
+    return 1
+}
+
+# ---- P_HitSlideLine ---------------------------------------------------
+
+function P_HitSlideLine(ld: ptr<void>) -> void {
+    if GEOM_line_slopetype(ld) == MAP_ST_HORIZONTAL {
+        tmymove = 0
+        return
+    }
+
+    if GEOM_line_slopetype(ld) == MAP_ST_VERTICAL {
+        tmxmove = 0
+        return
+    }
+
+    let side: i32 = P_PointOnLineSide(MOBJ_x(slidemo), MOBJ_y(slidemo), ld)
+    let mut lineangle: u32 = R_PointToAngle2(0, 0, GEOM_line_dx(ld), GEOM_line_dy(ld))
+
+    if side == 1 {
+        lineangle = lineangle + MAP_ANG180
+    }
+
+    let moveangle: u32 = R_PointToAngle2(0, 0, tmxmove, tmymove)
+    let mut deltaangle: u32 = moveangle - lineangle
+
+    if deltaangle > MAP_ANG180 {
+        deltaangle = deltaangle + MAP_ANG180
+    }
+
+    let la: u32 = lineangle >> MAP_ANGLETOFINESHIFT
+    let da: u32 = deltaangle >> MAP_ANGLETOFINESHIFT
+
+    let movelen: i32 = P_AproxDistance(tmxmove, tmymove)
+    let newlen: i32 = FixedMul(movelen, TABLES_finecosine(da as i32))
+
+    tmxmove = FixedMul(newlen, TABLES_finecosine(la as i32))
+    tmymove = FixedMul(newlen, TABLES_finesine(la as i32))
+}
+
+# ---- PTR_SlideTraverse ------------------------------------------------
+
+@flow_api
+function PTR_SlideTraverse(icpt: ptr<void>) -> i32 {
+    if MAPUTL_intercept_isaline(icpt) == 0 {
+        I_Error("PTR_SlideTraverse: not a line?")
+    }
+
+    let li: ptr<void> = MAPUTL_intercept_line(icpt)
+    let mut blocking: i32 = 0
+
+    if (GEOM_line_flags(li) & MAP_ML_TWOSIDED) == 0 {
+        if P_PointOnLineSide(MOBJ_x(slidemo), MOBJ_y(slidemo), li) != 0 {
+            return 1
+        }
+        blocking = 1
+    } else {
+        P_LineOpening(li)
+        if MAPUTL_openrange() < MOBJ_height(slidemo) {
+            blocking = 1
+        } elif MAPUTL_opentop() - MOBJ_z(slidemo) < MOBJ_height(slidemo) {
+            blocking = 1
+        } elif MAPUTL_openbottom() - MOBJ_z(slidemo) > MAP_STEP {
+            blocking = 1
+        }
+    }
+
+    if blocking == 0 {
+        return 1
+    }
+
+    if MAPUTL_intercept_frac(icpt) < bestslidefrac {
+        secondslidefrac = bestslidefrac
+        secondslideline = bestslideline
+        bestslidefrac = MAPUTL_intercept_frac(icpt)
+        bestslideline = li
+    }
+
+    return 0
+}
+
+# ---- P_SlideMove ------------------------------------------------------
+
+@flow_api
+function P_SlideMove(mo: ptr<void>) -> void {
+    slidemo = mo
+    let mut hitcount: i32 = 0
+    let mut done: i32 = 0
+
+    while done == 0 {
+        hitcount = hitcount + 1
+        if hitcount == 3 {
+            # stairstep
+            if P_TryMove(mo, MOBJ_x(mo), MOBJ_y(mo) + MOBJ_momy(mo)) == 0 {
+                P_TryMove(mo, MOBJ_x(mo) + MOBJ_momx(mo), MOBJ_y(mo))
+            }
+            return
+        }
+
+        let mut leadx: i32 = 0
+        let mut leady: i32 = 0
+        let mut trailx: i32 = 0
+        let mut traily: i32 = 0
+
+        if MOBJ_momx(mo) > 0 {
+            leadx = MOBJ_x(mo) + MOBJ_radius(mo)
+            trailx = MOBJ_x(mo) - MOBJ_radius(mo)
+        } else {
+            leadx = MOBJ_x(mo) - MOBJ_radius(mo)
+            trailx = MOBJ_x(mo) + MOBJ_radius(mo)
+        }
+
+        if MOBJ_momy(mo) > 0 {
+            leady = MOBJ_y(mo) + MOBJ_radius(mo)
+            traily = MOBJ_y(mo) - MOBJ_radius(mo)
+        } else {
+            leady = MOBJ_y(mo) - MOBJ_radius(mo)
+            traily = MOBJ_y(mo) + MOBJ_radius(mo)
+        }
+
+        bestslidefrac = MAP_FRACUNIT + 1
+
+        P_PathTraverse(leadx, leady, leadx + MOBJ_momx(mo), leady + MOBJ_momy(mo),
+            MAP_PT_ADDLINES, PTR_SlideTraverse)
+        P_PathTraverse(trailx, leady, trailx + MOBJ_momx(mo), leady + MOBJ_momy(mo),
+            MAP_PT_ADDLINES, PTR_SlideTraverse)
+        P_PathTraverse(leadx, traily, leadx + MOBJ_momx(mo), traily + MOBJ_momy(mo),
+            MAP_PT_ADDLINES, PTR_SlideTraverse)
+
+        if bestslidefrac == MAP_FRACUNIT + 1 {
+            if P_TryMove(mo, MOBJ_x(mo), MOBJ_y(mo) + MOBJ_momy(mo)) == 0 {
+                P_TryMove(mo, MOBJ_x(mo) + MOBJ_momx(mo), MOBJ_y(mo))
+            }
+            return
+        }
+
+        bestslidefrac = bestslidefrac - 2048
+        if bestslidefrac > 0 {
+            let newx: i32 = FixedMul(MOBJ_momx(mo), bestslidefrac)
+            let newy: i32 = FixedMul(MOBJ_momy(mo), bestslidefrac)
+            if P_TryMove(mo, MOBJ_x(mo) + newx, MOBJ_y(mo) + newy) == 0 {
+                # stairstep via loop continue path: bump hitcount to 2 so next iter hits 3
+                # Match C goto stairstep: try y then x and return.
+                if P_TryMove(mo, MOBJ_x(mo), MOBJ_y(mo) + MOBJ_momy(mo)) == 0 {
+                    P_TryMove(mo, MOBJ_x(mo) + MOBJ_momx(mo), MOBJ_y(mo))
+                }
+                return
+            }
+        }
+
+        bestslidefrac = MAP_FRACUNIT - (bestslidefrac + 2048)
+
+        if bestslidefrac > MAP_FRACUNIT {
+            bestslidefrac = MAP_FRACUNIT
+        }
+
+        if bestslidefrac <= 0 {
+            return
+        }
+
+        tmxmove = FixedMul(MOBJ_momx(mo), bestslidefrac)
+        tmymove = FixedMul(MOBJ_momy(mo), bestslidefrac)
+
+        P_HitSlideLine(bestslideline)
+
+        MOBJ_set_momx(mo, tmxmove)
+        MOBJ_set_momy(mo, tmymove)
+
+        if P_TryMove(mo, MOBJ_x(mo) + tmxmove, MOBJ_y(mo) + tmymove) != 0 {
+            done = 1
+        }
+    }
+}
+
+# ---- PTR_AimTraverse --------------------------------------------------
+
+@flow_api
+function PTR_AimTraverse(icpt: ptr<void>) -> i32 {
+    if MAPUTL_intercept_isaline(icpt) != 0 {
+        let li: ptr<void> = MAPUTL_intercept_line(icpt)
+
+        if (GEOM_line_flags(li) & MAP_ML_TWOSIDED) == 0 {
+            return 0
+        }
+
+        P_LineOpening(li)
+
+        if MAPUTL_openbottom() >= MAPUTL_opentop() {
+            return 0
+        }
+
+        let dist: i32 = FixedMul(MAP_attackrange(), MAPUTL_intercept_frac(icpt))
+
+        let back: ptr<void> = GEOM_line_backsector(li)
+        let front: ptr<void> = GEOM_line_frontsector(li)
+
+        if (back as i64) == 0
+            or GEOM_sector_floorheight(front) != GEOM_sector_floorheight(back) {
+            let slope: i32 = FixedDiv(MAPUTL_openbottom() - shootz, dist)
+            if slope > SIGHT_bottomslope() {
+                SIGHT_set_bottomslope(slope)
+            }
+        }
+
+        if (back as i64) == 0
+            or GEOM_sector_ceilingheight(front) != GEOM_sector_ceilingheight(back) {
+            let slope2: i32 = FixedDiv(MAPUTL_opentop() - shootz, dist)
+            if slope2 < SIGHT_topslope() {
+                SIGHT_set_topslope(slope2)
+            }
+        }
+
+        if SIGHT_topslope() <= SIGHT_bottomslope() {
+            return 0
+        }
+        return 1
+    }
+
+    let th: ptr<void> = MAPUTL_intercept_thing(icpt)
+    if (th as i64) == (shootthing as i64) {
+        return 1
+    }
+
+    if (MOBJ_flags(th) & MAP_MF_SHOOTABLE) == 0 {
+        return 1
+    }
+
+    let dist2: i32 = FixedMul(MAP_attackrange(), MAPUTL_intercept_frac(icpt))
+    let mut thingtopslope: i32 = FixedDiv(
+        MOBJ_z(th) + MOBJ_height(th) - shootz, dist2)
+
+    if thingtopslope < SIGHT_bottomslope() {
+        return 1
+    }
+
+    let mut thingbottomslope: i32 = FixedDiv(MOBJ_z(th) - shootz, dist2)
+
+    if thingbottomslope > SIGHT_topslope() {
+        return 1
+    }
+
+    if thingtopslope > SIGHT_topslope() {
+        thingtopslope = SIGHT_topslope()
+    }
+    if thingbottomslope < SIGHT_bottomslope() {
+        thingbottomslope = SIGHT_bottomslope()
+    }
+
+    aimslope = (thingtopslope + thingbottomslope) / 2
+    MAP_set_linetarget(th)
+    return 0
+}
+
+# ---- PTR_ShootTraverse ------------------------------------------------
+
+@flow_api
+function PTR_ShootTraverse(icpt: ptr<void>) -> i32 {
+    if MAPUTL_intercept_isaline(icpt) != 0 {
+        let li: ptr<void> = MAPUTL_intercept_line(icpt)
+
+        if GEOM_line_special(li) != 0 {
+            P_ShootSpecialLine(shootthing, li)
+        }
+
+        let mut hitline: i32 = 0
+
+        if (GEOM_line_flags(li) & MAP_ML_TWOSIDED) == 0 {
+            hitline = 1
+        } else {
+            P_LineOpening(li)
+            let dist: i32 = FixedMul(MAP_attackrange(), MAPUTL_intercept_frac(icpt))
+            let back: ptr<void> = GEOM_line_backsector(li)
+            let front: ptr<void> = GEOM_line_frontsector(li)
+
+            if (back as i64) == 0 {
+                let slope: i32 = FixedDiv(MAPUTL_openbottom() - shootz, dist)
+                if slope > aimslope {
+                    hitline = 1
+                }
+                if hitline == 0 {
+                    let slope2: i32 = FixedDiv(MAPUTL_opentop() - shootz, dist)
+                    if slope2 < aimslope {
+                        hitline = 1
+                    }
+                }
+            } else {
+                if GEOM_sector_floorheight(front) != GEOM_sector_floorheight(back) {
+                    let slope3: i32 = FixedDiv(MAPUTL_openbottom() - shootz, dist)
+                    if slope3 > aimslope {
+                        hitline = 1
+                    }
+                }
+                if hitline == 0
+                    and GEOM_sector_ceilingheight(front) != GEOM_sector_ceilingheight(back) {
+                    let slope4: i32 = FixedDiv(MAPUTL_opentop() - shootz, dist)
+                    if slope4 < aimslope {
+                        hitline = 1
+                    }
+                }
+            }
+        }
+
+        if hitline == 0 {
+            return 1
+        }
+
+        let frac: i32 = MAPUTL_intercept_frac(icpt) - FixedDiv(4 * MAP_FRACUNIT, MAP_attackrange())
+        let x: i32 = MAPUTL_trace_x() + FixedMul(MAPUTL_trace_dx(), frac)
+        let y: i32 = MAPUTL_trace_y() + FixedMul(MAPUTL_trace_dy(), frac)
+        let z: i32 = shootz + FixedMul(aimslope, FixedMul(frac, MAP_attackrange()))
+
+        let front2: ptr<void> = GEOM_line_frontsector(li)
+        if GEOM_sector_ceilingpic(front2) == SKY_skyflatnum() {
+            if z > GEOM_sector_ceilingheight(front2) {
+                return 0
+            }
+            let back2: ptr<void> = GEOM_line_backsector(li)
+            if (back2 as i64) != 0 and GEOM_sector_ceilingpic(back2) == SKY_skyflatnum() {
+                return 0
+            }
+        }
+
+        P_SpawnPuff(x, y, z)
+        return 0
+    }
+
+    let th: ptr<void> = MAPUTL_intercept_thing(icpt)
+    if (th as i64) == (shootthing as i64) {
+        return 1
+    }
+
+    if (MOBJ_flags(th) & MAP_MF_SHOOTABLE) == 0 {
+        return 1
+    }
+
+    let dist2: i32 = FixedMul(MAP_attackrange(), MAPUTL_intercept_frac(icpt))
+    let thingtopslope: i32 = FixedDiv(
+        MOBJ_z(th) + MOBJ_height(th) - shootz, dist2)
+
+    if thingtopslope < aimslope {
+        return 1
+    }
+
+    let thingbottomslope: i32 = FixedDiv(MOBJ_z(th) - shootz, dist2)
+    if thingbottomslope > aimslope {
+        return 1
+    }
+
+    let frac2: i32 = MAPUTL_intercept_frac(icpt) - FixedDiv(10 * MAP_FRACUNIT, MAP_attackrange())
+    let x2: i32 = MAPUTL_trace_x() + FixedMul(MAPUTL_trace_dx(), frac2)
+    let y2: i32 = MAPUTL_trace_y() + FixedMul(MAPUTL_trace_dy(), frac2)
+    let z2: i32 = shootz + FixedMul(aimslope, FixedMul(frac2, MAP_attackrange()))
+
+    if (MOBJ_flags(th) & MAP_MF_NOBLOOD) != 0 {
+        P_SpawnPuff(x2, y2, z2)
+    } else {
+        P_SpawnBlood(x2, y2, z2, la_damage)
+    }
+
+    if la_damage != 0 {
+        P_DamageMobj(th, shootthing, shootthing, la_damage)
+    }
+
+    return 0
+}
+
+# ---- P_AimLineAttack --------------------------------------------------
+
+@flow_api
+function P_AimLineAttack(t1_in: ptr<void>, angle_in: u32, distance: i32) -> i32 {
+    let t1: ptr<void> = P_SubstNullMobj(t1_in)
+    let angle: u32 = angle_in >> MAP_ANGLETOFINESHIFT
+    shootthing = t1
+
+    let x2: i32 = MOBJ_x(t1) + (distance >> MAP_FRACBITS) * TABLES_finecosine(angle as i32)
+    let y2: i32 = MOBJ_y(t1) + (distance >> MAP_FRACBITS) * TABLES_finesine(angle as i32)
+    shootz = MOBJ_z(t1) + (MOBJ_height(t1) >> 1) + 8 * MAP_FRACUNIT
+
+    SIGHT_set_topslope(100 * MAP_FRACUNIT / 160)
+    SIGHT_set_bottomslope(0 - (100 * MAP_FRACUNIT / 160))
+
+    MAP_set_attackrange(distance)
+    MAP_set_linetarget(null)
+
+    P_PathTraverse(MOBJ_x(t1), MOBJ_y(t1), x2, y2,
+        MAP_PT_ADDLINES | MAP_PT_ADDTHINGS, PTR_AimTraverse)
+
+    if (MAP_linetarget() as i64) != 0 {
+        return aimslope
+    }
+    return 0
+}
+
+# ---- P_LineAttack -----------------------------------------------------
+
+@flow_api
+function P_LineAttack(t1: ptr<void>, angle_in: u32, distance: i32, slope: i32, damage: i32) -> void {
+    let angle: u32 = angle_in >> MAP_ANGLETOFINESHIFT
+    shootthing = t1
+    la_damage = damage
+    let x2: i32 = MOBJ_x(t1) + (distance >> MAP_FRACBITS) * TABLES_finecosine(angle as i32)
+    let y2: i32 = MOBJ_y(t1) + (distance >> MAP_FRACBITS) * TABLES_finesine(angle as i32)
+    shootz = MOBJ_z(t1) + (MOBJ_height(t1) >> 1) + 8 * MAP_FRACUNIT
+    MAP_set_attackrange(distance)
+    aimslope = slope
+
+    P_PathTraverse(MOBJ_x(t1), MOBJ_y(t1), x2, y2,
+        MAP_PT_ADDLINES | MAP_PT_ADDTHINGS, PTR_ShootTraverse)
+}
+
+# ---- PTR_UseTraverse --------------------------------------------------
+
+@flow_api
+function PTR_UseTraverse(icpt: ptr<void>) -> i32 {
+    let line: ptr<void> = MAPUTL_intercept_line(icpt)
+
+    if GEOM_line_special(line) == 0 {
+        P_LineOpening(line)
+        if MAPUTL_openrange() <= 0 {
+            S_StartSound(usething, MAP_SFX_NOWAY)
+            return 0
+        }
+        return 1
+    }
+
+    let mut side: i32 = 0
+    if P_PointOnLineSide(MOBJ_x(usething), MOBJ_y(usething), line) == 1 {
+        side = 1
+    }
+
+    P_UseSpecialLine(usething, line, side)
+    return 0
+}
+
+# ---- P_UseLines -------------------------------------------------------
+
+@flow_api
+function P_UseLines(player: ptr<void>) -> void {
+    usething = PLAYER_mo(player)
+    let angle: u32 = MOBJ_angle(usething) >> MAP_ANGLETOFINESHIFT
+    let x1: i32 = MOBJ_x(usething)
+    let y1: i32 = MOBJ_y(usething)
+    let x2: i32 = x1 + (MAP_USERANGE >> MAP_FRACBITS) * TABLES_finecosine(angle as i32)
+    let y2: i32 = y1 + (MAP_USERANGE >> MAP_FRACBITS) * TABLES_finesine(angle as i32)
+    P_PathTraverse(x1, y1, x2, y2, MAP_PT_ADDLINES, PTR_UseTraverse)
+}
+
+# ---- PIT_RadiusAttack -------------------------------------------------
+
+@flow_api
+function PIT_RadiusAttack(thing: ptr<void>) -> i32 {
+    if (MOBJ_flags(thing) & MAP_MF_SHOOTABLE) == 0 {
+        return 1
+    }
+
+    let mtype: i32 = MOBJ_type(thing)
+    if mtype == MAP_MT_CYBORG or mtype == MAP_MT_SPIDER {
+        return 1
+    }
+
+    let dx: i32 = map_abs(MOBJ_x(thing) - MOBJ_x(bombspot))
+    let dy: i32 = map_abs(MOBJ_y(thing) - MOBJ_y(bombspot))
+    let mut dist: i32 = dx
+    if dy > dx {
+        dist = dy
+    }
+    dist = (dist - MOBJ_radius(thing)) >> MAP_FRACBITS
+    if dist < 0 {
+        dist = 0
+    }
+
+    if dist >= bombdamage {
+        return 1
+    }
+
+    if P_CheckSight(thing, bombspot) != 0 {
+        P_DamageMobj(thing, bombspot, bombsource, bombdamage - dist)
+    }
+    return 1
+}
+
+# ---- P_RadiusAttack ---------------------------------------------------
+
+@flow_api
+function P_RadiusAttack(spot: ptr<void>, source: ptr<void>, damage: i32) -> void {
+    let dist: i32 = (damage + MAP_MAXRADIUS) << MAP_FRACBITS
+    let yh: i32 = (MOBJ_y(spot) + dist - GEOM_bmaporgy()) >> MAP_MAPBLOCKSHIFT
+    let yl: i32 = (MOBJ_y(spot) - dist - GEOM_bmaporgy()) >> MAP_MAPBLOCKSHIFT
+    let xh: i32 = (MOBJ_x(spot) + dist - GEOM_bmaporgx()) >> MAP_MAPBLOCKSHIFT
+    let xl: i32 = (MOBJ_x(spot) - dist - GEOM_bmaporgx()) >> MAP_MAPBLOCKSHIFT
+    bombspot = spot
+    bombsource = source
+    bombdamage = damage
+
+    for y in yl to (yh + 1) {
+        for x in xl to (xh + 1) {
+            P_BlockThingsIterator(x, y, PIT_RadiusAttack)
+        }
+    }
+}
+
+# ---- PIT_ChangeSector -------------------------------------------------
+
+@flow_api
+function PIT_ChangeSector(thing: ptr<void>) -> i32 {
+    if P_ThingHeightClip(thing) != 0 {
+        return 1
+    }
+
+    if MOBJ_health(thing) <= 0 {
+        P_SetMobjState(thing, MAP_S_GIBS)
+        MOBJ_set_flags(thing, MOBJ_flags(thing) & (0 - 1 - MAP_MF_SOLID))
+        MOBJ_set_height(thing, 0)
+        MOBJ_set_radius(thing, 0)
+        return 1
+    }
+
+    if (MOBJ_flags(thing) & MAP_MF_DROPPED) != 0 {
+        P_RemoveMobj(thing)
+        return 1
+    }
+
+    if (MOBJ_flags(thing) & MAP_MF_SHOOTABLE) == 0 {
+        return 1
+    }
+
+    mapshim_set_nofit(1)
+
+    if MAP_crushchange() != 0 and (STAT_leveltime() & 3) == 0 {
+        P_DamageMobj(thing, null, null, 10)
+        let blood: ptr<void> = P_SpawnMobj(
+            MOBJ_x(thing),
+            MOBJ_y(thing),
+            MOBJ_z(thing) + MOBJ_height(thing) / 2,
+            MAP_MT_BLOOD)
+        MOBJ_set_momx(blood, (P_Random() - P_Random()) << 12)
+        MOBJ_set_momy(blood, (P_Random() - P_Random()) << 12)
+    }
+
+    return 1
+}
+
+# ---- P_ChangeSector ---------------------------------------------------
+
+@flow_api
+function P_ChangeSector(sector: ptr<void>, crunch: i32) -> i32 {
+    mapshim_set_nofit(0)
+    mapshim_set_crushchange(crunch)
+
+    let xl: i32 = GEOM_sector_blockbox(sector, MAP_BOXLEFT)
+    let xh: i32 = GEOM_sector_blockbox(sector, MAP_BOXRIGHT)
+    let yl: i32 = GEOM_sector_blockbox(sector, MAP_BOXBOTTOM)
+    let yh: i32 = GEOM_sector_blockbox(sector, MAP_BOXTOP)
+
+    for x in xl to (xh + 1) {
+        for y in yl to (yh + 1) {
+            P_BlockThingsIterator(x, y, PIT_ChangeSector)
+        }
+    }
+
+    return MAP_nofit()
+}

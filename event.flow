@@ -1,0 +1,50 @@
+# Event queue, ported from d_event.c to Flow.
+#
+# event_t (d_event.h) is evtype_t + int data1..data4, five 4-byte
+# fields, 20 bytes, verified with sizeof. Events are C structs passed by
+# pointer; D_PostEvent COPIES the caller's event into the queue, and
+# D_PopEvent hands back a pointer into the queue slot.
+#
+# grep over doomgeneric/*.c shows the queue is only touched through
+# D_PostEvent (i_input.c, i_joystick.c) and D_PopEvent (d_main.c);
+# nothing reads events[]/eventhead/eventtail directly, so the queue
+# state stays private to this module. The C static array becomes a
+# lazily calloc'd buffer of identical size; same zero-initial contents,
+# same layout.
+
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+
+# MAXEVENTS from d_event.c.
+const MAXEVENTS: i32 = 64
+# sizeof(event_t), d_event.h: 5 x i32.
+const EVENT_SIZE: i32 = 20
+
+let mut ev_buf: ptr<u8> = null
+let mut eventhead: i32 = 0
+let mut eventtail: i32 = 0
+
+function ev_slot(i: i32) -> ptr<void> {
+    if (ev_buf as i64) == 0 {
+        ev_buf = calloc(MAXEVENTS as i64, EVENT_SIZE as i64) as ptr<u8>
+    }
+    return ((ev_buf as i64) + (i * EVENT_SIZE) as i64) as ptr<void>
+}
+
+# Called by the I/O functions when input is detected.
+@flow_api
+function D_PostEvent(ev: ptr<void>) -> void {
+    memcpy(ev_slot(eventhead), ev, EVENT_SIZE as i64)
+    eventhead = (eventhead + 1) % MAXEVENTS
+}
+
+# Read an event from the queue; NULL when no events are waiting.
+@flow_api
+function D_PopEvent() -> ptr<void> {
+    if eventtail == eventhead {
+        return null
+    }
+    let result: ptr<void> = ev_slot(eventtail)
+    eventtail = (eventtail + 1) % MAXEVENTS
+    return result
+}

@@ -1,0 +1,1622 @@
+# Doom main / demo loop, ported from d_main.c to Flow.
+#
+# Public ABI (d_main.h / doomgeneric.h / doom.h): D_ProcessEvents,
+# D_PageTicker, D_PageDrawer, D_AdvanceDemo, D_DoAdvanceDemo, D_StartTitle,
+# D_DoomMain, doomgeneric_Tick. Also D_Display / D_BindVariables /
+# D_GrabMouseCallback / D_IdentifyVersion / D_SetGameDescription /
+# D_DoomLoop (internal in C but exported for fidelity).
+#
+# Doomstat start flags / savegamedir / wipegamestate live here as `let mut`
+# + @flow_api (was dmain_data.c). Private D_Main / demo-loop state and
+# helpers live here too. FEATURE_DEHACKED / MULTIPLAYER / WAD_MERGE /
+# ORIGCODE off — DEH_String identity; GetGameName / PrintDehackedBanners /
+# BFG DEH_AddStringReplacement are no-ops.
+#
+# Helpers prefixed dmain_*. Consts use DMAIN_. Reserved: handle, type.
+
+extern { function printf(fmt: string) -> i32 }
+extern { function printf(fmt: string, s: string) -> i32 }
+extern { function printf(fmt: string, a: string, b: string) -> i32 }
+extern { function printf(fmt: string, a: i32) -> i32 }
+extern { function strcmp(a: string, b: string) -> i32 }
+extern { function snprintf(buf: string, n: i64, fmt: string, s: string) -> i32 }
+extern { function malloc(n: i64) -> ptr<void> }
+extern { function exit(code: i32) -> void }
+
+extern { function I_Error(msg: string) -> void }
+extern { function I_AtExit(func: ptr<void>, run_on_error: i32) -> void }
+extern { function I_PrintBanner(msg: string) -> void }
+extern { function I_PrintDivider() -> void }
+extern { function I_PrintStartupBanner(gamedescription: string) -> void }
+extern { function I_Sleep(ms: i32) -> void }
+extern { function I_GetTime() -> i32 }
+extern { function I_StartFrame() -> void }
+extern { function I_UpdateNoBlit() -> void }
+extern { function I_FinishUpdate() -> void }
+extern { function I_SetPalette(pal: ptr<u8>) -> void }
+extern { function I_SetWindowTitle(title: string) -> void }
+extern { function I_GraphicsCheckCommandLine() -> void }
+extern { function I_SetGrabMouseCallback(func: ptr<void>) -> void }
+extern { function I_InitGraphics() -> void }
+extern { function I_EnableLoadingDisk() -> void }
+extern { function I_BindVideoVariables() -> void }
+extern { function I_DisplayFPSDots(dots_on: i32) -> void }
+extern { function I_CheckIsScreensaver() -> void }
+extern { function I_InitTimer() -> void }
+extern { function I_InitJoystick() -> void }
+extern { function I_InitSound(use_sfx_prefix: i32) -> void }
+extern { function I_InitMusic() -> void }
+extern { function I_BindJoystickVariables() -> void }
+extern { function I_BindSoundVariables() -> void }
+extern { function I_Endoom(endoom_data: ptr<u8>) -> void }
+
+extern { function Z_Init() -> void }
+extern { function V_Init() -> void }
+extern { function V_RestoreBuffer() -> void }
+extern { function V_DrawPatch(x: i32, y: i32, patch: ptr<void>) -> void }
+extern { function V_DrawPatchDirect(x: i32, y: i32, patch: ptr<void>) -> void }
+extern { function V_DrawMouseSpeedBox(speed: i32) -> void }
+
+extern { function W_AddFile(filename: string) -> ptr<void> }
+extern { function W_CheckCorrectIWAD(mission: i32) -> void }
+extern { function W_CheckNumForName(name: string) -> i32 }
+extern { function W_CacheLumpName(name: string, tag: i32) -> ptr<void> }
+extern { function W_ParseCommandLine() -> i32 }
+extern { function W_GenerateHashTable() -> void }
+
+extern { function M_CheckParm(check: string) -> i32 }
+extern { function M_CheckParmWithArgs(check: string, num_args: i32) -> i32 }
+extern { function M_ParmExists(check: string) -> i32 }
+extern { function M_SetConfigDir(dir: string) -> void }
+extern { function M_SetConfigFilenames(main_config: string, extra_config: string) -> void }
+extern { function M_LoadDefaults() -> void }
+extern { function M_SaveDefaults() -> void }
+extern { function M_BindVariable(name: string, location: ptr<void>) -> void }
+extern { function M_GetSaveGameDir(iwadname: string) -> string }
+extern { function M_ApplyPlatformDefaults() -> void }
+extern { function M_BindBaseControls() -> void }
+extern { function M_BindWeaponControls() -> void }
+extern { function M_BindMapControls() -> void }
+extern { function M_BindMenuControls() -> void }
+extern { function M_BindChatControls(num_players: u32) -> void }
+extern { function M_Responder(ev: ptr<i32>) -> i32 }
+extern { function M_Drawer() -> void }
+extern { function M_Init() -> void }
+extern { function M_StringCopy(dest: ptr<u8>, src: ptr<u8>, dest_size: i64) -> i32 }
+extern { function M_StringEndsWith(s: ptr<u8>, suffix: ptr<u8>) -> i32 }
+
+extern { function D_FindIWAD(mask: i32, mission: ptr<i32>) -> string }
+extern { function D_SaveGameIWADName(gamemission: i32) -> string }
+extern { function D_PopEvent() -> ptr<void> }
+extern { function D_StartGameLoop() -> void }
+extern { function D_ConnectNetGame() -> void }
+extern { function D_CheckNetGame() -> void }
+extern { function TryRunTics() -> void }
+extern { function NetUpdate() -> void }
+
+extern { function G_Responder(ev: ptr<void>) -> i32 }
+extern { function G_BeginRecording() -> void }
+extern { function G_DeferedPlayDemo(demo: string) -> void }
+extern { function G_TimeDemo(name: string) -> void }
+extern { function G_RecordDemo(name: string) -> void }
+extern { function G_InitNew(skill: i32, episode: i32, map: i32) -> void }
+extern { function G_LoadGame(name: string) -> void }
+extern { function G_CheckDemoStatus() -> i32 }
+
+extern { function R_ExecuteSetViewSize() -> void }
+extern { function R_RenderPlayerView(player: ptr<void>) -> void }
+extern { function R_FillBackScreen() -> void }
+extern { function R_DrawViewBorder() -> void }
+extern { function R_Init() -> void }
+
+extern { function S_UpdateSounds(listener: ptr<void>) -> void }
+extern { function S_StartMusic(music_id: i32) -> void }
+extern { function S_Init(sfx_vol: i32, music_vol: i32) -> void }
+
+extern { function HU_Erase() -> void }
+extern { function HU_Drawer() -> void }
+extern { function HU_Init() -> void }
+extern { function ST_Drawer(fullscreen: i32, refresh: i32) -> void }
+extern { function ST_Init() -> void }
+extern { function AM_Drawer() -> void }
+extern { function WI_Drawer() -> void }
+extern { function F_Drawer() -> void }
+extern { function P_Init() -> void }
+extern { function StatDump() -> void }
+
+extern { function wipe_StartScreen(x: i32, y: i32, width: i32, height: i32) -> i32 }
+extern { function wipe_EndScreen(x: i32, y: i32, width: i32, height: i32) -> i32 }
+extern { function wipe_ScreenWipe(wipeno: i32, x: i32, y: i32, width: i32, height: i32, ticks: i32) -> i32 }
+
+extern { function argvflow_argc() -> i32 }
+extern { function argvflow_argv() -> ptr<i64> }
+extern { function DRAW_scaledviewwidth() -> i32 }
+extern { function DRAW_viewheight() -> i32 }
+
+extern { function gameshim_forwardmove(i: i32) -> i32 }
+extern { function gameshim_set_forwardmove(i: i32, v: i32) -> void }
+extern { function gameshim_sidemove(i: i32) -> i32 }
+extern { function gameshim_set_sidemove(i: i32, v: i32) -> void }
+extern { function gameshim_vanilla_savegame_limit_addr() -> ptr<void> }
+extern { function gameshim_vanilla_demo_limit_addr() -> ptr<void> }
+
+extern { function SOUND_sfxvolume_addr() -> ptr<i32> }
+extern { function SOUND_musicvolume_addr() -> ptr<i32> }
+extern { function SOUND_snd_channels_addr() -> ptr<i32> }
+extern { function hushim_chat_macro_bind_addr(i: i32) -> ptr<void> }
+extern { function ctrlshim_set_key_multi_msgplayer(i: i32, v: i32) -> void }
+extern { function wadflow_lumpinfo() -> ptr<u8> }
+extern { function wadflow_numlumps() -> u32 }
+extern { function P_SaveGameFile(slot: i32) -> string }
+
+extern { function STAT_nomonsters() -> i32 }
+extern { function STAT_set_nomonsters(v: i32) -> void }
+extern { function STAT_respawnparm() -> i32 }
+extern { function STAT_set_respawnparm(v: i32) -> void }
+extern { function STAT_fastparm() -> i32 }
+extern { function STAT_set_fastparm(v: i32) -> void }
+extern { function STAT_startskill() -> i32 }
+extern { function STAT_set_startskill(v: i32) -> void }
+extern { function STAT_startepisode() -> i32 }
+extern { function STAT_set_startepisode(v: i32) -> void }
+extern { function STAT_startmap() -> i32 }
+extern { function STAT_set_startmap(v: i32) -> void }
+extern { function STAT_autostart() -> i32 }
+extern { function STAT_set_autostart(v: i32) -> void }
+extern { function STAT_startloadgame() -> i32 }
+extern { function STAT_set_startloadgame(v: i32) -> void }
+extern { function STAT_bfgedition() -> i32 }
+extern { function STAT_set_bfgedition(v: i32) -> void }
+extern { function STAT_wipegamestate() -> i32 }
+extern { function STAT_set_wipegamestate(v: i32) -> void }
+extern { function STAT_gamemission() -> i32 }
+extern { function STAT_set_gamemission(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+
+# Private D_Main / demo-loop state (was dmain_shim.c).
+# Storage names differ from accessors (Flow emits both as C symbols).
+let mut dmain_iwad: string = null as string
+let mut dmain_devparm: i32 = 0
+let mut dmain_advancedemo: i32 = 0
+let mut dmain_storedemo: i32 = 0
+let mut dmain_loop_started: i32 = 0
+let mut dmain_endoom_flag: i32 = 1
+let mut dmain_demosequence: i32 = 0
+let mut dmain_pagetic: i32 = 0
+let mut dmain_pagename: string = null as string
+
+# Formerly dmain_data.c DEFINEs
+# Storage name differs from @flow_api getter (C forbids same-symbol var+fn).
+let mut dmain_savegamedir_val: string = null as string
+let mut dmain_nomonsters: i32 = 0
+let mut dmain_respawnparm: i32 = 0
+let mut dmain_fastparm: i32 = 0
+let mut dmain_autostart: i32 = 0
+let mut dmain_bfgedition: i32 = 0
+let mut dmain_startskill: i32 = 0
+let mut dmain_startepisode: i32 = 0
+let mut dmain_startmap: i32 = 0
+let mut dmain_startloadgame: i32 = 0
+let mut dmain_wipegamestate: i32 = 3
+
+@flow_api
+function dmain_set_savegamedir(v: string) -> void { dmain_savegamedir_val = v }
+@flow_api
+function dmain_savegamedir() -> string { return dmain_savegamedir_val }
+
+@flow_api
+function gameshim_nomonsters() -> i32 { return dmain_nomonsters }
+@flow_api
+function gameshim_set_nomonsters(v: i32) -> void { dmain_nomonsters = v }
+@flow_api
+function gameshim_respawnparm() -> i32 { return dmain_respawnparm }
+@flow_api
+function gameshim_set_respawnparm(v: i32) -> void { dmain_respawnparm = v }
+@flow_api
+function gameshim_fastparm() -> i32 { return dmain_fastparm }
+@flow_api
+function gameshim_set_fastparm(v: i32) -> void { dmain_fastparm = v }
+@flow_api
+function gameshim_startskill() -> i32 { return dmain_startskill }
+@flow_api
+function gameshim_set_startskill(v: i32) -> void { dmain_startskill = v }
+@flow_api
+function gameshim_startepisode() -> i32 { return dmain_startepisode }
+@flow_api
+function gameshim_set_startepisode(v: i32) -> void { dmain_startepisode = v }
+@flow_api
+function gameshim_startmap() -> i32 { return dmain_startmap }
+@flow_api
+function gameshim_set_startmap(v: i32) -> void { dmain_startmap = v }
+@flow_api
+function gameshim_startloadgame() -> i32 { return dmain_startloadgame }
+@flow_api
+function gameshim_set_startloadgame(v: i32) -> void { dmain_startloadgame = v }
+@flow_api
+function gameshim_autostart() -> i32 { return dmain_autostart }
+@flow_api
+function gameshim_set_autostart(v: i32) -> void { dmain_autostart = v }
+@flow_api
+function gameshim_wipegamestate() -> i32 { return dmain_wipegamestate }
+@flow_api
+function gameshim_set_wipegamestate(v: i32) -> void { dmain_wipegamestate = v }
+@flow_api
+function gameshim_bfgedition() -> i32 { return dmain_bfgedition }
+@flow_api
+function gameshim_set_bfgedition(v: i32) -> void { dmain_bfgedition = v }
+
+@flow_api
+function dmain_apply_turbo(scale: i32) -> void {
+    printf("turbo scale: %i%%\n", scale)
+    gameshim_set_forwardmove(0, gameshim_forwardmove(0) * scale / 100)
+    gameshim_set_forwardmove(1, gameshim_forwardmove(1) * scale / 100)
+    gameshim_set_sidemove(0, gameshim_sidemove(0) * scale / 100)
+    gameshim_set_sidemove(1, gameshim_sidemove(1) * scale / 100)
+}
+
+@flow_api
+function dmain_vanilla_save_addr() -> ptr<void> {
+    return gameshim_vanilla_savegame_limit_addr()
+}
+@flow_api
+function dmain_vanilla_demo_addr() -> ptr<void> {
+    return gameshim_vanilla_demo_limit_addr()
+}
+
+@flow_api
+function STAT_devparm() -> i32 { return dmain_devparm }
+@flow_api
+function STAT_set_devparm(v: i32) -> void { dmain_devparm = v }
+@flow_api
+function STAT_advancedemo() -> i32 { return dmain_advancedemo }
+@flow_api
+function STAT_set_advancedemo(v: i32) -> void { dmain_advancedemo = v }
+@flow_api
+function STAT_drone() -> i32 { return 0 }
+@flow_api
+function STAT_storedemo() -> i32 { return dmain_storedemo }
+@flow_api
+function STAT_set_storedemo(v: i32) -> void { dmain_storedemo = v }
+
+@flow_api
+function DEMO_demosequence() -> i32 { return dmain_demosequence }
+@flow_api
+function DEMO_set_demosequence(v: i32) -> void { dmain_demosequence = v }
+@flow_api
+function DEMO_pagetic() -> i32 { return dmain_pagetic }
+@flow_api
+function DEMO_set_pagetic(v: i32) -> void { dmain_pagetic = v }
+@flow_api
+function DEMO_pagename() -> string { return dmain_pagename }
+@flow_api
+function DEMO_set_pagename(v: string) -> void { dmain_pagename = v }
+
+function dmain_set_iwadfile(v: string) -> void { dmain_iwad = v }
+function dmain_iwadfile() -> string { return dmain_iwad }
+function dmain_set_main_loop_started(v: i32) -> void { dmain_loop_started = v }
+function dmain_main_loop_started() -> i32 { return dmain_loop_started }
+function dmain_show_endoom() -> i32 { return dmain_endoom_flag }
+
+function dmain_tolower(c: i32) -> i32 {
+    if c >= 65 and c <= 90 {
+        return c + 32
+    }
+    return c
+}
+
+function dmain_strcasecmp(a: string, b: string) -> i32 {
+    let ap: ptr<u8> = a as ptr<u8>
+    let bp: ptr<u8> = b as ptr<u8>
+    let mut i: i32 = 0
+    while true {
+        let ca: i32 = dmain_tolower(ap[i] as i32)
+        let cb: i32 = dmain_tolower(bp[i] as i32)
+        if ca != cb {
+            return ca - cb
+        }
+        if ca == 0 {
+            return 0
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+function dmain_name_ieq8(a: ptr<u8>, b: ptr<u8>) -> bool {
+    for i in 0 to 8 {
+        let ca: i32 = dmain_tolower(a[i] as i32)
+        let cb: i32 = dmain_tolower(b[i] as i32)
+        if ca != cb {
+            return false
+        }
+        if ca == 0 {
+            return true
+        }
+    }
+    return true
+}
+
+function dmain_str_join3(a: string, b: string, c: string) -> string {
+    let la: i64 = 0
+    let lb: i64 = 0
+    let lc: i64 = 0
+    let ap: ptr<u8> = a as ptr<u8>
+    let bp: ptr<u8> = b as ptr<u8>
+    let cp: ptr<u8> = c as ptr<u8>
+    while ap[la] as i32 != 0 {
+        la = la + 1
+    }
+    while bp[lb] as i32 != 0 {
+        lb = lb + 1
+    }
+    while cp[lc] as i32 != 0 {
+        lc = lc + 1
+    }
+    let result: ptr<u8> = malloc(la + lb + lc + 1) as ptr<u8>
+    let mut i: i64 = 0
+    while i < la {
+        result[i] = ap[i]
+        i = i + 1
+    }
+    i = 0
+    while i < lb {
+        result[la + i] = bp[i]
+        i = i + 1
+    }
+    i = 0
+    while i < lc {
+        result[la + lb + i] = cp[i]
+        i = i + 1
+    }
+    result[la + lb + lc] = 0 as u8
+    return result as string
+}
+
+function dmain_bind_addr(id: i32) -> ptr<void> {
+    if id == 1 {
+        return SOUND_sfxvolume_addr() as ptr<void>
+    }
+    if id == 2 {
+        return SOUND_musicvolume_addr() as ptr<void>
+    }
+    if id == 6 {
+        return SOUND_snd_channels_addr() as ptr<void>
+    }
+    if id == 7 {
+        return dmain_vanilla_save_addr()
+    }
+    if id == 8 {
+        return dmain_vanilla_demo_addr()
+    }
+    if id == 9 {
+        return &dmain_endoom_flag as ptr<void>
+    }
+    return null
+}
+
+function dmain_bind_chatmacro(i: i32) -> void {
+    let mut buf: array<u8, 12> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    buf[0] = 99 as u8
+    buf[1] = 104 as u8
+    buf[2] = 97 as u8
+    buf[3] = 116 as u8
+    buf[4] = 109 as u8
+    buf[5] = 97 as u8
+    buf[6] = 99 as u8
+    buf[7] = 114 as u8
+    buf[8] = 111 as u8
+    buf[9] = (48 + i) as u8
+    buf[10] = 0 as u8
+    M_BindVariable(buf as string, hushim_chat_macro_bind_addr(i))
+}
+
+function dmain_fmt_lmp(file: ptr<u8>, file_size: i32, name: string) -> void {
+    snprintf(file as string, file_size as i64, "%s.lmp", name)
+}
+
+const DMAIN_LUMP_STRIDE: i32 = 40
+
+function dmain_lump_name(lump: i32) -> ptr<u8> {
+    return ((wadflow_lumpinfo() as i64) + (lump as i64) * DMAIN_LUMP_STRIDE as i64) as ptr<u8>
+}
+
+function dmain_copy_lump_name(dest: ptr<u8>, dest_size: i32) -> void {
+    let n: i32 = wadflow_numlumps() as i32
+    M_StringCopy(dest, dmain_lump_name(n - 1), dest_size as i64)
+}
+
+function dmain_atoi(s: string) -> i32 {
+    let p: ptr<u8> = s as ptr<u8>
+    let mut i: i32 = 0
+    while p[i] as i32 == 32 or (p[i] as i32 >= 9 and p[i] as i32 <= 13) {
+        i = i + 1
+    }
+    let mut sign: i32 = 1
+    if p[i] as i32 == 45 {
+        sign = 0 - 1
+        i = i + 1
+    } elif p[i] as i32 == 43 {
+        i = i + 1
+    }
+    let mut v: i32 = 0
+    let mut c: i32 = p[i] as i32
+    while c >= 48 and c <= 57 {
+        v = v * 10 + (c - 48)
+        i = i + 1
+        c = p[i] as i32
+    }
+    return v * sign
+}
+
+function dmain_argv_str(argi: i32) -> string {
+    if argi < 0 or argi >= argvflow_argc() {
+        return ""
+    }
+    let words: ptr<i64> = argvflow_argv()
+    return words[argi] as ptr<u8> as string
+}
+
+function dmain_argv_byte(argi: i32, idx: i32) -> i32 {
+    if argi < 0 or argi >= argvflow_argc() {
+        return 0
+    }
+    let words: ptr<i64> = argvflow_argv()
+    let s: ptr<u8> = words[argi] as ptr<u8>
+    if (s as i64) == 0 {
+        return 0
+    }
+    return s[idx] as i32
+}
+
+function dmain_gameversion_match(cmdline: string) -> i32 {
+    if strcmp(cmdline, "1.666") == 0 {
+        return 1
+    }
+    if strcmp(cmdline, "1.7") == 0 {
+        return 2
+    }
+    if strcmp(cmdline, "1.8") == 0 {
+        return 3
+    }
+    if strcmp(cmdline, "1.9") == 0 {
+        return 4
+    }
+    if strcmp(cmdline, "hacx") == 0 {
+        return 5
+    }
+    if strcmp(cmdline, "ultimate") == 0 {
+        return 6
+    }
+    if strcmp(cmdline, "final") == 0 {
+        return 7
+    }
+    if strcmp(cmdline, "final2") == 0 {
+        return 8
+    }
+    if strcmp(cmdline, "chex") == 0 {
+        return 9
+    }
+    return 0 - 1
+}
+
+function dmain_print_supported_versions() -> void {
+    printf("Supported game versions:\n")
+    printf("\t%s (%s)\n", "1.666", "Doom 1.666")
+    printf("\t%s (%s)\n", "1.7", "Doom 1.7/1.7a")
+    printf("\t%s (%s)\n", "1.8", "Doom 1.8")
+    printf("\t%s (%s)\n", "1.9", "Doom 1.9")
+    printf("\t%s (%s)\n", "hacx", "Hacx")
+    printf("\t%s (%s)\n", "ultimate", "Ultimate Doom")
+    printf("\t%s (%s)\n", "final", "Final Doom")
+    printf("\t%s (%s)\n", "final2", "Final Doom (alt)")
+    printf("\t%s (%s)\n", "chex", "Chex Quest")
+}
+
+function dmain_print_emulating() -> void {
+    let v: i32 = STAT_gameversion()
+    if v == 1 {
+        printf("Emulating the behavior of the '%s' executable.\n", "Doom 1.666")
+    } elif v == 2 {
+        printf("Emulating the behavior of the '%s' executable.\n", "Doom 1.7/1.7a")
+    } elif v == 3 {
+        printf("Emulating the behavior of the '%s' executable.\n", "Doom 1.8")
+    } elif v == 4 {
+        printf("Emulating the behavior of the '%s' executable.\n", "Doom 1.9")
+    } elif v == 5 {
+        printf("Emulating the behavior of the '%s' executable.\n", "Hacx")
+    } elif v == 6 {
+        printf("Emulating the behavior of the '%s' executable.\n", "Ultimate Doom")
+    } elif v == 7 {
+        printf("Emulating the behavior of the '%s' executable.\n", "Final Doom")
+    } elif v == 8 {
+        printf("Emulating the behavior of the '%s' executable.\n", "Final Doom (alt)")
+    } elif v == 9 {
+        printf("Emulating the behavior of the '%s' executable.\n", "Chex Quest")
+    }
+}
+
+function dmain_set_mission_pack(pack_name: string) -> void {
+    if dmain_strcasecmp(pack_name, "doom2") == 0 {
+        STAT_set_gamemission(1)
+        return
+    }
+    if dmain_strcasecmp(pack_name, "tnt") == 0 {
+        STAT_set_gamemission(2)
+        return
+    }
+    if dmain_strcasecmp(pack_name, "plutonia") == 0 {
+        STAT_set_gamemission(3)
+        return
+    }
+    printf("Valid mission packs are:\n")
+    printf("\t%s\n", "doom2")
+    printf("\t%s\n", "tnt")
+    printf("\t%s\n", "plutonia")
+    I_Error(dmain_str_join3("Unknown mission pack name: ", pack_name, ""))
+}
+
+function dmain_identify_from_lumps() -> void {
+    let n: i32 = wadflow_numlumps() as i32
+    let map01: ptr<u8> = "MAP01" as ptr<u8>
+    let e1m1: ptr<u8> = "E1M1" as ptr<u8>
+    for i in 0 to n {
+        let name: ptr<u8> = dmain_lump_name(i)
+        if dmain_name_ieq8(name, map01) {
+            STAT_set_gamemission(1)
+            return
+        }
+        if dmain_name_ieq8(name, e1m1) {
+            STAT_set_gamemission(0)
+            return
+        }
+    }
+}
+
+function dmain_print_adding(filename: string) -> void {
+    printf(" adding %s\n", filename)
+}
+
+function dmain_print_playing_demo(file: string) -> void {
+    printf("Playing demo %s.\n", file)
+}
+
+function dmain_print_bfg_iwad_warn() -> void {
+    printf(" WARNING: You are playing using one of the Doom Classic\n")
+    printf(" IWAD files shipped with the Doom 3: BFG Edition. These are\n")
+    printf(" known to be incompatible with the regular IWAD files and\n")
+    printf(" may cause demos and network games to get out of sync.\n")
+}
+
+function dmain_print_bfg_edition() -> void {
+    printf("BFG Edition: Using workarounds as needed.\n")
+}
+
+function dmain_print_sprite_warn() -> void {
+    I_PrintDivider()
+    printf(" WARNING: The loaded WAD file contains modified sprites or\n")
+    printf(" floor textures.  You may want to use the '-merge' command\n")
+    printf(" line option instead of '-file'.\n")
+}
+
+function dmain_print_freedoom_warn() -> void {
+    printf(" WARNING: You are playing using one of the Freedoom IWAD\n")
+    printf(" files, which might not work in this port. See this page\n")
+    printf(" for more information on how to play using Freedoom:\n")
+    printf("   http://www.chocolate-doom.org/wiki/index.php/Freedoom\n")
+    I_PrintDivider()
+}
+
+function dmain_print_devstr() -> void {
+    printf("Development mode ON.\n")
+}
+
+function dmain_check_registered_lumps() -> i32 {
+    # Preserve shim typo: e3m3 listed twice (no e3m2).
+    if W_CheckNumForName("e2m1") < 0 { return 0 }
+    if W_CheckNumForName("e2m2") < 0 { return 0 }
+    if W_CheckNumForName("e2m3") < 0 { return 0 }
+    if W_CheckNumForName("e2m4") < 0 { return 0 }
+    if W_CheckNumForName("e2m5") < 0 { return 0 }
+    if W_CheckNumForName("e2m6") < 0 { return 0 }
+    if W_CheckNumForName("e2m7") < 0 { return 0 }
+    if W_CheckNumForName("e2m8") < 0 { return 0 }
+    if W_CheckNumForName("e2m9") < 0 { return 0 }
+    if W_CheckNumForName("e3m1") < 0 { return 0 }
+    if W_CheckNumForName("e3m3") < 0 { return 0 }
+    if W_CheckNumForName("e3m3") < 0 { return 0 }
+    if W_CheckNumForName("e3m4") < 0 { return 0 }
+    if W_CheckNumForName("e3m5") < 0 { return 0 }
+    if W_CheckNumForName("e3m6") < 0 { return 0 }
+    if W_CheckNumForName("e3m7") < 0 { return 0 }
+    if W_CheckNumForName("e3m8") < 0 { return 0 }
+    if W_CheckNumForName("e3m9") < 0 { return 0 }
+    if W_CheckNumForName("dphoof") < 0 { return 0 }
+    if W_CheckNumForName("bfgga0") < 0 { return 0 }
+    if W_CheckNumForName("heada1") < 0 { return 0 }
+    if W_CheckNumForName("cybra1") < 0 { return 0 }
+    if W_CheckNumForName("spida1d1") < 0 { return 0 }
+    return 1
+}
+
+function dmain_error_shareware_file() -> void {
+    I_Error("\nYou cannot -file with the shareware version. Register!")
+}
+
+function dmain_error_not_registered() -> void {
+    I_Error("\nThis is not the registered version.")
+}
+
+function dmain_error_unknown_iwad() -> void {
+    I_Error("Unknown or invalid IWAD file.")
+}
+
+function dmain_error_no_iwad() -> void {
+    I_Error("Game mode indeterminate.  No IWAD file was found.  Try\nspecifying one with the '-iwad' command line parameter.\n")
+}
+
+function dmain_error_unknown_version(s: string) -> void {
+    I_Error(dmain_str_join3("Unknown game version '", s, "'"))
+}
+
+function dmain_copy_save_path(file: ptr<u8>, file_size: i32, slot: i32) -> void {
+    M_StringCopy(file, P_SaveGameFile(slot) as ptr<u8>, file_size as i64)
+}
+
+function dmain_set_config_dir_default() -> void {
+    M_SetConfigDir(null as string)
+}
+
+extern { function STAT_gamemission_addr() -> ptr<i32> }
+extern { function STAT_logical_gamemission() -> i32 }
+extern { function STAT_gamedescription() -> string }
+extern { function STAT_set_gamedescription(v: string) -> void }
+extern { function STAT_modifiedgame() -> i32 }
+extern { function STAT_set_modifiedgame(v: i32) -> void }
+extern { function STAT_gamestate() -> i32 }
+extern { function STAT_set_gamestate(v: i32) -> void }
+extern { function STAT_gameaction() -> i32 }
+extern { function STAT_set_gameaction(v: i32) -> void }
+extern { function STAT_paused() -> i32 }
+extern { function STAT_set_paused(v: i32) -> void }
+extern { function STAT_viewactive() -> i32 }
+extern { function STAT_set_viewactive(v: i32) -> void }
+extern { function STAT_nodrawers() -> i32 }
+extern { function STAT_testcontrols() -> i32 }
+extern { function STAT_set_testcontrols(v: i32) -> void }
+extern { function STAT_testcontrols_mousespeed() -> i32 }
+extern { function STAT_usergame() -> i32 }
+extern { function STAT_set_usergame(v: i32) -> void }
+extern { function STAT_demoplayback() -> i32 }
+extern { function STAT_demorecording() -> i32 }
+extern { function STAT_set_singledemo(v: i32) -> void }
+extern { function STAT_timelimit() -> i32 }
+extern { function STAT_set_timelimit(v: i32) -> void }
+
+extern { function STAT_displayplayer() -> i32 }
+extern { function STAT_menuactive() -> i32 }
+extern { function menushim_inhelpscreens() -> i32 }
+extern { function STAT_automapactive() -> i32 }
+extern { function STAT_setsizeneeded() -> i32 }
+extern { function RMAIN_viewwindowx() -> i32 }
+extern { function RMAIN_viewwindowy() -> i32 }
+extern { function IVIDEO_screenvisible() -> i32 }
+extern { function IVIDEO_screensaver_mode() -> i32 }
+extern { function STAT_sfxVolume() -> i32 }
+extern { function STAT_musicVolume() -> i32 }
+extern { function PLAYER_set_playerstate(p: ptr<void>, v: i32) -> void }
+extern { function menushim_bind_addr(id: i32) -> ptr<void> }
+extern { function PLAYER_at(i: i32) -> ptr<void> }
+extern { function PLAYER_mo(p: ptr<void>) -> ptr<void> }
+
+# ---- constants (DMAIN_) -----------------------------------------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_gametic() -> i32 }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+# i_video.h / doomdef.h / z_zone.h / i_timer.h
+const DMAIN_SCREENWIDTH: i32 = 320
+const DMAIN_SCREENHEIGHT: i32 = 200
+const DMAIN_PU_CACHE: i32 = 8
+const DMAIN_PU_STATIC: i32 = 1
+const DMAIN_TICRATE: i32 = 35
+const DMAIN_MAXPLAYERS: i32 = 4
+
+# gamestate_t
+const DMAIN_GS_LEVEL: i32 = 0
+const DMAIN_GS_INTERMISSION: i32 = 1
+const DMAIN_GS_FINALE: i32 = 2
+const DMAIN_GS_DEMOSCREEN: i32 = 3
+
+# gameaction_t
+const DMAIN_GA_NOTHING: i32 = 0
+const DMAIN_GA_LOADGAME: i32 = 3
+const DMAIN_GA_PLAYDEMO: i32 = 5
+
+# GameMode_t / GameMission_t / GameVersion_t / skill_t (d_mode.h)
+const DMAIN_GM_SHAREWARE: i32 = 0
+const DMAIN_GM_REGISTERED: i32 = 1
+const DMAIN_GM_COMMERCIAL: i32 = 2
+const DMAIN_GM_RETAIL: i32 = 3
+
+const DMAIN_MISSION_DOOM: i32 = 0
+const DMAIN_MISSION_DOOM2: i32 = 1
+const DMAIN_MISSION_PACK_TNT: i32 = 2
+const DMAIN_MISSION_PACK_PLUT: i32 = 3
+const DMAIN_MISSION_PACK_CHEX: i32 = 4
+const DMAIN_MISSION_PACK_HACX: i32 = 5
+const DMAIN_MISSION_NONE: i32 = 9
+
+const DMAIN_EXE_DOOM_1_9: i32 = 4
+const DMAIN_EXE_HACX: i32 = 5
+const DMAIN_EXE_ULTIMATE: i32 = 6
+const DMAIN_EXE_FINAL: i32 = 7
+const DMAIN_EXE_CHEX: i32 = 9
+
+const DMAIN_SK_MEDIUM: i32 = 2
+const DMAIN_PST_LIVE: i32 = 0
+
+# wipe_Melt (f_wipe.h)
+const DMAIN_WIPE_MELT: i32 = 1
+
+# d_iwad.h IWAD_MASK_DOOM
+const DMAIN_IWAD_MASK_DOOM: i32 = 63
+
+# config.h
+const DMAIN_PACKAGE_STRING: string = "Doom Generic 0.1"
+const DMAIN_PROGRAM_PREFIX_CFG: string = "doomgenericdoom.cfg"
+
+# d_englsh.h HUSTR_KEY*
+const DMAIN_HUSTR_KEYGREEN: i32 = 103
+const DMAIN_HUSTR_KEYINDIGO: i32 = 105
+const DMAIN_HUSTR_KEYBROWN: i32 = 98
+const DMAIN_HUSTR_KEYRED: i32 = 114
+
+# sounds.h mus_*
+const DMAIN_MUS_INTRO: i32 = 29
+const DMAIN_MUS_DM2TTL: i32 = 66
+
+# bind_addr ids
+const DMAIN_BIND_MOUSE: i32 = 0
+const DMAIN_BIND_SFX: i32 = 1
+const DMAIN_BIND_MUSIC: i32 = 2
+const DMAIN_BIND_SHOWMSG: i32 = 3
+const DMAIN_BIND_SCREENBLOCKS: i32 = 4
+const DMAIN_BIND_DETAIL: i32 = 5
+const DMAIN_BIND_SND_CHANNELS: i32 = 6
+const DMAIN_BIND_VANILLA_SAVE: i32 = 7
+const DMAIN_BIND_VANILLA_DEMO: i32 = 8
+const DMAIN_BIND_SHOW_ENDOOM: i32 = 9
+
+# ---- D_Display private statics ----------------------------------------
+
+let mut dmain_viewactivestate: i32 = 0
+let mut dmain_menuactivestate: i32 = 0
+let mut dmain_inhelpscreensstate: i32 = 0
+let mut dmain_fullscreen: i32 = 0
+# C static oldgamestate = -1; set before first use in D_Display.
+let mut dmain_oldgamestate: i32 = 0
+let mut dmain_oldgamestate_ready: i32 = 0
+let mut dmain_borderdrawcount: i32 = 0
+
+# Demo lump name buffer for -playdemo / -timedemo (was stack in C).
+let mut dmain_demolump: array<u8, 9> = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+let mut dmain_filebuf: array<u8, 256> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+function dmain_argv_at(i: i32) -> ptr<u8> {
+    let words: ptr<i64> = argvflow_argv()
+    return words[i] as ptr<u8>
+}
+
+function dmain_file_ptr() -> ptr<u8> {
+    return &dmain_filebuf[0] as ptr<u8>
+}
+
+function dmain_demo_ptr() -> ptr<u8> {
+    return &dmain_demolump[0] as ptr<u8>
+}
+
+# ---- D_ProcessEvents --------------------------------------------------
+
+@flow_api
+function D_ProcessEvents() -> void {
+    if STAT_storedemo() != 0 {
+        return
+    }
+    while true {
+        let ev: ptr<void> = D_PopEvent()
+        if (ev as i64) == 0 {
+            break
+        }
+        if M_Responder(ev) != 0 {
+            continue
+        }
+        G_Responder(ev)
+    }
+}
+
+# ---- D_Display --------------------------------------------------------
+
+@flow_api
+function D_Display() -> void {
+    let mut nowtime: i32 = 0
+    let mut tics: i32 = 0
+    let mut wipestart: i32 = 0
+    let mut y: i32 = 0
+    let mut done: i32 = 0
+    let mut wipe: i32 = 0
+    let mut redrawsbar: i32 = 0
+
+    if STAT_nodrawers() != 0 {
+        return
+    }
+
+    if dmain_oldgamestate_ready == 0 {
+        dmain_oldgamestate = 0 - 1
+        dmain_oldgamestate_ready = 1
+    }
+
+    redrawsbar = 0
+
+    if STAT_setsizeneeded() != 0 {
+        R_ExecuteSetViewSize()
+        dmain_oldgamestate = 0 - 1
+        dmain_borderdrawcount = 3
+    }
+
+    if STAT_gamestate() != STAT_wipegamestate() {
+        wipe = 1
+        wipe_StartScreen(0, 0, DMAIN_SCREENWIDTH, DMAIN_SCREENHEIGHT)
+    } else {
+        wipe = 0
+    }
+
+    if STAT_gamestate() == DMAIN_GS_LEVEL and STAT_gametic() != 0 {
+        HU_Erase()
+    }
+
+    let gs: i32 = STAT_gamestate()
+    if gs == DMAIN_GS_LEVEL {
+        if STAT_gametic() != 0 {
+            if STAT_automapactive() != 0 {
+                AM_Drawer()
+            }
+            if wipe != 0 or (DRAW_viewheight() != 200 and dmain_fullscreen != 0) {
+                redrawsbar = 1
+            }
+            if dmain_inhelpscreensstate != 0 and menushim_inhelpscreens() == 0 {
+                redrawsbar = 1
+            }
+            let fs: i32 = 0
+            if DRAW_viewheight() == 200 {
+                fs = 1
+            }
+            ST_Drawer(fs, redrawsbar)
+            if DRAW_viewheight() == 200 {
+                dmain_fullscreen = 1
+            } else {
+                dmain_fullscreen = 0
+            }
+        }
+    } elif gs == DMAIN_GS_INTERMISSION {
+        WI_Drawer()
+    } elif gs == DMAIN_GS_FINALE {
+        F_Drawer()
+    } elif gs == DMAIN_GS_DEMOSCREEN {
+        D_PageDrawer()
+    }
+
+    I_UpdateNoBlit()
+
+    if STAT_gamestate() == DMAIN_GS_LEVEL and STAT_automapactive() == 0 and STAT_gametic() != 0 {
+        R_RenderPlayerView(PLAYER_at(STAT_displayplayer()))
+    }
+
+    if STAT_gamestate() == DMAIN_GS_LEVEL and STAT_gametic() != 0 {
+        HU_Drawer()
+    }
+
+    if STAT_gamestate() != dmain_oldgamestate and STAT_gamestate() != DMAIN_GS_LEVEL {
+        I_SetPalette(W_CacheLumpName("PLAYPAL", DMAIN_PU_CACHE) as ptr<u8>)
+    }
+
+    if STAT_gamestate() == DMAIN_GS_LEVEL and dmain_oldgamestate != DMAIN_GS_LEVEL {
+        dmain_viewactivestate = 0
+        R_FillBackScreen()
+    }
+
+    if STAT_gamestate() == DMAIN_GS_LEVEL and STAT_automapactive() == 0 and DRAW_scaledviewwidth() != 320 {
+        if STAT_menuactive() != 0 or dmain_menuactivestate != 0 or dmain_viewactivestate == 0 {
+            dmain_borderdrawcount = 3
+        }
+        if dmain_borderdrawcount != 0 {
+            R_DrawViewBorder()
+            dmain_borderdrawcount = dmain_borderdrawcount - 1
+        }
+    }
+
+    if STAT_testcontrols() != 0 {
+        V_DrawMouseSpeedBox(STAT_testcontrols_mousespeed())
+    }
+
+    dmain_menuactivestate = STAT_menuactive()
+    dmain_viewactivestate = STAT_viewactive()
+    dmain_inhelpscreensstate = menushim_inhelpscreens()
+    dmain_oldgamestate = STAT_gamestate()
+    STAT_set_wipegamestate(STAT_gamestate())
+
+    if STAT_paused() != 0 {
+        if STAT_automapactive() != 0 {
+            y = 4
+        } else {
+            y = RMAIN_viewwindowy() + 4
+        }
+        V_DrawPatchDirect(
+            RMAIN_viewwindowx() + (DRAW_scaledviewwidth() - 68) / 2,
+            y,
+            W_CacheLumpName("M_PAUSE", DMAIN_PU_CACHE))
+    }
+
+    M_Drawer()
+    NetUpdate()
+
+    if wipe == 0 {
+        I_FinishUpdate()
+        return
+    }
+
+    wipe_EndScreen(0, 0, DMAIN_SCREENWIDTH, DMAIN_SCREENHEIGHT)
+    wipestart = I_GetTime() - 1
+
+    while true {
+        while true {
+            nowtime = I_GetTime()
+            tics = nowtime - wipestart
+            I_Sleep(1)
+            if tics > 0 {
+                break
+            }
+        }
+        wipestart = nowtime
+        done = wipe_ScreenWipe(DMAIN_WIPE_MELT, 0, 0, DMAIN_SCREENWIDTH, DMAIN_SCREENHEIGHT, tics)
+        I_UpdateNoBlit()
+        M_Drawer()
+        I_FinishUpdate()
+        if done != 0 {
+            break
+        }
+    }
+}
+
+# ---- D_BindVariables --------------------------------------------------
+
+@flow_api
+function D_BindVariables() -> void {
+    M_ApplyPlatformDefaults()
+
+    I_BindVideoVariables()
+    I_BindJoystickVariables()
+    I_BindSoundVariables()
+
+    M_BindBaseControls()
+    M_BindWeaponControls()
+    M_BindMapControls()
+    M_BindMenuControls()
+    M_BindChatControls(DMAIN_MAXPLAYERS as u32)
+
+    ctrlshim_set_key_multi_msgplayer(0, DMAIN_HUSTR_KEYGREEN)
+    ctrlshim_set_key_multi_msgplayer(1, DMAIN_HUSTR_KEYINDIGO)
+    ctrlshim_set_key_multi_msgplayer(2, DMAIN_HUSTR_KEYBROWN)
+    ctrlshim_set_key_multi_msgplayer(3, DMAIN_HUSTR_KEYRED)
+
+    M_BindVariable("mouse_sensitivity", menushim_bind_addr(DMAIN_BIND_MOUSE))
+    M_BindVariable("sfx_volume", dmain_bind_addr(DMAIN_BIND_SFX))
+    M_BindVariable("music_volume", dmain_bind_addr(DMAIN_BIND_MUSIC))
+    M_BindVariable("show_messages", menushim_bind_addr(DMAIN_BIND_SHOWMSG))
+    M_BindVariable("screenblocks", menushim_bind_addr(DMAIN_BIND_SCREENBLOCKS))
+    M_BindVariable("detaillevel", menushim_bind_addr(DMAIN_BIND_DETAIL))
+    M_BindVariable("snd_channels", dmain_bind_addr(DMAIN_BIND_SND_CHANNELS))
+    M_BindVariable("vanilla_savegame_limit", dmain_bind_addr(DMAIN_BIND_VANILLA_SAVE))
+    M_BindVariable("vanilla_demo_limit", dmain_bind_addr(DMAIN_BIND_VANILLA_DEMO))
+    M_BindVariable("show_endoom", dmain_bind_addr(DMAIN_BIND_SHOW_ENDOOM))
+
+    for i in 0 to 10 {
+        dmain_bind_chatmacro(i)
+    }
+}
+
+# ---- D_GrabMouseCallback ----------------------------------------------
+
+@flow_api
+function D_GrabMouseCallback() -> i32 {
+    if STAT_drone() != 0 {
+        return 0
+    }
+    if STAT_menuactive() != 0 or STAT_paused() != 0 {
+        return 0
+    }
+    if STAT_gamestate() == DMAIN_GS_LEVEL and STAT_demoplayback() == 0 and STAT_advancedemo() == 0 {
+        return 1
+    }
+    return 0
+}
+
+# ---- doomgeneric_Tick / D_DoomLoop ------------------------------------
+
+@flow_api
+function doomgeneric_Tick() -> void {
+    I_StartFrame()
+    TryRunTics()
+    S_UpdateSounds(PLAYER_mo(PLAYER_at(STAT_consoleplayer())))
+    if IVIDEO_screenvisible() != 0 {
+        D_Display()
+    }
+}
+
+@flow_api
+function D_DoomLoop() -> void {
+    if STAT_bfgedition() != 0 and (STAT_demorecording() != 0 or STAT_gameaction() == DMAIN_GA_PLAYDEMO or STAT_netgame() != 0) {
+        dmain_print_bfg_iwad_warn()
+    }
+
+    if STAT_demorecording() != 0 {
+        G_BeginRecording()
+    }
+
+    dmain_set_main_loop_started(1)
+
+    TryRunTics()
+
+    I_SetWindowTitle(STAT_gamedescription())
+    I_GraphicsCheckCommandLine()
+    I_SetGrabMouseCallback(D_GrabMouseCallback)
+    I_InitGraphics()
+    I_EnableLoadingDisk()
+
+    V_RestoreBuffer()
+    R_ExecuteSetViewSize()
+
+    D_StartGameLoop()
+
+    if STAT_testcontrols() != 0 {
+        STAT_set_wipegamestate(STAT_gamestate())
+    }
+
+    doomgeneric_Tick()
+}
+
+# ---- DEMO LOOP --------------------------------------------------------
+
+@flow_api
+function D_PageTicker() -> void {
+    DEMO_set_pagetic(DEMO_pagetic() - 1)
+    if DEMO_pagetic() < 0 {
+        D_AdvanceDemo()
+    }
+}
+
+@flow_api
+function D_PageDrawer() -> void {
+    V_DrawPatch(0, 0, W_CacheLumpName(DEMO_pagename(), DMAIN_PU_CACHE))
+}
+
+@flow_api
+function D_AdvanceDemo() -> void {
+    STAT_set_advancedemo(1)
+}
+
+@flow_api
+function D_DoAdvanceDemo() -> void {
+    PLAYER_set_playerstate(PLAYER_at(STAT_consoleplayer()), DMAIN_PST_LIVE)
+    STAT_set_advancedemo(0)
+    STAT_set_usergame(0)
+    STAT_set_paused(0)
+    STAT_set_gameaction(DMAIN_GA_NOTHING)
+
+    if STAT_gameversion() == DMAIN_EXE_ULTIMATE or STAT_gameversion() == DMAIN_EXE_FINAL {
+        DEMO_set_demosequence((DEMO_demosequence() + 1) % 7)
+    } else {
+        DEMO_set_demosequence((DEMO_demosequence() + 1) % 6)
+    }
+
+    let seq: i32 = DEMO_demosequence()
+    if seq == 0 {
+        if STAT_gamemode() == DMAIN_GM_COMMERCIAL {
+            DEMO_set_pagetic(DMAIN_TICRATE * 11)
+        } else {
+            DEMO_set_pagetic(170)
+        }
+        STAT_set_gamestate(DMAIN_GS_DEMOSCREEN)
+        DEMO_set_pagename("TITLEPIC")
+        if STAT_gamemode() == DMAIN_GM_COMMERCIAL {
+            S_StartMusic(DMAIN_MUS_DM2TTL)
+        } else {
+            S_StartMusic(DMAIN_MUS_INTRO)
+        }
+    } elif seq == 1 {
+        G_DeferedPlayDemo("demo1")
+    } elif seq == 2 {
+        DEMO_set_pagetic(200)
+        STAT_set_gamestate(DMAIN_GS_DEMOSCREEN)
+        DEMO_set_pagename("CREDIT")
+    } elif seq == 3 {
+        G_DeferedPlayDemo("demo2")
+    } elif seq == 4 {
+        STAT_set_gamestate(DMAIN_GS_DEMOSCREEN)
+        if STAT_gamemode() == DMAIN_GM_COMMERCIAL {
+            DEMO_set_pagetic(DMAIN_TICRATE * 11)
+            DEMO_set_pagename("TITLEPIC")
+            S_StartMusic(DMAIN_MUS_DM2TTL)
+        } else {
+            DEMO_set_pagetic(200)
+            if STAT_gamemode() == DMAIN_GM_RETAIL {
+                DEMO_set_pagename("CREDIT")
+            } else {
+                DEMO_set_pagename("HELP2")
+            }
+        }
+    } elif seq == 5 {
+        G_DeferedPlayDemo("demo3")
+    } elif seq == 6 {
+        G_DeferedPlayDemo("demo4")
+    }
+
+    # BFG Edition TITLEPIC → INTERPIC workaround
+    if STAT_bfgedition() != 0 and dmain_strcasecmp(DEMO_pagename(), "TITLEPIC") == 0 and W_CheckNumForName("titlepic") < 0 {
+        DEMO_set_pagename("INTERPIC")
+    }
+}
+
+@flow_api
+function D_StartTitle() -> void {
+    STAT_set_gameaction(DMAIN_GA_NOTHING)
+    DEMO_set_demosequence(0 - 1)
+    D_AdvanceDemo()
+}
+
+# FEATURE_DEHACKED off: banners never replaced → identity.
+function dmain_get_game_name(gamename: string) -> string {
+    return gamename
+}
+
+function dmain_print_dehacked_banners() -> void {
+}
+
+# ---- version / description --------------------------------------------
+
+@flow_api
+function D_IdentifyVersion() -> void {
+    if STAT_gamemission() == DMAIN_MISSION_NONE {
+        dmain_identify_from_lumps()
+        if STAT_gamemission() == DMAIN_MISSION_NONE {
+            dmain_error_unknown_iwad()
+        }
+    }
+
+    if STAT_logical_gamemission() == DMAIN_MISSION_DOOM {
+        if W_CheckNumForName("E4M1") > 0 {
+            STAT_set_gamemode(DMAIN_GM_RETAIL)
+        } elif W_CheckNumForName("E3M1") > 0 {
+            STAT_set_gamemode(DMAIN_GM_REGISTERED)
+        } else {
+            STAT_set_gamemode(DMAIN_GM_SHAREWARE)
+        }
+    } else {
+        STAT_set_gamemode(DMAIN_GM_COMMERCIAL)
+        let p: i32 = M_CheckParmWithArgs("-pack", 1)
+        if p > 0 {
+            dmain_set_mission_pack(dmain_argv_str(p + 1))
+        }
+    }
+}
+
+@flow_api
+function D_SetGameDescription() -> void {
+    let is_freedoom: i32 = 0
+    let is_freedm: i32 = 0
+    if W_CheckNumForName("FREEDOOM") >= 0 {
+        is_freedoom = 1
+    }
+    if W_CheckNumForName("FREEDM") >= 0 {
+        is_freedm = 1
+    }
+
+    STAT_set_gamedescription("Unknown")
+
+    if STAT_logical_gamemission() == DMAIN_MISSION_DOOM {
+        if is_freedoom != 0 {
+            STAT_set_gamedescription(dmain_get_game_name("Freedoom: Phase 1"))
+        } elif STAT_gamemode() == DMAIN_GM_RETAIL {
+            STAT_set_gamedescription(dmain_get_game_name("The Ultimate DOOM"))
+        } elif STAT_gamemode() == DMAIN_GM_REGISTERED {
+            STAT_set_gamedescription(dmain_get_game_name("DOOM Registered"))
+        } elif STAT_gamemode() == DMAIN_GM_SHAREWARE {
+            STAT_set_gamedescription(dmain_get_game_name("DOOM Shareware"))
+        }
+    } else {
+        if is_freedoom != 0 {
+            if is_freedm != 0 {
+                STAT_set_gamedescription(dmain_get_game_name("FreeDM"))
+            } else {
+                STAT_set_gamedescription(dmain_get_game_name("Freedoom: Phase 2"))
+            }
+        } elif STAT_logical_gamemission() == DMAIN_MISSION_DOOM2 {
+            STAT_set_gamedescription(dmain_get_game_name("DOOM 2: Hell on Earth"))
+        } elif STAT_logical_gamemission() == DMAIN_MISSION_PACK_PLUT {
+            STAT_set_gamedescription(dmain_get_game_name("DOOM 2: Plutonia Experiment"))
+        } elif STAT_logical_gamemission() == DMAIN_MISSION_PACK_TNT {
+            STAT_set_gamedescription(dmain_get_game_name("DOOM 2: TNT - Evilution"))
+        }
+    }
+}
+
+function dmain_add_file(filename: string) -> i32 {
+    dmain_print_adding(filename)
+    let wad: ptr<void> = W_AddFile(filename)
+    if (wad as i64) != 0 {
+        return 1
+    }
+    return 0
+}
+
+function dmain_init_game_version() -> void {
+    let p: i32 = M_CheckParmWithArgs("-gameversion", 1)
+
+    if p != 0 {
+        let ver: i32 = dmain_gameversion_match(dmain_argv_str(p + 1))
+        if ver >= 0 {
+            STAT_set_gameversion(ver)
+        } else {
+            dmain_print_supported_versions()
+            dmain_error_unknown_version(dmain_argv_str(p + 1))
+        }
+    } else {
+        if STAT_gamemission() == DMAIN_MISSION_PACK_CHEX {
+            STAT_set_gameversion(DMAIN_EXE_CHEX)
+        } elif STAT_gamemission() == DMAIN_MISSION_PACK_HACX {
+            STAT_set_gameversion(DMAIN_EXE_HACX)
+        } elif STAT_gamemode() == DMAIN_GM_SHAREWARE or STAT_gamemode() == DMAIN_GM_REGISTERED {
+            STAT_set_gameversion(DMAIN_EXE_DOOM_1_9)
+        } elif STAT_gamemode() == DMAIN_GM_RETAIL {
+            STAT_set_gameversion(DMAIN_EXE_ULTIMATE)
+        } elif STAT_gamemode() == DMAIN_GM_COMMERCIAL {
+            if STAT_gamemission() == DMAIN_MISSION_DOOM2 {
+                STAT_set_gameversion(DMAIN_EXE_DOOM_1_9)
+            } else {
+                STAT_set_gameversion(DMAIN_EXE_FINAL)
+            }
+        }
+    }
+
+    if STAT_gameversion() < DMAIN_EXE_ULTIMATE and STAT_gamemode() == DMAIN_GM_RETAIL {
+        STAT_set_gamemode(DMAIN_GM_REGISTERED)
+    }
+
+    if STAT_gameversion() < DMAIN_EXE_FINAL and STAT_gamemode() == DMAIN_GM_COMMERCIAL and (STAT_gamemission() == DMAIN_MISSION_PACK_TNT or STAT_gamemission() == DMAIN_MISSION_PACK_PLUT) {
+        STAT_set_gamemission(DMAIN_MISSION_DOOM2)
+    }
+}
+
+@flow_api
+function PrintGameVersion() -> void {
+    dmain_print_emulating()
+}
+
+function dmain_endoom() -> void {
+    if dmain_show_endoom() == 0 or dmain_main_loop_started() == 0 or IVIDEO_screensaver_mode() != 0 or M_CheckParm("-testcontrols") > 0 {
+        return
+    }
+    let endoom: ptr<u8> = W_CacheLumpName("ENDOOM", DMAIN_PU_STATIC) as ptr<u8>
+    I_Endoom(endoom)
+    exit(0)
+}
+
+@flow_api
+function D_Endoom() -> void {
+    dmain_endoom()
+}
+
+# ---- D_DoomMain -------------------------------------------------------
+
+@flow_api
+function D_DoomMain() -> void {
+    let mut p: i32 = 0
+
+    I_AtExit(D_Endoom, 0)
+
+    I_PrintBanner(DMAIN_PACKAGE_STRING)
+
+    printf("Z_Init: Init zone memory allocation daemon. \n")
+    Z_Init()
+
+    STAT_set_nomonsters(M_CheckParm("-nomonsters"))
+    STAT_set_respawnparm(M_CheckParm("-respawn"))
+    STAT_set_fastparm(M_CheckParm("-fast"))
+    STAT_set_devparm(M_CheckParm("-devparm"))
+
+    I_DisplayFPSDots(STAT_devparm())
+
+    if M_CheckParm("-deathmatch") != 0 {
+        STAT_set_deathmatch(1)
+    }
+    if M_CheckParm("-altdeath") != 0 {
+        STAT_set_deathmatch(2)
+    }
+
+    if STAT_devparm() != 0 {
+        dmain_print_devstr()
+    }
+
+    dmain_set_config_dir_default()
+
+    p = M_CheckParm("-turbo")
+    if p != 0 {
+        let mut scale: i32 = 200
+        if p < argvflow_argc() - 1 {
+            scale = dmain_atoi(dmain_argv_str(p + 1))
+        }
+        if scale < 10 {
+            scale = 10
+        }
+        if scale > 400 {
+            scale = 400
+        }
+        dmain_apply_turbo(scale)
+    }
+
+    printf("V_Init: allocate screens.\n")
+    V_Init()
+
+    printf("M_LoadDefaults: Load system defaults.\n")
+    M_SetConfigFilenames("default.cfg", DMAIN_PROGRAM_PREFIX_CFG)
+    D_BindVariables()
+    M_LoadDefaults()
+
+    I_AtExit(M_SaveDefaults, 0)
+
+    dmain_set_iwadfile(D_FindIWAD(DMAIN_IWAD_MASK_DOOM, STAT_gamemission_addr()))
+
+    if (dmain_iwadfile() as ptr<u8> as i64) == 0 {
+        dmain_error_no_iwad()
+    }
+
+    STAT_set_modifiedgame(0)
+
+    printf("W_Init: Init WADfiles.\n")
+    dmain_add_file(dmain_iwadfile())
+
+    W_CheckCorrectIWAD(DMAIN_MISSION_DOOM)
+
+    D_IdentifyVersion()
+    dmain_init_game_version()
+
+    if W_CheckNumForName("dmenupic") >= 0 {
+        dmain_print_bfg_edition()
+        STAT_set_bfgedition(1)
+        # DEH_AddStringReplacement no-op without FEATURE_DEHACKED
+    }
+
+    STAT_set_modifiedgame(W_ParseCommandLine())
+
+    p = M_CheckParmWithArgs("-playdemo", 1)
+    if p == 0 {
+        p = M_CheckParmWithArgs("-timedemo", 1)
+    }
+
+    if p != 0 {
+        let arg: ptr<u8> = dmain_argv_at(p + 1)
+        if M_StringEndsWith(arg, ".lmp" as ptr<u8>) != 0 {
+            M_StringCopy(dmain_file_ptr(), arg, 256)
+        } else {
+            dmain_fmt_lmp(dmain_file_ptr(), 256, dmain_argv_str(p + 1))
+        }
+
+        if dmain_add_file(dmain_file_ptr() as string) != 0 {
+            dmain_copy_lump_name(dmain_demo_ptr(), 9)
+        } else {
+            M_StringCopy(dmain_demo_ptr(), arg, 9)
+        }
+
+        dmain_print_playing_demo(dmain_file_ptr() as string)
+    }
+
+    I_AtExit(G_CheckDemoStatus, 1)
+
+    W_GenerateHashTable()
+
+    D_SetGameDescription()
+
+    dmain_set_savegamedir(M_GetSaveGameDir(D_SaveGameIWADName(STAT_gamemission())))
+
+    if STAT_modifiedgame() != 0 {
+        if STAT_gamemode() == DMAIN_GM_SHAREWARE {
+            dmain_error_shareware_file()
+        }
+        if STAT_gamemode() == DMAIN_GM_REGISTERED {
+            if dmain_check_registered_lumps() == 0 {
+                dmain_error_not_registered()
+            }
+        }
+    }
+
+    if W_CheckNumForName("SS_START") >= 0 or W_CheckNumForName("FF_END") >= 0 {
+        dmain_print_sprite_warn()
+    }
+
+    I_PrintStartupBanner(STAT_gamedescription())
+    dmain_print_dehacked_banners()
+
+    if W_CheckNumForName("FREEDOOM") >= 0 and W_CheckNumForName("FREEDM") < 0 {
+        dmain_print_freedoom_warn()
+    }
+
+    printf("I_Init: Setting up machine state.\n")
+    I_CheckIsScreensaver()
+    I_InitTimer()
+    I_InitJoystick()
+    I_InitSound(1)
+    I_InitMusic()
+
+    D_ConnectNetGame()
+
+    STAT_set_startskill(DMAIN_SK_MEDIUM)
+    STAT_set_startepisode(1)
+    STAT_set_startmap(1)
+    STAT_set_autostart(0)
+
+    p = M_CheckParmWithArgs("-skill", 1)
+    if p != 0 {
+        STAT_set_startskill(dmain_argv_byte(p + 1, 0) - 49)
+        STAT_set_autostart(1)
+    }
+
+    p = M_CheckParmWithArgs("-episode", 1)
+    if p != 0 {
+        STAT_set_startepisode(dmain_argv_byte(p + 1, 0) - 48)
+        STAT_set_startmap(1)
+        STAT_set_autostart(1)
+    }
+
+    STAT_set_timelimit(0)
+
+    p = M_CheckParmWithArgs("-timer", 1)
+    if p != 0 {
+        STAT_set_timelimit(dmain_atoi(dmain_argv_str(p + 1)))
+    }
+
+    p = M_CheckParm("-avg")
+    if p != 0 {
+        STAT_set_timelimit(20)
+    }
+
+    p = M_CheckParmWithArgs("-warp", 1)
+    if p != 0 {
+        if STAT_gamemode() == DMAIN_GM_COMMERCIAL {
+            STAT_set_startmap(dmain_atoi(dmain_argv_str(p + 1)))
+        } else {
+            STAT_set_startepisode(dmain_argv_byte(p + 1, 0) - 48)
+            if p + 2 < argvflow_argc() {
+                STAT_set_startmap(dmain_argv_byte(p + 2, 0) - 48)
+            } else {
+                STAT_set_startmap(1)
+            }
+        }
+        STAT_set_autostart(1)
+    }
+
+    p = M_CheckParm("-testcontrols")
+    if p > 0 {
+        STAT_set_startepisode(1)
+        STAT_set_startmap(1)
+        STAT_set_autostart(1)
+        STAT_set_testcontrols(1)
+    }
+
+    p = M_CheckParmWithArgs("-loadgame", 1)
+    if p != 0 {
+        STAT_set_startloadgame(dmain_atoi(dmain_argv_str(p + 1)))
+    } else {
+        STAT_set_startloadgame(0 - 1)
+    }
+
+    printf("M_Init: Init miscellaneous info.\n")
+    M_Init()
+
+    printf("R_Init: Init DOOM refresh daemon - ")
+    R_Init()
+
+    printf("\nP_Init: Init Playloop state.\n")
+    P_Init()
+
+    printf("S_Init: Setting up sound.\n")
+    S_Init(STAT_sfxVolume() * 8, STAT_musicVolume() * 8)
+
+    printf("D_CheckNetGame: Checking network game status.\n")
+    D_CheckNetGame()
+
+    PrintGameVersion()
+
+    printf("HU_Init: Setting up heads up display.\n")
+    HU_Init()
+
+    printf("ST_Init: Init status bar.\n")
+    ST_Init()
+
+    if STAT_gamemode() == DMAIN_GM_COMMERCIAL and W_CheckNumForName("map01") < 0 {
+        STAT_set_storedemo(1)
+    }
+
+    if M_CheckParmWithArgs("-statdump", 1) != 0 {
+        I_AtExit(StatDump, 1)
+        printf("External statistics registered.\n")
+    }
+
+    p = M_CheckParmWithArgs("-record", 1)
+    if p != 0 {
+        G_RecordDemo(dmain_argv_str(p + 1))
+        STAT_set_autostart(1)
+    }
+
+    p = M_CheckParmWithArgs("-playdemo", 1)
+    if p != 0 {
+        STAT_set_singledemo(1)
+        G_DeferedPlayDemo(dmain_demo_ptr() as string)
+        D_DoomLoop()
+        return
+    }
+
+    p = M_CheckParmWithArgs("-timedemo", 1)
+    if p != 0 {
+        G_TimeDemo(dmain_demo_ptr() as string)
+        D_DoomLoop()
+        return
+    }
+
+    if STAT_startloadgame() >= 0 {
+        dmain_copy_save_path(dmain_file_ptr(), 256, STAT_startloadgame())
+        G_LoadGame(dmain_file_ptr() as string)
+    }
+
+    if STAT_gameaction() != DMAIN_GA_LOADGAME {
+        if STAT_autostart() != 0 or STAT_netgame() != 0 {
+            G_InitNew(STAT_startskill(), STAT_startepisode(), STAT_startmap())
+        } else {
+            D_StartTitle()
+        }
+    }
+
+    D_DoomLoop()
+}

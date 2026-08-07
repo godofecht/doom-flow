@@ -1,0 +1,111 @@
+# Cheat sequence checking, ported from m_cheat.c to Flow.
+#
+# The cheatseq_t structs are DEFINED in C (statics in st_stuff.c and
+# am_map.c) and passed here by pointer, so fields are accessed by exact
+# byte offset. Layout of cheatseq_t from m_cheat.h on LP64 (char 1,
+# int 4, size_t 8 with 8-byte alignment), verified with offsetof:
+#
+#   char   sequence[25];       offset  0   (MAX_CHEAT_LEN 25)
+#   (7 bytes padding)                 25
+#   size_t sequence_len;       offset 32
+#   int    parameter_chars;    offset 40
+#   (4 bytes padding)                 44
+#   size_t chars_read;         offset 48
+#   int    param_chars_read;   offset 56
+#   char   parameter_buf[5];   offset 60   (MAX_CHEAT_PARAMS 5)
+#   (7 bytes tail padding)            65
+#                       sizeof = 72
+
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+
+# ---- cheatseq_t field access, by explicit layout ----------------------
+
+function cht_sequence_len(cht: ptr<u8>) -> i64 {
+    let p: ptr<i64> = ((cht as i64) + 32) as ptr<i64>
+    return p[0]
+}
+
+function cht_parameter_chars(cht: ptr<u8>) -> i32 {
+    let p: ptr<i32> = ((cht as i64) + 40) as ptr<i32>
+    return p[0]
+}
+
+function cht_chars_read(cht: ptr<u8>) -> i64 {
+    let p: ptr<i64> = ((cht as i64) + 48) as ptr<i64>
+    return p[0]
+}
+
+function cht_set_chars_read(cht: ptr<u8>, v: i64) -> void {
+    let p: ptr<i64> = ((cht as i64) + 48) as ptr<i64>
+    p[0] = v
+}
+
+function cht_param_chars_read(cht: ptr<u8>) -> i32 {
+    let p: ptr<i32> = ((cht as i64) + 56) as ptr<i32>
+    return p[0]
+}
+
+function cht_set_param_chars_read(cht: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((cht as i64) + 56) as ptr<i32>
+    p[0] = v
+}
+
+function cht_parameter_buf(cht: ptr<u8>) -> ptr<u8> {
+    return ((cht as i64) + 60) as ptr<u8>
+}
+
+# strlen over the NUL-terminated cheat sequence (always < 25 chars).
+function cheat_strlen(p: ptr<u8>) -> i32 {
+    let mut n: i32 = 0
+    while p[n] as i32 != 0 {
+        n = n + 1
+    }
+    return n
+}
+
+# Called by st_stuff.c / am_map.c on each input key. Returns 1 when the
+# full cheat (and its parameters, if any) has been entered, else 0.
+@flow_api
+function cht_CheckCheat(cht: ptr<u8>, key: u8) -> i32 {
+    let seq: ptr<u8> = cht
+    let slen: i32 = cheat_strlen(seq)
+
+    # A short sequence on a cheat with parameters does not work in
+    # vanilla doom; behave the same.
+    if cht_parameter_chars(cht) > 0 and (slen as i64) < cht_sequence_len(cht) {
+        return 0
+    }
+
+    if cht_chars_read(cht) < slen as i64 {
+        # Still reading and verifying the cheat code; reset to the
+        # beginning if a key is wrong.
+        if key as i32 == seq[cht_chars_read(cht) as i32] as i32 {
+            cht_set_chars_read(cht, cht_chars_read(cht) + 1)
+        } else {
+            cht_set_chars_read(cht, 0)
+        }
+        cht_set_param_chars_read(cht, 0)
+    } else {
+        if cht_param_chars_read(cht) < cht_parameter_chars(cht) {
+            # Past the end of the sequence, entering parameters now.
+            let buf: ptr<u8> = cht_parameter_buf(cht)
+            buf[cht_param_chars_read(cht)] = key
+            cht_set_param_chars_read(cht, cht_param_chars_read(cht) + 1)
+        }
+    }
+
+    if cht_chars_read(cht) >= slen as i64 and cht_param_chars_read(cht) >= cht_parameter_chars(cht) {
+        cht_set_chars_read(cht, 0)
+        cht_set_param_chars_read(cht, 0)
+        return 1
+    }
+
+    # Cheat not matched yet.
+    return 0
+}
+
+@flow_api
+function cht_GetParam(cht: ptr<u8>, buffer: ptr<u8>) -> void {
+    let src: ptr<void> = cht_parameter_buf(cht) as ptr<void>
+    memcpy(buffer as ptr<void>, src, cht_parameter_chars(cht) as i64)
+}

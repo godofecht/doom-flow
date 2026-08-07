@@ -1,0 +1,697 @@
+# Input bindings, ported from m_controls.c to Flow.
+#
+# key_*/mouseb*/joyb* globals live here as let mut; unported C and
+# M_BindVariable reach them through ctrlshim_var(id). IDs below must
+# stay in lockstep with ctrlshim_var().
+
+extern { function M_BindVariable(name: string, location: ptr<void>) -> void }
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+extern { function strlen(s: string) -> i64 }
+
+# doomkeys.h (CTRL_* prefix avoids collision with hud.flow KEY_*)
+const CTRL_KEY_RIGHTARROW: i32 = 174
+const CTRL_KEY_LEFTARROW: i32 = 172
+const CTRL_KEY_UPARROW: i32 = 173
+const CTRL_KEY_DOWNARROW: i32 = 175
+const CTRL_KEY_STRAFE_L: i32 = 160
+const CTRL_KEY_STRAFE_R: i32 = 161
+const CTRL_KEY_USE: i32 = 162
+const CTRL_KEY_FIRE: i32 = 163
+const CTRL_KEY_ESCAPE: i32 = 27
+const CTRL_KEY_ENTER: i32 = 13
+const CTRL_KEY_TAB: i32 = 9
+const CTRL_KEY_BACKSPACE: i32 = 127
+const CTRL_KEY_PAUSE: i32 = 255
+const CTRL_KEY_EQUALS: i32 = 61
+const CTRL_KEY_MINUS: i32 = 45
+const CTRL_KEY_RSHIFT: i32 = 182
+const CTRL_KEY_RALT: i32 = 184
+const CTRL_KEY_HOME: i32 = 199
+const CTRL_KEY_END: i32 = 207
+const CTRL_KEY_F1: i32 = 187
+const CTRL_KEY_F2: i32 = 188
+const CTRL_KEY_F3: i32 = 189
+const CTRL_KEY_F4: i32 = 190
+const CTRL_KEY_F5: i32 = 191
+const CTRL_KEY_F6: i32 = 192
+const CTRL_KEY_F7: i32 = 193
+const CTRL_KEY_F8: i32 = 194
+const CTRL_KEY_F9: i32 = 195
+const CTRL_KEY_F10: i32 = 196
+const CTRL_KEY_F11: i32 = 215
+const CTRL_KEY_F12: i32 = 216
+
+# ---- keyboard / mouse / joystick globals (were ctrl_shim.c) -----------
+
+let mut key_right: i32 = CTRL_KEY_RIGHTARROW
+let mut key_left: i32 = CTRL_KEY_LEFTARROW
+let mut key_up: i32 = CTRL_KEY_UPARROW
+let mut key_down: i32 = CTRL_KEY_DOWNARROW
+let mut key_strafeleft: i32 = CTRL_KEY_STRAFE_L
+let mut key_straferight: i32 = CTRL_KEY_STRAFE_R
+let mut key_fire: i32 = CTRL_KEY_FIRE
+let mut key_use: i32 = CTRL_KEY_USE
+let mut key_strafe: i32 = CTRL_KEY_RALT
+let mut key_speed: i32 = CTRL_KEY_RSHIFT
+
+let mut key_flyup: i32 = KEY_PGUP
+let mut key_flydown: i32 = KEY_INS
+let mut key_flycenter: i32 = CTRL_KEY_HOME
+
+let mut key_lookup: i32 = KEY_PGDN
+let mut key_lookdown: i32 = KEY_DEL
+let mut key_lookcenter: i32 = CTRL_KEY_END
+
+let mut key_invleft: i32 = 91    # '['
+let mut key_invright: i32 = 93   # ']'
+let mut key_useartifact: i32 = CTRL_KEY_ENTER
+
+let mut key_jump: i32 = 47       # '/'
+
+let mut key_arti_all: i32 = CTRL_KEY_BACKSPACE
+let mut key_arti_health: i32 = 92    # '\\'
+let mut key_arti_poisonbag: i32 = 48
+let mut key_arti_blastradius: i32 = 57
+let mut key_arti_teleport: i32 = 56
+let mut key_arti_teleportother: i32 = 55
+let mut key_arti_egg: i32 = 54
+let mut key_arti_invulnerability: i32 = 53
+
+let mut key_usehealth: i32 = 104   # 'h'
+let mut key_invquery: i32 = 113    # 'q'
+let mut key_mission: i32 = 119     # 'w'
+let mut key_invpop: i32 = 122      # 'z'
+let mut key_invkey: i32 = 107      # 'k'
+let mut key_invhome: i32 = CTRL_KEY_HOME
+let mut key_invend: i32 = CTRL_KEY_END
+let mut key_invuse: i32 = CTRL_KEY_ENTER
+let mut key_invdrop: i32 = CTRL_KEY_BACKSPACE
+
+let mut mousebfire: i32 = 0
+let mut mousebstrafe: i32 = 1
+let mut mousebforward: i32 = 2
+let mut mousebjump: i32 = 0 - 1
+let mut mousebstrafeleft: i32 = 0 - 1
+let mut mousebstraferight: i32 = 0 - 1
+let mut mousebbackward: i32 = 0 - 1
+let mut mousebuse: i32 = 0 - 1
+let mut mousebprevweapon: i32 = 0 - 1
+let mut mousebnextweapon: i32 = 0 - 1
+
+let mut key_message_refresh: i32 = CTRL_KEY_ENTER
+let mut key_pause: i32 = CTRL_KEY_PAUSE
+let mut key_demo_quit: i32 = 113   # 'q'
+let mut key_spy: i32 = CTRL_KEY_F12
+
+let mut key_multi_msg: i32 = 116   # 't'
+let mut key_multi_msgplayer: array<i32, 8> = [0, 0, 0, 0, 0, 0, 0, 0]
+
+let mut key_weapon1: i32 = 49
+let mut key_weapon2: i32 = 50
+let mut key_weapon3: i32 = 51
+let mut key_weapon4: i32 = 52
+let mut key_weapon5: i32 = 53
+let mut key_weapon6: i32 = 54
+let mut key_weapon7: i32 = 55
+let mut key_weapon8: i32 = 56
+let mut key_prevweapon: i32 = 0
+let mut key_nextweapon: i32 = 0
+
+let mut key_map_north: i32 = CTRL_KEY_UPARROW
+let mut key_map_south: i32 = CTRL_KEY_DOWNARROW
+let mut key_map_east: i32 = CTRL_KEY_RIGHTARROW
+let mut key_map_west: i32 = CTRL_KEY_LEFTARROW
+let mut key_map_zoomin: i32 = 61     # '='
+let mut key_map_zoomout: i32 = CTRL_KEY_MINUS
+let mut key_map_toggle: i32 = CTRL_KEY_TAB
+let mut key_map_maxzoom: i32 = 48    # '0'
+let mut key_map_follow: i32 = 102    # 'f'
+let mut key_map_grid: i32 = 103      # 'g'
+let mut key_map_mark: i32 = 109      # 'm'
+let mut key_map_clearmark: i32 = 99    # 'c'
+
+let mut key_menu_activate: i32 = CTRL_KEY_ESCAPE
+let mut key_menu_up: i32 = CTRL_KEY_UPARROW
+let mut key_menu_down: i32 = CTRL_KEY_DOWNARROW
+let mut key_menu_left: i32 = CTRL_KEY_LEFTARROW
+let mut key_menu_right: i32 = CTRL_KEY_RIGHTARROW
+let mut key_menu_back: i32 = CTRL_KEY_BACKSPACE
+let mut key_menu_forward: i32 = CTRL_KEY_ENTER
+let mut key_menu_confirm: i32 = 121  # 'y'
+let mut key_menu_abort: i32 = 110    # 'n'
+
+let mut key_menu_help: i32 = CTRL_KEY_F1
+let mut key_menu_save: i32 = CTRL_KEY_F2
+let mut key_menu_load: i32 = CTRL_KEY_F3
+let mut key_menu_volume: i32 = CTRL_KEY_F4
+let mut key_menu_detail: i32 = CTRL_KEY_F5
+let mut key_menu_qsave: i32 = CTRL_KEY_F6
+let mut key_menu_endgame: i32 = CTRL_KEY_F7
+let mut key_menu_messages: i32 = CTRL_KEY_F8
+let mut key_menu_qload: i32 = CTRL_KEY_F9
+let mut key_menu_quit: i32 = CTRL_KEY_F10
+let mut key_menu_gamma: i32 = CTRL_KEY_F11
+
+let mut key_menu_incscreen: i32 = CTRL_KEY_EQUALS
+let mut key_menu_decscreen: i32 = CTRL_KEY_MINUS
+let mut key_menu_screenshot: i32 = 0
+
+let mut joybfire: i32 = 0
+let mut joybstrafe: i32 = 1
+let mut joybuse: i32 = 3
+let mut joybspeed: i32 = 2
+let mut joybstrafeleft: i32 = 0 - 1
+let mut joybstraferight: i32 = 0 - 1
+let mut joybjump: i32 = 0 - 1
+let mut joybprevweapon: i32 = 0 - 1
+let mut joybnextweapon: i32 = 0 - 1
+let mut joybmenu: i32 = 0 - 1
+
+let mut dclick_use: i32 = 1
+
+let mut ctrl_bindname_buf: ptr<u8> = null
+
+function ctrl_bindname(base: string, digit: i32) -> string {
+    if (ctrl_bindname_buf as i64) == 0 {
+        ctrl_bindname_buf = calloc(32, 1) as ptr<u8>
+    }
+    let bp: ptr<u8> = base as ptr<u8>
+    let n: i32 = strlen(base) as i32
+    let mut i: i32 = 0
+    while i < n {
+        ctrl_bindname_buf[i] = bp[i]
+        i = i + 1
+    }
+    if digit >= 10 {
+        ctrl_bindname_buf[i] = (48 + digit / 10) as u8
+        i = i + 1
+    }
+    ctrl_bindname_buf[i] = (48 + digit % 10) as u8
+    i = i + 1
+    ctrl_bindname_buf[i] = 0
+    return ctrl_bindname_buf as string
+}
+
+@flow_api
+function ctrlshim_var(id: i32) -> ptr<i32> {
+    if id == C_KEY_RIGHT { return &key_right }
+    if id == C_KEY_LEFT { return &key_left }
+    if id == C_KEY_UP { return &key_up }
+    if id == C_KEY_DOWN { return &key_down }
+    if id == C_KEY_STRAFELEFT { return &key_strafeleft }
+    if id == C_KEY_STRAFERIGHT { return &key_straferight }
+    if id == C_KEY_FIRE { return &key_fire }
+    if id == C_KEY_USE { return &key_use }
+    if id == C_KEY_STRAFE { return &key_strafe }
+    if id == C_KEY_SPEED { return &key_speed }
+    if id == C_MOUSEBFIRE { return &mousebfire }
+    if id == C_MOUSEBSTRAFE { return &mousebstrafe }
+    if id == C_MOUSEBFORWARD { return &mousebforward }
+    if id == C_JOYBFIRE { return &joybfire }
+    if id == C_JOYBSTRAFE { return &joybstrafe }
+    if id == C_JOYBUSE { return &joybuse }
+    if id == C_JOYBSPEED { return &joybspeed }
+    if id == C_JOYBMENU { return &joybmenu }
+    if id == C_JOYBSTRAFELEFT { return &joybstrafeleft }
+    if id == C_JOYBSTRAFERIGHT { return &joybstraferight }
+    if id == C_MOUSEBSTRAFELEFT { return &mousebstrafeleft }
+    if id == C_MOUSEBSTRAFERIGHT { return &mousebstraferight }
+    if id == C_MOUSEBUSE { return &mousebuse }
+    if id == C_MOUSEBBACKWARD { return &mousebbackward }
+    if id == C_DCLICK_USE { return &dclick_use }
+    if id == C_KEY_PAUSE { return &key_pause }
+    if id == C_KEY_MESSAGE_REFRESH { return &key_message_refresh }
+    if id == C_KEY_FLYUP { return &key_flyup }
+    if id == C_KEY_FLYDOWN { return &key_flydown }
+    if id == C_KEY_FLYCENTER { return &key_flycenter }
+    if id == C_KEY_LOOKUP { return &key_lookup }
+    if id == C_KEY_LOOKDOWN { return &key_lookdown }
+    if id == C_KEY_LOOKCENTER { return &key_lookcenter }
+    if id == C_KEY_INVLEFT { return &key_invleft }
+    if id == C_KEY_INVRIGHT { return &key_invright }
+    if id == C_KEY_USEARTIFACT { return &key_useartifact }
+    if id == C_KEY_JUMP { return &key_jump }
+    if id == C_MOUSEBJUMP { return &mousebjump }
+    if id == C_JOYBJUMP { return &joybjump }
+    if id == C_KEY_ARTI_ALL { return &key_arti_all }
+    if id == C_KEY_ARTI_HEALTH { return &key_arti_health }
+    if id == C_KEY_ARTI_POISONBAG { return &key_arti_poisonbag }
+    if id == C_KEY_ARTI_BLASTRADIUS { return &key_arti_blastradius }
+    if id == C_KEY_ARTI_TELEPORT { return &key_arti_teleport }
+    if id == C_KEY_ARTI_TELEPORTOTHER { return &key_arti_teleportother }
+    if id == C_KEY_ARTI_EGG { return &key_arti_egg }
+    if id == C_KEY_ARTI_INVULNERABILITY { return &key_arti_invulnerability }
+    if id == C_KEY_USEHEALTH { return &key_usehealth }
+    if id == C_KEY_INVQUERY { return &key_invquery }
+    if id == C_KEY_MISSION { return &key_mission }
+    if id == C_KEY_INVPOP { return &key_invpop }
+    if id == C_KEY_INVKEY { return &key_invkey }
+    if id == C_KEY_INVHOME { return &key_invhome }
+    if id == C_KEY_INVEND { return &key_invend }
+    if id == C_KEY_INVUSE { return &key_invuse }
+    if id == C_KEY_INVDROP { return &key_invdrop }
+    if id == C_KEY_WEAPON1 { return &key_weapon1 }
+    if id == C_KEY_WEAPON2 { return &key_weapon2 }
+    if id == C_KEY_WEAPON3 { return &key_weapon3 }
+    if id == C_KEY_WEAPON4 { return &key_weapon4 }
+    if id == C_KEY_WEAPON5 { return &key_weapon5 }
+    if id == C_KEY_WEAPON6 { return &key_weapon6 }
+    if id == C_KEY_WEAPON7 { return &key_weapon7 }
+    if id == C_KEY_WEAPON8 { return &key_weapon8 }
+    if id == C_KEY_PREVWEAPON { return &key_prevweapon }
+    if id == C_KEY_NEXTWEAPON { return &key_nextweapon }
+    if id == C_JOYBPREVWEAPON { return &joybprevweapon }
+    if id == C_JOYBNEXTWEAPON { return &joybnextweapon }
+    if id == C_MOUSEBPREVWEAPON { return &mousebprevweapon }
+    if id == C_MOUSEBNEXTWEAPON { return &mousebnextweapon }
+    if id == C_KEY_MAP_NORTH { return &key_map_north }
+    if id == C_KEY_MAP_SOUTH { return &key_map_south }
+    if id == C_KEY_MAP_EAST { return &key_map_east }
+    if id == C_KEY_MAP_WEST { return &key_map_west }
+    if id == C_KEY_MAP_ZOOMIN { return &key_map_zoomin }
+    if id == C_KEY_MAP_ZOOMOUT { return &key_map_zoomout }
+    if id == C_KEY_MAP_TOGGLE { return &key_map_toggle }
+    if id == C_KEY_MAP_MAXZOOM { return &key_map_maxzoom }
+    if id == C_KEY_MAP_FOLLOW { return &key_map_follow }
+    if id == C_KEY_MAP_GRID { return &key_map_grid }
+    if id == C_KEY_MAP_MARK { return &key_map_mark }
+    if id == C_KEY_MAP_CLEARMARK { return &key_map_clearmark }
+    if id == C_KEY_MENU_ACTIVATE { return &key_menu_activate }
+    if id == C_KEY_MENU_UP { return &key_menu_up }
+    if id == C_KEY_MENU_DOWN { return &key_menu_down }
+    if id == C_KEY_MENU_LEFT { return &key_menu_left }
+    if id == C_KEY_MENU_RIGHT { return &key_menu_right }
+    if id == C_KEY_MENU_BACK { return &key_menu_back }
+    if id == C_KEY_MENU_FORWARD { return &key_menu_forward }
+    if id == C_KEY_MENU_CONFIRM { return &key_menu_confirm }
+    if id == C_KEY_MENU_ABORT { return &key_menu_abort }
+    if id == C_KEY_MENU_HELP { return &key_menu_help }
+    if id == C_KEY_MENU_SAVE { return &key_menu_save }
+    if id == C_KEY_MENU_LOAD { return &key_menu_load }
+    if id == C_KEY_MENU_VOLUME { return &key_menu_volume }
+    if id == C_KEY_MENU_DETAIL { return &key_menu_detail }
+    if id == C_KEY_MENU_QSAVE { return &key_menu_qsave }
+    if id == C_KEY_MENU_ENDGAME { return &key_menu_endgame }
+    if id == C_KEY_MENU_MESSAGES { return &key_menu_messages }
+    if id == C_KEY_MENU_QLOAD { return &key_menu_qload }
+    if id == C_KEY_MENU_QUIT { return &key_menu_quit }
+    if id == C_KEY_MENU_GAMMA { return &key_menu_gamma }
+    if id == C_KEY_MENU_INCSCREEN { return &key_menu_incscreen }
+    if id == C_KEY_MENU_DECSCREEN { return &key_menu_decscreen }
+    if id == C_KEY_MENU_SCREENSHOT { return &key_menu_screenshot }
+    if id == C_KEY_DEMO_QUIT { return &key_demo_quit }
+    if id == C_KEY_SPY { return &key_spy }
+    if id == C_KEY_MULTI_MSG { return &key_multi_msg }
+    return &key_right
+}
+
+@flow_api
+function ctrlshim_bind_msgplayer(i: i32) -> void {
+    M_BindVariable(ctrl_bindname("key_multi_msgplayer", i + 1),
+                 &key_multi_msgplayer[i] as ptr<void>)
+}
+
+@flow_api
+function ctrlshim_key_multi_msgplayer(i: i32) -> i32 {
+    return key_multi_msgplayer[i]
+}
+
+@flow_api
+function ctrlshim_set_key_multi_msgplayer(i: i32, v: i32) -> void {
+    key_multi_msgplayer[i] = v
+}
+
+function bind(name: string, id: i32) -> void {
+    M_BindVariable(name, ctrlshim_var(id) as ptr<void>)
+}
+
+function set_var(id: i32, v: i32) -> void {
+    ctrlshim_var(id)[0] = v
+}
+
+# Shared key-binding readers. Callers in automap/game/hud use KEY_*.
+function key_of(id: i32) -> i32 {
+    return ctrlshim_var(id)[0]
+}
+
+# ---- IDs matching ctrlshim_var() --------------------------------------
+
+const C_KEY_RIGHT: i32 = 0
+const C_KEY_LEFT: i32 = 1
+const C_KEY_UP: i32 = 2
+const C_KEY_DOWN: i32 = 3
+const C_KEY_STRAFELEFT: i32 = 4
+const C_KEY_STRAFERIGHT: i32 = 5
+const C_KEY_FIRE: i32 = 6
+const C_KEY_USE: i32 = 7
+const C_KEY_STRAFE: i32 = 8
+const C_KEY_SPEED: i32 = 9
+const C_MOUSEBFIRE: i32 = 10
+const C_MOUSEBSTRAFE: i32 = 11
+const C_MOUSEBFORWARD: i32 = 12
+const C_JOYBFIRE: i32 = 13
+const C_JOYBSTRAFE: i32 = 14
+const C_JOYBUSE: i32 = 15
+const C_JOYBSPEED: i32 = 16
+const C_JOYBMENU: i32 = 17
+const C_JOYBSTRAFELEFT: i32 = 18
+const C_JOYBSTRAFERIGHT: i32 = 19
+const C_MOUSEBSTRAFELEFT: i32 = 20
+const C_MOUSEBSTRAFERIGHT: i32 = 21
+const C_MOUSEBUSE: i32 = 22
+const C_MOUSEBBACKWARD: i32 = 23
+const C_DCLICK_USE: i32 = 24
+const C_KEY_PAUSE: i32 = 25
+const C_KEY_MESSAGE_REFRESH: i32 = 26
+const C_KEY_FLYUP: i32 = 27
+const C_KEY_FLYDOWN: i32 = 28
+const C_KEY_FLYCENTER: i32 = 29
+const C_KEY_LOOKUP: i32 = 30
+const C_KEY_LOOKDOWN: i32 = 31
+const C_KEY_LOOKCENTER: i32 = 32
+const C_KEY_INVLEFT: i32 = 33
+const C_KEY_INVRIGHT: i32 = 34
+const C_KEY_USEARTIFACT: i32 = 35
+const C_KEY_JUMP: i32 = 36
+const C_MOUSEBJUMP: i32 = 37
+const C_JOYBJUMP: i32 = 38
+const C_KEY_ARTI_ALL: i32 = 39
+const C_KEY_ARTI_HEALTH: i32 = 40
+const C_KEY_ARTI_POISONBAG: i32 = 41
+const C_KEY_ARTI_BLASTRADIUS: i32 = 42
+const C_KEY_ARTI_TELEPORT: i32 = 43
+const C_KEY_ARTI_TELEPORTOTHER: i32 = 44
+const C_KEY_ARTI_EGG: i32 = 45
+const C_KEY_ARTI_INVULNERABILITY: i32 = 46
+const C_KEY_USEHEALTH: i32 = 47
+const C_KEY_INVQUERY: i32 = 48
+const C_KEY_MISSION: i32 = 49
+const C_KEY_INVPOP: i32 = 50
+const C_KEY_INVKEY: i32 = 51
+const C_KEY_INVHOME: i32 = 52
+const C_KEY_INVEND: i32 = 53
+const C_KEY_INVUSE: i32 = 54
+const C_KEY_INVDROP: i32 = 55
+const C_KEY_WEAPON1: i32 = 56
+const C_KEY_WEAPON2: i32 = 57
+const C_KEY_WEAPON3: i32 = 58
+const C_KEY_WEAPON4: i32 = 59
+const C_KEY_WEAPON5: i32 = 60
+const C_KEY_WEAPON6: i32 = 61
+const C_KEY_WEAPON7: i32 = 62
+const C_KEY_WEAPON8: i32 = 63
+const C_KEY_PREVWEAPON: i32 = 64
+const C_KEY_NEXTWEAPON: i32 = 65
+const C_JOYBPREVWEAPON: i32 = 66
+const C_JOYBNEXTWEAPON: i32 = 67
+const C_MOUSEBPREVWEAPON: i32 = 68
+const C_MOUSEBNEXTWEAPON: i32 = 69
+const C_KEY_MAP_NORTH: i32 = 70
+const C_KEY_MAP_SOUTH: i32 = 71
+const C_KEY_MAP_EAST: i32 = 72
+const C_KEY_MAP_WEST: i32 = 73
+const C_KEY_MAP_ZOOMIN: i32 = 74
+const C_KEY_MAP_ZOOMOUT: i32 = 75
+const C_KEY_MAP_TOGGLE: i32 = 76
+const C_KEY_MAP_MAXZOOM: i32 = 77
+const C_KEY_MAP_FOLLOW: i32 = 78
+const C_KEY_MAP_GRID: i32 = 79
+const C_KEY_MAP_MARK: i32 = 80
+const C_KEY_MAP_CLEARMARK: i32 = 81
+const C_KEY_MENU_ACTIVATE: i32 = 82
+const C_KEY_MENU_UP: i32 = 83
+const C_KEY_MENU_DOWN: i32 = 84
+const C_KEY_MENU_LEFT: i32 = 85
+const C_KEY_MENU_RIGHT: i32 = 86
+const C_KEY_MENU_BACK: i32 = 87
+const C_KEY_MENU_FORWARD: i32 = 88
+const C_KEY_MENU_CONFIRM: i32 = 89
+const C_KEY_MENU_ABORT: i32 = 90
+const C_KEY_MENU_HELP: i32 = 91
+const C_KEY_MENU_SAVE: i32 = 92
+const C_KEY_MENU_LOAD: i32 = 93
+const C_KEY_MENU_VOLUME: i32 = 94
+const C_KEY_MENU_DETAIL: i32 = 95
+const C_KEY_MENU_QSAVE: i32 = 96
+const C_KEY_MENU_ENDGAME: i32 = 97
+const C_KEY_MENU_MESSAGES: i32 = 98
+const C_KEY_MENU_QLOAD: i32 = 99
+const C_KEY_MENU_QUIT: i32 = 100
+const C_KEY_MENU_GAMMA: i32 = 101
+const C_KEY_MENU_INCSCREEN: i32 = 102
+const C_KEY_MENU_DECSCREEN: i32 = 103
+const C_KEY_MENU_SCREENSHOT: i32 = 104
+const C_KEY_DEMO_QUIT: i32 = 105
+const C_KEY_SPY: i32 = 106
+const C_KEY_MULTI_MSG: i32 = 107
+
+# doomkeys.h values used as Strife overrides
+const KEY_PGUP: i32 = 201
+const KEY_PGDN: i32 = 209
+const KEY_INS: i32 = 210
+const KEY_DEL: i32 = 211
+
+# ---- KEY_* shared accessors (read at call time for rebinding) ---------
+
+@flow_api
+function KEY_right() -> i32 { return key_of(C_KEY_RIGHT) }
+@flow_api
+function KEY_left() -> i32 { return key_of(C_KEY_LEFT) }
+@flow_api
+function KEY_up() -> i32 { return key_of(C_KEY_UP) }
+@flow_api
+function KEY_down() -> i32 { return key_of(C_KEY_DOWN) }
+@flow_api
+function KEY_strafeleft() -> i32 { return key_of(C_KEY_STRAFELEFT) }
+@flow_api
+function KEY_straferight() -> i32 { return key_of(C_KEY_STRAFERIGHT) }
+@flow_api
+function KEY_fire() -> i32 { return key_of(C_KEY_FIRE) }
+@flow_api
+function KEY_use() -> i32 { return key_of(C_KEY_USE) }
+@flow_api
+function KEY_strafe() -> i32 { return key_of(C_KEY_STRAFE) }
+@flow_api
+function KEY_speed() -> i32 { return key_of(C_KEY_SPEED) }
+@flow_api
+function KEY_pause() -> i32 { return key_of(C_KEY_PAUSE) }
+@flow_api
+function KEY_message_refresh() -> i32 { return key_of(C_KEY_MESSAGE_REFRESH) }
+@flow_api
+function KEY_prevweapon() -> i32 { return key_of(C_KEY_PREVWEAPON) }
+@flow_api
+function KEY_nextweapon() -> i32 { return key_of(C_KEY_NEXTWEAPON) }
+@flow_api
+function KEY_map_north() -> i32 { return key_of(C_KEY_MAP_NORTH) }
+@flow_api
+function KEY_map_south() -> i32 { return key_of(C_KEY_MAP_SOUTH) }
+@flow_api
+function KEY_map_east() -> i32 { return key_of(C_KEY_MAP_EAST) }
+@flow_api
+function KEY_map_west() -> i32 { return key_of(C_KEY_MAP_WEST) }
+@flow_api
+function KEY_map_zoomin() -> i32 { return key_of(C_KEY_MAP_ZOOMIN) }
+@flow_api
+function KEY_map_zoomout() -> i32 { return key_of(C_KEY_MAP_ZOOMOUT) }
+@flow_api
+function KEY_map_toggle() -> i32 { return key_of(C_KEY_MAP_TOGGLE) }
+@flow_api
+function KEY_map_maxzoom() -> i32 { return key_of(C_KEY_MAP_MAXZOOM) }
+@flow_api
+function KEY_map_follow() -> i32 { return key_of(C_KEY_MAP_FOLLOW) }
+@flow_api
+function KEY_map_grid() -> i32 { return key_of(C_KEY_MAP_GRID) }
+@flow_api
+function KEY_map_mark() -> i32 { return key_of(C_KEY_MAP_MARK) }
+@flow_api
+function KEY_map_clearmark() -> i32 { return key_of(C_KEY_MAP_CLEARMARK) }
+@flow_api
+function KEY_demo_quit() -> i32 { return key_of(C_KEY_DEMO_QUIT) }
+@flow_api
+function KEY_spy() -> i32 { return key_of(C_KEY_SPY) }
+@flow_api
+function KEY_multi_msg() -> i32 { return key_of(C_KEY_MULTI_MSG) }
+@flow_api
+function KEY_weapon(i: i32) -> i32 { return key_of(C_KEY_WEAPON1 + i) }
+@flow_api
+function KEY_multi_msgplayer(i: i32) -> i32 { return key_multi_msgplayer[i] }
+
+@flow_api
+function M_BindBaseControls() -> void {
+    bind("key_right", C_KEY_RIGHT)
+    bind("key_left", C_KEY_LEFT)
+    bind("key_up", C_KEY_UP)
+    bind("key_down", C_KEY_DOWN)
+    bind("key_strafeleft", C_KEY_STRAFELEFT)
+    bind("key_straferight", C_KEY_STRAFERIGHT)
+    bind("key_fire", C_KEY_FIRE)
+    bind("key_use", C_KEY_USE)
+    bind("key_strafe", C_KEY_STRAFE)
+    bind("key_speed", C_KEY_SPEED)
+
+    bind("mouseb_fire", C_MOUSEBFIRE)
+    bind("mouseb_strafe", C_MOUSEBSTRAFE)
+    bind("mouseb_forward", C_MOUSEBFORWARD)
+
+    bind("joyb_fire", C_JOYBFIRE)
+    bind("joyb_strafe", C_JOYBSTRAFE)
+    bind("joyb_use", C_JOYBUSE)
+    bind("joyb_speed", C_JOYBSPEED)
+
+    bind("joyb_menu_activate", C_JOYBMENU)
+
+    bind("joyb_strafeleft", C_JOYBSTRAFELEFT)
+    bind("joyb_straferight", C_JOYBSTRAFERIGHT)
+    bind("mouseb_strafeleft", C_MOUSEBSTRAFELEFT)
+    bind("mouseb_straferight", C_MOUSEBSTRAFERIGHT)
+    bind("mouseb_use", C_MOUSEBUSE)
+    bind("mouseb_backward", C_MOUSEBBACKWARD)
+    bind("dclick_use", C_DCLICK_USE)
+    bind("key_pause", C_KEY_PAUSE)
+    bind("key_message_refresh", C_KEY_MESSAGE_REFRESH)
+}
+
+@flow_api
+function M_BindHereticControls() -> void {
+    bind("key_flyup", C_KEY_FLYUP)
+    bind("key_flydown", C_KEY_FLYDOWN)
+    bind("key_flycenter", C_KEY_FLYCENTER)
+
+    bind("key_lookup", C_KEY_LOOKUP)
+    bind("key_lookdown", C_KEY_LOOKDOWN)
+    bind("key_lookcenter", C_KEY_LOOKCENTER)
+
+    bind("key_invleft", C_KEY_INVLEFT)
+    bind("key_invright", C_KEY_INVRIGHT)
+    bind("key_useartifact", C_KEY_USEARTIFACT)
+}
+
+@flow_api
+function M_BindHexenControls() -> void {
+    bind("key_jump", C_KEY_JUMP)
+    bind("mouseb_jump", C_MOUSEBJUMP)
+    bind("joyb_jump", C_JOYBJUMP)
+
+    bind("key_arti_all", C_KEY_ARTI_ALL)
+    bind("key_arti_health", C_KEY_ARTI_HEALTH)
+    bind("key_arti_poisonbag", C_KEY_ARTI_POISONBAG)
+    bind("key_arti_blastradius", C_KEY_ARTI_BLASTRADIUS)
+    bind("key_arti_teleport", C_KEY_ARTI_TELEPORT)
+    bind("key_arti_teleportother", C_KEY_ARTI_TELEPORTOTHER)
+    bind("key_arti_egg", C_KEY_ARTI_EGG)
+    bind("key_arti_invulnerability", C_KEY_ARTI_INVULNERABILITY)
+}
+
+@flow_api
+function M_BindStrifeControls() -> void {
+    # Shared keys with different Strife defaults:
+    set_var(C_KEY_MESSAGE_REFRESH, 47)   # '/'
+    set_var(C_KEY_JUMP, 97)              # 'a'
+    set_var(C_KEY_LOOKUP, KEY_PGUP)
+    set_var(C_KEY_LOOKDOWN, KEY_PGDN)
+    set_var(C_KEY_INVLEFT, KEY_INS)
+    set_var(C_KEY_INVRIGHT, KEY_DEL)
+
+    bind("key_jump", C_KEY_JUMP)
+    bind("key_lookUp", C_KEY_LOOKUP)
+    bind("key_lookDown", C_KEY_LOOKDOWN)
+    bind("key_invLeft", C_KEY_INVLEFT)
+    bind("key_invRight", C_KEY_INVRIGHT)
+
+    bind("key_useHealth", C_KEY_USEHEALTH)
+    bind("key_invquery", C_KEY_INVQUERY)
+    bind("key_mission", C_KEY_MISSION)
+    bind("key_invPop", C_KEY_INVPOP)
+    bind("key_invKey", C_KEY_INVKEY)
+    bind("key_invHome", C_KEY_INVHOME)
+    bind("key_invEnd", C_KEY_INVEND)
+    bind("key_invUse", C_KEY_INVUSE)
+    bind("key_invDrop", C_KEY_INVDROP)
+
+    bind("mouseb_jump", C_MOUSEBJUMP)
+    bind("joyb_jump", C_JOYBJUMP)
+}
+
+@flow_api
+function M_BindWeaponControls() -> void {
+    bind("key_weapon1", C_KEY_WEAPON1)
+    bind("key_weapon2", C_KEY_WEAPON2)
+    bind("key_weapon3", C_KEY_WEAPON3)
+    bind("key_weapon4", C_KEY_WEAPON4)
+    bind("key_weapon5", C_KEY_WEAPON5)
+    bind("key_weapon6", C_KEY_WEAPON6)
+    bind("key_weapon7", C_KEY_WEAPON7)
+    bind("key_weapon8", C_KEY_WEAPON8)
+
+    bind("key_prevweapon", C_KEY_PREVWEAPON)
+    bind("key_nextweapon", C_KEY_NEXTWEAPON)
+
+    bind("joyb_prevweapon", C_JOYBPREVWEAPON)
+    bind("joyb_nextweapon", C_JOYBNEXTWEAPON)
+
+    bind("mouseb_prevweapon", C_MOUSEBPREVWEAPON)
+    bind("mouseb_nextweapon", C_MOUSEBNEXTWEAPON)
+}
+
+@flow_api
+function M_BindMapControls() -> void {
+    bind("key_map_north", C_KEY_MAP_NORTH)
+    bind("key_map_south", C_KEY_MAP_SOUTH)
+    bind("key_map_east", C_KEY_MAP_EAST)
+    bind("key_map_west", C_KEY_MAP_WEST)
+    bind("key_map_zoomin", C_KEY_MAP_ZOOMIN)
+    bind("key_map_zoomout", C_KEY_MAP_ZOOMOUT)
+    bind("key_map_toggle", C_KEY_MAP_TOGGLE)
+    bind("key_map_maxzoom", C_KEY_MAP_MAXZOOM)
+    bind("key_map_follow", C_KEY_MAP_FOLLOW)
+    bind("key_map_grid", C_KEY_MAP_GRID)
+    bind("key_map_mark", C_KEY_MAP_MARK)
+    bind("key_map_clearmark", C_KEY_MAP_CLEARMARK)
+}
+
+@flow_api
+function M_BindMenuControls() -> void {
+    bind("key_menu_activate", C_KEY_MENU_ACTIVATE)
+    bind("key_menu_up", C_KEY_MENU_UP)
+    bind("key_menu_down", C_KEY_MENU_DOWN)
+    bind("key_menu_left", C_KEY_MENU_LEFT)
+    bind("key_menu_right", C_KEY_MENU_RIGHT)
+    bind("key_menu_back", C_KEY_MENU_BACK)
+    bind("key_menu_forward", C_KEY_MENU_FORWARD)
+    bind("key_menu_confirm", C_KEY_MENU_CONFIRM)
+    bind("key_menu_abort", C_KEY_MENU_ABORT)
+
+    bind("key_menu_help", C_KEY_MENU_HELP)
+    bind("key_menu_save", C_KEY_MENU_SAVE)
+    bind("key_menu_load", C_KEY_MENU_LOAD)
+    bind("key_menu_volume", C_KEY_MENU_VOLUME)
+    bind("key_menu_detail", C_KEY_MENU_DETAIL)
+    bind("key_menu_qsave", C_KEY_MENU_QSAVE)
+    bind("key_menu_endgame", C_KEY_MENU_ENDGAME)
+    bind("key_menu_messages", C_KEY_MENU_MESSAGES)
+    bind("key_menu_qload", C_KEY_MENU_QLOAD)
+    bind("key_menu_quit", C_KEY_MENU_QUIT)
+    bind("key_menu_gamma", C_KEY_MENU_GAMMA)
+
+    bind("key_menu_incscreen", C_KEY_MENU_INCSCREEN)
+    bind("key_menu_decscreen", C_KEY_MENU_DECSCREEN)
+    bind("key_menu_screenshot", C_KEY_MENU_SCREENSHOT)
+    bind("key_demo_quit", C_KEY_DEMO_QUIT)
+    bind("key_spy", C_KEY_SPY)
+}
+
+@flow_api
+function M_BindChatControls(num_players: u32) -> void {
+    bind("key_multi_msg", C_KEY_MULTI_MSG)
+    let mut i: u32 = 0
+    while i < num_players {
+        ctrlshim_bind_msgplayer(i as i32)
+        i = i + (1 as u32)
+    }
+}
+
+@flow_api
+function M_ApplyPlatformDefaults() -> void {
+    # no-op. Add your platform-specific patches here.
+    return
+}

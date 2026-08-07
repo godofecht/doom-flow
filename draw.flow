@@ -1,0 +1,904 @@
+# Span/column drawing, ported from r_draw.c to Flow.
+#
+# Public ABI matches r_draw.h. Shared globals (viewwidth, columnofs,
+# ylookup, view*/dc_*/ds_*, fuzz*, translationtables) are Flow-owned
+# let mut state with @flow_api DRAW_* / drawshim_* accessors. centery
+# lives in rmain.flow (RMAIN_centery). background_buffer stays private.
+
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+extern { function calloc(n: i64, sz: i64) -> ptr<void> }
+
+extern { function I_Error(msg: string) -> void }
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function Z_Free(p: ptr<void>) -> void }
+extern { function W_CacheLumpName(name: string, tag: i32) -> ptr<void> }
+
+extern { function V_UseBuffer(buffer: ptr<u8>) -> void }
+extern { function V_RestoreBuffer() -> void }
+extern { function V_DrawPatch(x: i32, y: i32, patch: ptr<void>) -> void }
+extern { function V_MarkRect(x: i32, y: i32, width: i32, height: i32) -> void }
+
+extern { function RMAIN_centery() -> i32 }
+extern { function RDATA_colormaps() -> ptr<void> }
+extern { function VIDEO_buffer() -> ptr<u8> }
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+# r_draw.c / i_video.h / doomdef.h / m_fixed.h / z_zone.h / d_mode.h
+# (prefixed: one Flow TU, const names must be unique)
+const DRAW_SCREENWIDTH: i32 = 320
+const DRAW_SCREENHEIGHT: i32 = 200
+const DRAW_SBARHEIGHT: i32 = 32
+const DRAW_FRACBITS: i32 = 16
+const DRAW_FUZZTABLE: i32 = 50
+const DRAW_FUZZOFF: i32 = 320          # SCREENWIDTH
+const DRAW_MAXWIDTH: i32 = 1120
+const DRAW_MAXHEIGHT: i32 = 832
+const DRAW_PU_STATIC: i32 = 1
+const DRAW_PU_CACHE: i32 = 8
+const DRAW_COMMERCIAL: i32 = 2
+
+# Backing buffer for the bezel (was static in r_draw.c)
+let mut background_buffer: ptr<u8> = null
+
+# ---- shared globals (were DEFINEd in draw_shim.c / r_draw.c) ---------
+
+let mut viewwidth: i32 = 0
+let mut scaledviewwidth: i32 = 0
+let mut viewheight: i32 = 0
+let mut viewwindowx: i32 = 0
+let mut viewwindowy: i32 = 0
+
+let mut columnofs: ptr<i32> = null
+let mut ylookup: ptr<ptr<u8> > = null
+
+let mut dc_colormap: ptr<u8> = null
+let mut dc_x: i32 = 0
+let mut dc_yl: i32 = 0
+let mut dc_yh: i32 = 0
+let mut dc_iscale: i32 = 0
+let mut dc_texturemid: i32 = 0
+let mut dc_source: ptr<u8> = null
+let mut dc_translation: ptr<u8> = null
+let mut translationtables: ptr<u8> = null
+
+let mut fuzzpos: i32 = 0
+let mut fuzzoffset: array<i32, 50> = [
+    320, -320, 320, -320, 320, 320, -320, 320, 320, -320,
+    320, 320, 320, -320, 320, 320, 320, -320, -320, -320,
+    -320, 320, -320, -320, 320, 320, 320, 320, -320, 320,
+    -320, 320, 320, -320, -320, 320, 320, -320, -320, -320,
+    -320, 320, 320, 320, 320, -320, 320, 320, -320, 320
+]
+
+let mut ds_y: i32 = 0
+let mut ds_x1: i32 = 0
+let mut ds_x2: i32 = 0
+let mut ds_colormap: ptr<u8> = null
+let mut ds_xfrac: i32 = 0
+let mut ds_yfrac: i32 = 0
+let mut ds_xstep: i32 = 0
+let mut ds_ystep: i32 = 0
+let mut ds_source: ptr<u8> = null
+
+function draw_ensure_buffers() -> void {
+    if (columnofs as i64) == 0 {
+        columnofs = calloc(DRAW_MAXWIDTH as i64, 4) as ptr<i32>
+        ylookup = calloc(DRAW_MAXHEIGHT as i64, 8) as ptr<ptr<u8> >
+    }
+}
+
+@flow_api
+function drawshim_ylookup() -> ptr<ptr<u8> > {
+    draw_ensure_buffers()
+    return ylookup
+}
+
+@flow_api
+function drawshim_columnofs() -> ptr<i32> {
+    draw_ensure_buffers()
+    return columnofs
+}
+
+@flow_api
+function drawshim_viewwidth_addr() -> ptr<i32> { return &viewwidth }
+
+@flow_api
+function drawshim_scaledviewwidth_addr() -> ptr<i32> { return &scaledviewwidth }
+
+@flow_api
+function drawshim_viewheight_addr() -> ptr<i32> { return &viewheight }
+
+@flow_api
+function drawshim_viewwindowx_addr() -> ptr<i32> { return &viewwindowx }
+
+@flow_api
+function drawshim_viewwindowy_addr() -> ptr<i32> { return &viewwindowy }
+
+@flow_api
+function drawshim_dc_colormap_addr() -> ptr<ptr<u8> > { return &dc_colormap }
+
+@flow_api
+function drawshim_dc_x_addr() -> ptr<i32> { return &dc_x }
+
+@flow_api
+function drawshim_dc_yl_addr() -> ptr<i32> { return &dc_yl }
+
+@flow_api
+function drawshim_dc_yh_addr() -> ptr<i32> { return &dc_yh }
+
+@flow_api
+function drawshim_dc_iscale_addr() -> ptr<i32> { return &dc_iscale }
+
+@flow_api
+function drawshim_dc_texturemid_addr() -> ptr<i32> { return &dc_texturemid }
+
+@flow_api
+function drawshim_dc_source_addr() -> ptr<ptr<u8> > { return &dc_source }
+
+@flow_api
+function drawshim_fuzzoffset() -> ptr<i32> { return &fuzzoffset[0] }
+
+@flow_api
+function drawshim_fuzzpos_addr() -> ptr<i32> { return &fuzzpos }
+
+@flow_api
+function drawshim_dc_translation_addr() -> ptr<ptr<u8> > { return &dc_translation }
+
+@flow_api
+function drawshim_translationtables_addr() -> ptr<ptr<u8> > { return &translationtables }
+
+@flow_api
+function drawshim_ds_y_addr() -> ptr<i32> { return &ds_y }
+
+@flow_api
+function drawshim_ds_x1_addr() -> ptr<i32> { return &ds_x1 }
+
+@flow_api
+function drawshim_ds_x2_addr() -> ptr<i32> { return &ds_x2 }
+
+@flow_api
+function drawshim_ds_colormap_addr() -> ptr<ptr<u8> > { return &ds_colormap }
+
+@flow_api
+function drawshim_ds_xfrac_addr() -> ptr<i32> { return &ds_xfrac }
+
+@flow_api
+function drawshim_ds_yfrac_addr() -> ptr<i32> { return &ds_yfrac }
+
+@flow_api
+function drawshim_ds_xstep_addr() -> ptr<i32> { return &ds_xstep }
+
+@flow_api
+function drawshim_ds_ystep_addr() -> ptr<i32> { return &ds_ystep }
+
+@flow_api
+function drawshim_ds_source_addr() -> ptr<ptr<u8> > { return &ds_source }
+
+function draw_addr(base: ptr<u8>, off: i32) -> ptr<u8> {
+    return ((base as i64) + off as i64) as ptr<u8>
+}
+
+function draw_dest(yl: i32, x: i32) -> ptr<u8> {
+    let rows: ptr<ptr<u8> > = drawshim_ylookup()
+    let cols: ptr<i32> = drawshim_columnofs()
+    return draw_addr(rows[yl], cols[x])
+}
+
+# Shared view-window getters/setters (owned in draw_shim.c). Prefer these
+# over per-module *shim_viewwidth clones.
+
+@flow_api
+function DRAW_viewwidth() -> i32 {
+    return drawshim_viewwidth_addr()[0]
+}
+
+@flow_api
+function DRAW_set_viewwidth(v: i32) -> void {
+    drawshim_viewwidth_addr()[0] = v
+}
+
+@flow_api
+function DRAW_scaledviewwidth() -> i32 {
+    return drawshim_scaledviewwidth_addr()[0]
+}
+
+@flow_api
+function DRAW_set_scaledviewwidth(v: i32) -> void {
+    drawshim_scaledviewwidth_addr()[0] = v
+}
+
+@flow_api
+function DRAW_viewheight() -> i32 {
+    return drawshim_viewheight_addr()[0]
+}
+
+@flow_api
+function DRAW_set_viewheight(v: i32) -> void {
+    drawshim_viewheight_addr()[0] = v
+}
+
+# Shared column-drawer getters/setters (owned in draw_shim.c). Prefer these
+# over per-module planeshim_/segshim_/thingshim_ dc_* clones.
+
+@flow_api
+function DRAW_dc_colormap() -> ptr<void> {
+    return drawshim_dc_colormap_addr()[0] as ptr<void>
+}
+
+@flow_api
+function DRAW_set_dc_colormap(p: ptr<void>) -> void {
+    drawshim_dc_colormap_addr()[0] = p as ptr<u8>
+}
+
+@flow_api
+function DRAW_dc_x() -> i32 {
+    return drawshim_dc_x_addr()[0]
+}
+
+@flow_api
+function DRAW_set_dc_x(v: i32) -> void {
+    drawshim_dc_x_addr()[0] = v
+}
+
+@flow_api
+function DRAW_dc_yl() -> i32 {
+    return drawshim_dc_yl_addr()[0]
+}
+
+@flow_api
+function DRAW_set_dc_yl(v: i32) -> void {
+    drawshim_dc_yl_addr()[0] = v
+}
+
+@flow_api
+function DRAW_dc_yh() -> i32 {
+    return drawshim_dc_yh_addr()[0]
+}
+
+@flow_api
+function DRAW_set_dc_yh(v: i32) -> void {
+    drawshim_dc_yh_addr()[0] = v
+}
+
+@flow_api
+function DRAW_dc_iscale() -> i32 {
+    return drawshim_dc_iscale_addr()[0]
+}
+
+@flow_api
+function DRAW_set_dc_iscale(v: i32) -> void {
+    drawshim_dc_iscale_addr()[0] = v
+}
+
+@flow_api
+function DRAW_dc_texturemid() -> i32 {
+    return drawshim_dc_texturemid_addr()[0]
+}
+
+@flow_api
+function DRAW_set_dc_texturemid(v: i32) -> void {
+    drawshim_dc_texturemid_addr()[0] = v
+}
+
+@flow_api
+function DRAW_dc_source() -> ptr<void> {
+    return drawshim_dc_source_addr()[0] as ptr<void>
+}
+
+@flow_api
+function DRAW_set_dc_source(p: ptr<void>) -> void {
+    drawshim_dc_source_addr()[0] = p as ptr<u8>
+}
+
+@flow_api
+function DRAW_dc_translation() -> ptr<void> {
+    return drawshim_dc_translation_addr()[0] as ptr<void>
+}
+
+@flow_api
+function DRAW_set_dc_translation(p: ptr<void>) -> void {
+    drawshim_dc_translation_addr()[0] = p as ptr<u8>
+}
+
+# Shared span-drawer setters (owned in draw_shim.c). Prefer these over
+# per-module planeshim_set_ds_* clones.
+
+@flow_api
+function DRAW_set_ds_xstep(v: i32) -> void {
+    drawshim_ds_xstep_addr()[0] = v
+}
+
+@flow_api
+function DRAW_set_ds_ystep(v: i32) -> void {
+    drawshim_ds_ystep_addr()[0] = v
+}
+
+@flow_api
+function DRAW_set_ds_xfrac(v: i32) -> void {
+    drawshim_ds_xfrac_addr()[0] = v
+}
+
+@flow_api
+function DRAW_set_ds_yfrac(v: i32) -> void {
+    drawshim_ds_yfrac_addr()[0] = v
+}
+
+@flow_api
+function DRAW_set_ds_colormap(p: ptr<void>) -> void {
+    drawshim_ds_colormap_addr()[0] = p as ptr<u8>
+}
+
+@flow_api
+function DRAW_set_ds_y(v: i32) -> void {
+    drawshim_ds_y_addr()[0] = v
+}
+
+@flow_api
+function DRAW_set_ds_x1(v: i32) -> void {
+    drawshim_ds_x1_addr()[0] = v
+}
+
+@flow_api
+function DRAW_set_ds_x2(v: i32) -> void {
+    drawshim_ds_x2_addr()[0] = v
+}
+
+@flow_api
+function DRAW_set_ds_source(p: ptr<void>) -> void {
+    drawshim_ds_source_addr()[0] = p as ptr<u8>
+}
+
+#
+# R_DrawColumn
+#
+@flow_api
+function R_DrawColumn() -> void {
+    let mut count: i32 = drawshim_dc_yh_addr()[0] - drawshim_dc_yl_addr()[0]
+    if count < 0 {
+        return
+    }
+
+    # RANGECHECK (doomdef.h)
+    if (drawshim_dc_x_addr()[0] as u32) >= (DRAW_SCREENWIDTH as u32)
+        or drawshim_dc_yl_addr()[0] < 0
+        or drawshim_dc_yh_addr()[0] >= DRAW_SCREENHEIGHT {
+        I_Error("R_DrawColumn: bad range")
+    }
+
+    let mut dest: ptr<u8> = draw_dest(drawshim_dc_yl_addr()[0], drawshim_dc_x_addr()[0])
+    let fracstep: i32 = drawshim_dc_iscale_addr()[0]
+    let mut frac: i32 = drawshim_dc_texturemid_addr()[0]
+        + (drawshim_dc_yl_addr()[0] - RMAIN_centery()) * fracstep
+    let colormap: ptr<u8> = drawshim_dc_colormap_addr()[0]
+    let source: ptr<u8> = drawshim_dc_source_addr()[0]
+
+    while true {
+        dest[0] = colormap[source[(frac >> DRAW_FRACBITS) & 127] as i32]
+        dest = draw_addr(dest, DRAW_SCREENWIDTH)
+        frac = frac + fracstep
+        if count == 0 {
+            break
+        }
+        count = count - 1
+    }
+}
+
+#
+# R_DrawColumnLow
+#
+@flow_api
+function R_DrawColumnLow() -> void {
+    let mut count: i32 = drawshim_dc_yh_addr()[0] - drawshim_dc_yl_addr()[0]
+    if count < 0 {
+        return
+    }
+
+    # RANGECHECK
+    if (drawshim_dc_x_addr()[0] as u32) >= (DRAW_SCREENWIDTH as u32)
+        or drawshim_dc_yl_addr()[0] < 0
+        or drawshim_dc_yh_addr()[0] >= DRAW_SCREENHEIGHT {
+        I_Error("R_DrawColumn: bad range")
+    }
+
+    let x: i32 = drawshim_dc_x_addr()[0] << 1
+    let mut dest: ptr<u8> = draw_dest(drawshim_dc_yl_addr()[0], x)
+    let mut dest2: ptr<u8> = draw_dest(drawshim_dc_yl_addr()[0], x + 1)
+    let fracstep: i32 = drawshim_dc_iscale_addr()[0]
+    let mut frac: i32 = drawshim_dc_texturemid_addr()[0]
+        + (drawshim_dc_yl_addr()[0] - RMAIN_centery()) * fracstep
+    let colormap: ptr<u8> = drawshim_dc_colormap_addr()[0]
+    let source: ptr<u8> = drawshim_dc_source_addr()[0]
+
+    while true {
+        let pix: u8 = colormap[source[(frac >> DRAW_FRACBITS) & 127] as i32]
+        dest[0] = pix
+        dest2[0] = pix
+        dest = draw_addr(dest, DRAW_SCREENWIDTH)
+        dest2 = draw_addr(dest2, DRAW_SCREENWIDTH)
+        frac = frac + fracstep
+        if count == 0 {
+            break
+        }
+        count = count - 1
+    }
+}
+
+#
+# R_DrawFuzzColumn
+#
+@flow_api
+function R_DrawFuzzColumn() -> void {
+    let dc_yl_p: ptr<i32> = drawshim_dc_yl_addr()
+    let dc_yh_p: ptr<i32> = drawshim_dc_yh_addr()
+
+    # Adjust borders. Low...
+    if dc_yl_p[0] == 0 {
+        dc_yl_p[0] = 1
+    }
+    # .. and high.
+    if dc_yh_p[0] == drawshim_viewheight_addr()[0] - 1 {
+        dc_yh_p[0] = drawshim_viewheight_addr()[0] - 2
+    }
+
+    let mut count: i32 = dc_yh_p[0] - dc_yl_p[0]
+    if count < 0 {
+        return
+    }
+
+    # RANGECHECK
+    if (drawshim_dc_x_addr()[0] as u32) >= (DRAW_SCREENWIDTH as u32)
+        or dc_yl_p[0] < 0
+        or dc_yh_p[0] >= DRAW_SCREENHEIGHT {
+        I_Error("R_DrawFuzzColumn: bad range")
+    }
+
+    let mut dest: ptr<u8> = draw_dest(dc_yl_p[0], drawshim_dc_x_addr()[0])
+    let fracstep: i32 = drawshim_dc_iscale_addr()[0]
+    let mut frac: i32 = drawshim_dc_texturemid_addr()[0]
+        + (dc_yl_p[0] - RMAIN_centery()) * fracstep
+    let cmaps: ptr<u8> = RDATA_colormaps() as ptr<u8>
+    let fuzzoff: ptr<i32> = drawshim_fuzzoffset()
+    let fuzzpos_p: ptr<i32> = drawshim_fuzzpos_addr()
+
+    while true {
+        let sample: u8 = draw_addr(dest, fuzzoff[fuzzpos_p[0]])[0]
+        dest[0] = cmaps[6 * 256 + (sample as i32)]
+        fuzzpos_p[0] = fuzzpos_p[0] + 1
+        if fuzzpos_p[0] == DRAW_FUZZTABLE {
+            fuzzpos_p[0] = 0
+        }
+        dest = draw_addr(dest, DRAW_SCREENWIDTH)
+        frac = frac + fracstep
+        if count == 0 {
+            break
+        }
+        count = count - 1
+    }
+}
+
+#
+# R_DrawFuzzColumnLow
+#
+@flow_api
+function R_DrawFuzzColumnLow() -> void {
+    let dc_yl_p: ptr<i32> = drawshim_dc_yl_addr()
+    let dc_yh_p: ptr<i32> = drawshim_dc_yh_addr()
+
+    if dc_yl_p[0] == 0 {
+        dc_yl_p[0] = 1
+    }
+    if dc_yh_p[0] == drawshim_viewheight_addr()[0] - 1 {
+        dc_yh_p[0] = drawshim_viewheight_addr()[0] - 2
+    }
+
+    let mut count: i32 = dc_yh_p[0] - dc_yl_p[0]
+    if count < 0 {
+        return
+    }
+
+    let x: i32 = drawshim_dc_x_addr()[0] << 1
+
+    # RANGECHECK
+    if (x as u32) >= (DRAW_SCREENWIDTH as u32)
+        or dc_yl_p[0] < 0
+        or dc_yh_p[0] >= DRAW_SCREENHEIGHT {
+        I_Error("R_DrawFuzzColumn: bad range")
+    }
+
+    let mut dest: ptr<u8> = draw_dest(dc_yl_p[0], x)
+    let mut dest2: ptr<u8> = draw_dest(dc_yl_p[0], x + 1)
+    let fracstep: i32 = drawshim_dc_iscale_addr()[0]
+    let mut frac: i32 = drawshim_dc_texturemid_addr()[0]
+        + (dc_yl_p[0] - RMAIN_centery()) * fracstep
+    let cmaps: ptr<u8> = RDATA_colormaps() as ptr<u8>
+    let fuzzoff: ptr<i32> = drawshim_fuzzoffset()
+    let fuzzpos_p: ptr<i32> = drawshim_fuzzpos_addr()
+
+    while true {
+        let fo: i32 = fuzzoff[fuzzpos_p[0]]
+        dest[0] = cmaps[6 * 256 + (draw_addr(dest, fo)[0] as i32)]
+        dest2[0] = cmaps[6 * 256 + (draw_addr(dest2, fo)[0] as i32)]
+        fuzzpos_p[0] = fuzzpos_p[0] + 1
+        if fuzzpos_p[0] == DRAW_FUZZTABLE {
+            fuzzpos_p[0] = 0
+        }
+        dest = draw_addr(dest, DRAW_SCREENWIDTH)
+        dest2 = draw_addr(dest2, DRAW_SCREENWIDTH)
+        frac = frac + fracstep
+        if count == 0 {
+            break
+        }
+        count = count - 1
+    }
+}
+
+#
+# R_DrawTranslatedColumn
+#
+@flow_api
+function R_DrawTranslatedColumn() -> void {
+    let mut count: i32 = drawshim_dc_yh_addr()[0] - drawshim_dc_yl_addr()[0]
+    if count < 0 {
+        return
+    }
+
+    # RANGECHECK
+    if (drawshim_dc_x_addr()[0] as u32) >= (DRAW_SCREENWIDTH as u32)
+        or drawshim_dc_yl_addr()[0] < 0
+        or drawshim_dc_yh_addr()[0] >= DRAW_SCREENHEIGHT {
+        I_Error("R_DrawColumn: bad range")
+    }
+
+    let mut dest: ptr<u8> = draw_dest(drawshim_dc_yl_addr()[0], drawshim_dc_x_addr()[0])
+    let fracstep: i32 = drawshim_dc_iscale_addr()[0]
+    let mut frac: i32 = drawshim_dc_texturemid_addr()[0]
+        + (drawshim_dc_yl_addr()[0] - RMAIN_centery()) * fracstep
+    let colormap: ptr<u8> = drawshim_dc_colormap_addr()[0]
+    let translation: ptr<u8> = drawshim_dc_translation_addr()[0]
+    let source: ptr<u8> = drawshim_dc_source_addr()[0]
+
+    while true {
+        dest[0] = colormap[translation[source[frac >> DRAW_FRACBITS] as i32] as i32]
+        dest = draw_addr(dest, DRAW_SCREENWIDTH)
+        frac = frac + fracstep
+        if count == 0 {
+            break
+        }
+        count = count - 1
+    }
+}
+
+#
+# R_DrawTranslatedColumnLow
+#
+@flow_api
+function R_DrawTranslatedColumnLow() -> void {
+    let mut count: i32 = drawshim_dc_yh_addr()[0] - drawshim_dc_yl_addr()[0]
+    if count < 0 {
+        return
+    }
+
+    let x: i32 = drawshim_dc_x_addr()[0] << 1
+
+    # RANGECHECK
+    if (x as u32) >= (DRAW_SCREENWIDTH as u32)
+        or drawshim_dc_yl_addr()[0] < 0
+        or drawshim_dc_yh_addr()[0] >= DRAW_SCREENHEIGHT {
+        I_Error("R_DrawColumn: bad range")
+    }
+
+    let mut dest: ptr<u8> = draw_dest(drawshim_dc_yl_addr()[0], x)
+    let mut dest2: ptr<u8> = draw_dest(drawshim_dc_yl_addr()[0], x + 1)
+    let fracstep: i32 = drawshim_dc_iscale_addr()[0]
+    let mut frac: i32 = drawshim_dc_texturemid_addr()[0]
+        + (drawshim_dc_yl_addr()[0] - RMAIN_centery()) * fracstep
+    let colormap: ptr<u8> = drawshim_dc_colormap_addr()[0]
+    let translation: ptr<u8> = drawshim_dc_translation_addr()[0]
+    let source: ptr<u8> = drawshim_dc_source_addr()[0]
+
+    while true {
+        let pix: u8 = colormap[translation[source[frac >> DRAW_FRACBITS] as i32] as i32]
+        dest[0] = pix
+        dest2[0] = pix
+        dest = draw_addr(dest, DRAW_SCREENWIDTH)
+        dest2 = draw_addr(dest2, DRAW_SCREENWIDTH)
+        frac = frac + fracstep
+        if count == 0 {
+            break
+        }
+        count = count - 1
+    }
+}
+
+#
+# R_InitTranslationTables
+#
+@flow_api
+function R_InitTranslationTables() -> void {
+    let tables: ptr<u8> = Z_Malloc(256 * 3, DRAW_PU_STATIC, null) as ptr<u8>
+    drawshim_translationtables_addr()[0] = tables
+
+    for i in 0 to 256 {
+        if i >= 0x70 and i <= 0x7f {
+            # map green ramp to gray, brown, red
+            tables[i] = (0x60 + (i & 0xf)) as u8
+            tables[i + 256] = (0x40 + (i & 0xf)) as u8
+            tables[i + 512] = (0x20 + (i & 0xf)) as u8
+        } else {
+            # Keep all other colors as is.
+            let v: u8 = i as u8
+            tables[i] = v
+            tables[i + 256] = v
+            tables[i + 512] = v
+        }
+    }
+}
+
+#
+# R_DrawSpan
+#
+@flow_api
+function R_DrawSpan() -> void {
+    # RANGECHECK
+    if drawshim_ds_x2_addr()[0] < drawshim_ds_x1_addr()[0]
+        or drawshim_ds_x1_addr()[0] < 0
+        or drawshim_ds_x2_addr()[0] >= DRAW_SCREENWIDTH
+        or (drawshim_ds_y_addr()[0] as u32) > (DRAW_SCREENHEIGHT as u32) {
+        I_Error("R_DrawSpan: bad range")
+    }
+
+    let mut position: u32 = (((drawshim_ds_xfrac_addr()[0] as u32) << 10) & 0xffff0000 as u32)
+        | (((drawshim_ds_yfrac_addr()[0] as u32) >> 6) & 0x0000ffff as u32)
+    let step: u32 = (((drawshim_ds_xstep_addr()[0] as u32) << 10) & 0xffff0000 as u32)
+        | (((drawshim_ds_ystep_addr()[0] as u32) >> 6) & 0x0000ffff as u32)
+
+    let mut dest: ptr<u8> = draw_dest(drawshim_ds_y_addr()[0], drawshim_ds_x1_addr()[0])
+    let mut count: i32 = drawshim_ds_x2_addr()[0] - drawshim_ds_x1_addr()[0]
+    let colormap: ptr<u8> = drawshim_ds_colormap_addr()[0]
+    let source: ptr<u8> = drawshim_ds_source_addr()[0]
+
+    while true {
+        let ytemp: u32 = (position >> 4) & 0x0fc0 as u32
+        let xtemp: u32 = position >> 26
+        let spot: i32 = (xtemp | ytemp) as i32
+        dest[0] = colormap[source[spot] as i32]
+        dest = draw_addr(dest, 1)
+        position = position + step
+        if count == 0 {
+            break
+        }
+        count = count - 1
+    }
+}
+
+#
+# R_DrawSpanLow
+#
+@flow_api
+function R_DrawSpanLow() -> void {
+    # RANGECHECK
+    if drawshim_ds_x2_addr()[0] < drawshim_ds_x1_addr()[0]
+        or drawshim_ds_x1_addr()[0] < 0
+        or drawshim_ds_x2_addr()[0] >= DRAW_SCREENWIDTH
+        or (drawshim_ds_y_addr()[0] as u32) > (DRAW_SCREENHEIGHT as u32) {
+        I_Error("R_DrawSpan: bad range")
+    }
+
+    let mut position: u32 = (((drawshim_ds_xfrac_addr()[0] as u32) << 10) & 0xffff0000 as u32)
+        | (((drawshim_ds_yfrac_addr()[0] as u32) >> 6) & 0x0000ffff as u32)
+    let step: u32 = (((drawshim_ds_xstep_addr()[0] as u32) << 10) & 0xffff0000 as u32)
+        | (((drawshim_ds_ystep_addr()[0] as u32) >> 6) & 0x0000ffff as u32)
+
+    let mut count: i32 = drawshim_ds_x2_addr()[0] - drawshim_ds_x1_addr()[0]
+
+    # Blocky mode, need to multiply by 2.
+    let ds_x1_p: ptr<i32> = drawshim_ds_x1_addr()
+    let ds_x2_p: ptr<i32> = drawshim_ds_x2_addr()
+    ds_x1_p[0] = ds_x1_p[0] << 1
+    ds_x2_p[0] = ds_x2_p[0] << 1
+
+    let mut dest: ptr<u8> = draw_dest(drawshim_ds_y_addr()[0], ds_x1_p[0])
+    let colormap: ptr<u8> = drawshim_ds_colormap_addr()[0]
+    let source: ptr<u8> = drawshim_ds_source_addr()[0]
+
+    while true {
+        let ytemp: u32 = (position >> 4) & 0x0fc0 as u32
+        let xtemp: u32 = position >> 26
+        let spot: i32 = (xtemp | ytemp) as i32
+        let pix: u8 = colormap[source[spot] as i32]
+        dest[0] = pix
+        dest = draw_addr(dest, 1)
+        dest[0] = pix
+        dest = draw_addr(dest, 1)
+        position = position + step
+        if count == 0 {
+            break
+        }
+        count = count - 1
+    }
+}
+
+#
+# R_InitBuffer
+#
+@flow_api
+function R_InitBuffer(width: i32, height: i32) -> void {
+    # Handle resize, e.g. smaller view windows with border and/or status bar.
+    drawshim_viewwindowx_addr()[0] = (DRAW_SCREENWIDTH - width) >> 1
+
+    # Column offset. For windows.
+    let cols: ptr<i32> = drawshim_columnofs()
+    let vwx: i32 = drawshim_viewwindowx_addr()[0]
+    for i in 0 to width {
+        cols[i] = vwx + i
+    }
+
+    # Same with base row offset.
+    if width == DRAW_SCREENWIDTH {
+        drawshim_viewwindowy_addr()[0] = 0
+    } else {
+        drawshim_viewwindowy_addr()[0] = (DRAW_SCREENHEIGHT - DRAW_SBARHEIGHT - height) >> 1
+    }
+
+    # Precalculate all row offsets.
+    let rows: ptr<ptr<u8> > = drawshim_ylookup()
+    let buf: ptr<u8> = VIDEO_buffer()
+    let vwy: i32 = drawshim_viewwindowy_addr()[0]
+    for i in 0 to height {
+        rows[i] = draw_addr(buf, (i + vwy) * DRAW_SCREENWIDTH)
+    }
+}
+
+#
+# R_FillBackScreen
+#
+@flow_api
+function R_FillBackScreen() -> void {
+    # If we are running full screen, there is no need to do any of this,
+    # and the background buffer can be freed if it was previously in use.
+    if drawshim_scaledviewwidth_addr()[0] == DRAW_SCREENWIDTH {
+        if (background_buffer as i64) != 0 {
+            Z_Free(background_buffer as ptr<void>)
+            background_buffer = null
+        }
+        return
+    }
+
+    # Allocate the background buffer if necessary
+    if (background_buffer as i64) == 0 {
+        background_buffer = Z_Malloc(
+            DRAW_SCREENWIDTH * (DRAW_SCREENHEIGHT - DRAW_SBARHEIGHT),
+            DRAW_PU_STATIC,
+            null
+        ) as ptr<u8>
+    }
+
+    # DEH_String is identity without FEATURE_DEHACKED
+    let mut name: string = "FLOOR7_2"
+    if STAT_gamemode() == DRAW_COMMERCIAL {
+        name = "GRNROCK"
+    }
+
+    let src: ptr<u8> = W_CacheLumpName(name, DRAW_PU_CACHE) as ptr<u8>
+    let mut dest: ptr<u8> = background_buffer
+
+    for y in 0 to (DRAW_SCREENHEIGHT - DRAW_SBARHEIGHT) {
+        for x in 0 to (DRAW_SCREENWIDTH / 64) {
+            memcpy(dest as ptr<void>, draw_addr(src, (y & 63) << 6) as ptr<void>, 64)
+            dest = draw_addr(dest, 64)
+        }
+        if (DRAW_SCREENWIDTH & 63) != 0 {
+            let n: i32 = DRAW_SCREENWIDTH & 63
+            memcpy(dest as ptr<void>, draw_addr(src, (y & 63) << 6) as ptr<void>, n as i64)
+            dest = draw_addr(dest, n)
+        }
+    }
+
+    # Draw screen and bezel; this is done to a separate screen buffer.
+    V_UseBuffer(background_buffer)
+
+    let vwx: i32 = drawshim_viewwindowx_addr()[0]
+    let vwy: i32 = drawshim_viewwindowy_addr()[0]
+    let svw: i32 = drawshim_scaledviewwidth_addr()[0]
+    let vh: i32 = drawshim_viewheight_addr()[0]
+
+    let mut patch: ptr<void> = W_CacheLumpName("brdr_t", DRAW_PU_CACHE)
+    let mut x: i32 = 0
+    while x < svw {
+        V_DrawPatch(vwx + x, vwy - 8, patch)
+        x = x + 8
+    }
+
+    patch = W_CacheLumpName("brdr_b", DRAW_PU_CACHE)
+    x = 0
+    while x < svw {
+        V_DrawPatch(vwx + x, vwy + vh, patch)
+        x = x + 8
+    }
+
+    patch = W_CacheLumpName("brdr_l", DRAW_PU_CACHE)
+    let mut y: i32 = 0
+    while y < vh {
+        V_DrawPatch(vwx - 8, vwy + y, patch)
+        y = y + 8
+    }
+
+    patch = W_CacheLumpName("brdr_r", DRAW_PU_CACHE)
+    y = 0
+    while y < vh {
+        V_DrawPatch(vwx + svw, vwy + y, patch)
+        y = y + 8
+    }
+
+    # Draw beveled edge.
+    V_DrawPatch(vwx - 8, vwy - 8, W_CacheLumpName("brdr_tl", DRAW_PU_CACHE))
+    V_DrawPatch(vwx + svw, vwy - 8, W_CacheLumpName("brdr_tr", DRAW_PU_CACHE))
+    V_DrawPatch(vwx - 8, vwy + vh, W_CacheLumpName("brdr_bl", DRAW_PU_CACHE))
+    V_DrawPatch(vwx + svw, vwy + vh, W_CacheLumpName("brdr_br", DRAW_PU_CACHE))
+
+    V_RestoreBuffer()
+}
+
+#
+# R_VideoErase
+#
+@flow_api
+function R_VideoErase(ofs: u32, count: i32) -> void {
+    if (background_buffer as i64) != 0 {
+        memcpy(
+            draw_addr(VIDEO_buffer(), ofs as i32) as ptr<void>,
+            draw_addr(background_buffer, ofs as i32) as ptr<void>,
+            count as i64
+        )
+    }
+}
+
+#
+# R_DrawViewBorder
+#
+@flow_api
+function R_DrawViewBorder() -> void {
+    if drawshim_scaledviewwidth_addr()[0] == DRAW_SCREENWIDTH {
+        return
+    }
+
+    let top: i32 = ((DRAW_SCREENHEIGHT - DRAW_SBARHEIGHT) - drawshim_viewheight_addr()[0]) / 2
+    let mut side: i32 = (DRAW_SCREENWIDTH - drawshim_scaledviewwidth_addr()[0]) / 2
+
+    # copy top and one line of left side
+    R_VideoErase(0 as u32, top * DRAW_SCREENWIDTH + side)
+
+    # copy one line of right side and bottom
+    let mut ofs: i32 = (drawshim_viewheight_addr()[0] + top) * DRAW_SCREENWIDTH - side
+    R_VideoErase(ofs as u32, top * DRAW_SCREENWIDTH + side)
+
+    # copy sides using wraparound
+    ofs = top * DRAW_SCREENWIDTH + DRAW_SCREENWIDTH - side
+    side = side << 1
+
+    for i in 1 to drawshim_viewheight_addr()[0] {
+        R_VideoErase(ofs as u32, side)
+        ofs = ofs + DRAW_SCREENWIDTH
+    }
+
+    V_MarkRect(0, 0, DRAW_SCREENWIDTH, DRAW_SCREENHEIGHT - DRAW_SBARHEIGHT)
+}

@@ -1,0 +1,489 @@
+# Zone memory allocation, ported from z_zone.c to Flow.
+#
+# The zone is a rover-based first-fit ring of memblocks carved out of one
+# big heap obtained from I_ZoneBase (still C, in i_system.c). Blocks with
+# tag >= PU_PURGELEVEL are freed on demand during allocation. A block's
+# user field holds the ADDRESS of the owner's cache pointer; on alloc the
+# owner's pointer is written through it, on free it is zeroed.
+#
+# memblock_t and memzone_t are private to z_zone.c (verified: no other
+# engine file names memblock or mainzone), so the layout only has to be
+# self-consistent. It is kept identical to the C original on LP64:
+#
+#   struct memblock_s {          offset
+#       int         size;           0    // including header
+#       (padding)                   4
+#       void      **user;           8
+#       int         tag;           16    // PU_FREE if free
+#       int         id;            20    // ZONEID when allocated
+#       memblock_t *next;          24
+#       memblock_t *prev;          32
+#   };                     sizeof  40
+#
+#   struct memzone_s {           offset
+#       int         size;           0    // total bytes, incl. this header
+#       (padding)                   4
+#       memblock_t  blocklist;      8    // list start/end cap
+#       memblock_t *rover;         48
+#   };                     sizeof  56
+#
+# All field access goes through the mb_* / zone_* byte-offset helpers
+# below; block "pointers" are carried as i64 addresses.
+#
+# Deviation from z_zone.c: I_Error / printf messages are fixed strings
+# (no varargs in Flow), so Z_DumpHeap / Z_FileDumpHeap omit the numeric
+# block details and print only the structural-error diagnostics.
+
+extern { function malloc(n: i64) -> ptr<void> }
+extern { function free(p: ptr<void>) -> void }
+extern { function strlen(s: string) -> i64 }
+extern { function printf(fmt: string, s: string) -> i32 }
+extern { function fwrite(src: ptr<void>, size: i64, n: i64, f: ptr<void>) -> i64 }
+
+extern { function I_Error(msg: string) -> void }
+extern { function I_ZoneBase(size: ptr<i32>) -> ptr<u8> }
+
+# Constants from z_zone.c / z_zone.h.
+const MEM_ALIGN: i32 = 8            # sizeof(void*)
+const ZONEID: i32 = 1919505         # 0x1d4a11
+const MINFRAGMENT: i32 = 64
+const SIZEOF_MEMBLOCK: i32 = 40
+const SIZEOF_MEMZONE: i32 = 56
+
+# Purge tags from z_zone.h.
+const PU_STATIC: i32 = 1
+const PU_FREE: i32 = 4
+const PU_PURGELEVEL: i32 = 7
+
+# Only this module touches the zone; grep confirms no unported C reads
+# mainzone, so it stays a Flow module static (TU-private in the C output).
+let mut mainzone: i64 = 0
+
+# ---- memblock_t field access, by explicit layout ----------------------
+
+function mb_size(b: i64) -> i32 {
+    let p: ptr<i32> = b as ptr<i32>
+    return p[0]
+}
+
+function mb_set_size(b: i64, v: i32) -> void {
+    let p: ptr<i32> = b as ptr<i32>
+    p[0] = v
+}
+
+function mb_user(b: i64) -> i64 {
+    let p: ptr<i64> = b as ptr<i64>
+    return p[1]
+}
+
+function mb_set_user(b: i64, v: i64) -> void {
+    let p: ptr<i64> = b as ptr<i64>
+    p[1] = v
+}
+
+function mb_tag(b: i64) -> i32 {
+    let p: ptr<i32> = b as ptr<i32>
+    return p[4]
+}
+
+function mb_set_tag(b: i64, v: i32) -> void {
+    let p: ptr<i32> = b as ptr<i32>
+    p[4] = v
+}
+
+function mb_id(b: i64) -> i32 {
+    let p: ptr<i32> = b as ptr<i32>
+    return p[5]
+}
+
+function mb_set_id(b: i64, v: i32) -> void {
+    let p: ptr<i32> = b as ptr<i32>
+    p[5] = v
+}
+
+function mb_next(b: i64) -> i64 {
+    let p: ptr<i64> = b as ptr<i64>
+    return p[3]
+}
+
+function mb_set_next(b: i64, v: i64) -> void {
+    let p: ptr<i64> = b as ptr<i64>
+    p[3] = v
+}
+
+function mb_prev(b: i64) -> i64 {
+    let p: ptr<i64> = b as ptr<i64>
+    return p[4]
+}
+
+function mb_set_prev(b: i64, v: i64) -> void {
+    let p: ptr<i64> = b as ptr<i64>
+    p[4] = v
+}
+
+# ---- memzone_t field access -------------------------------------------
+
+function zone_size_of(z: i64) -> i32 {
+    let p: ptr<i32> = z as ptr<i32>
+    return p[0]
+}
+
+function zone_set_size(z: i64, v: i32) -> void {
+    let p: ptr<i32> = z as ptr<i32>
+    p[0] = v
+}
+
+# The blocklist cap is itself a memblock embedded at offset 8.
+function zone_blocklist(z: i64) -> i64 {
+    return z + 8
+}
+
+function zone_rover(z: i64) -> i64 {
+    let p: ptr<i64> = z as ptr<i64>
+    return p[6]
+}
+
+function zone_set_rover(z: i64, v: i64) -> void {
+    let p: ptr<i64> = z as ptr<i64>
+    p[6] = v
+}
+
+# ---- init -------------------------------------------------------------
+
+function zone_clear(z: i64) -> void {
+    # Set the entire zone to one free block.
+    let block: i64 = z + (SIZEOF_MEMZONE as i64)
+    let cap: i64 = zone_blocklist(z)
+
+    mb_set_next(cap, block)
+    mb_set_prev(cap, block)
+    # Marker semantics from the original: the cap's user points at the
+    # zone itself, so it never looks like an unowned block.
+    mb_set_user(cap, z)
+    mb_set_tag(cap, PU_STATIC)
+    zone_set_rover(z, block)
+
+    mb_set_prev(block, cap)
+    mb_set_next(block, cap)
+    mb_set_tag(block, PU_FREE)
+    mb_set_size(block, zone_size_of(z) - SIZEOF_MEMZONE)
+}
+
+@flow_api
+function Z_ClearZone(zone: ptr<void>) -> void {
+    zone_clear(zone as i64)
+}
+
+@flow_api
+function Z_Init() -> void {
+    # Flow has no address-of; use a heap scratch int for the out-param.
+    let sizep: ptr<i32> = malloc(4) as ptr<i32>
+    sizep[0] = 0
+    let base: ptr<u8> = I_ZoneBase(sizep)
+    mainzone = base as i64
+    zone_set_size(mainzone, sizep[0])
+    free(sizep as ptr<void>)
+
+    zone_clear(mainzone)
+}
+
+# ---- free -------------------------------------------------------------
+
+@flow_api
+function Z_Free(p: ptr<void>) -> void {
+    let mut block: i64 = (p as i64) - (SIZEOF_MEMBLOCK as i64)
+
+    if mb_id(block) != ZONEID {
+        I_Error("Z_Free: freed a pointer without ZONEID")
+    }
+
+    if mb_tag(block) != PU_FREE and mb_user(block) != 0 {
+        # Clear the user's mark.
+        let up: ptr<i64> = mb_user(block) as ptr<i64>
+        up[0] = 0
+    }
+
+    # Mark as free.
+    mb_set_tag(block, PU_FREE)
+    mb_set_user(block, 0)
+    mb_set_id(block, 0)
+
+    let mut other: i64 = mb_prev(block)
+
+    if mb_tag(other) == PU_FREE {
+        # Merge with previous free block.
+        mb_set_size(other, mb_size(other) + mb_size(block))
+        mb_set_next(other, mb_next(block))
+        mb_set_prev(mb_next(other), other)
+
+        if block == zone_rover(mainzone) {
+            zone_set_rover(mainzone, other)
+        }
+
+        block = other
+    }
+
+    other = mb_next(block)
+    if mb_tag(other) == PU_FREE {
+        # Merge the next free block onto the end.
+        mb_set_size(block, mb_size(block) + mb_size(other))
+        mb_set_next(block, mb_next(other))
+        mb_set_prev(mb_next(block), block)
+
+        if other == zone_rover(mainzone) {
+            zone_set_rover(mainzone, block)
+        }
+    }
+}
+
+# ---- alloc ------------------------------------------------------------
+
+@flow_api
+function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> {
+    # Round up to MEM_ALIGN; (size + 7) & ~7, and -8 is ~7 in two's
+    # complement, matching the C expression bit for bit.
+    let mut sz: i32 = (size + MEM_ALIGN - 1) & (0 - MEM_ALIGN)
+
+    # Account for size of block header.
+    sz = sz + SIZEOF_MEMBLOCK
+
+    # Scan through the block list looking for the first free block of
+    # sufficient size, throwing out any purgable blocks along the way.
+
+    # If there is a free block behind the rover, back up over it.
+    let mut base: i64 = zone_rover(mainzone)
+    if mb_tag(mb_prev(base)) == PU_FREE {
+        base = mb_prev(base)
+    }
+
+    let mut rover: i64 = base
+    let start: i64 = mb_prev(base)
+
+    # do { ... } while (base->tag != PU_FREE || base->size < size)
+    let mut searching: bool = true
+    while searching {
+        if rover == start {
+            # Scanned all the way around the list.
+            I_Error("Z_Malloc: failed on allocation")
+        }
+
+        if mb_tag(rover) != PU_FREE {
+            if mb_tag(rover) < PU_PURGELEVEL {
+                # Hit a block that can't be purged, so move base past it.
+                rover = mb_next(rover)
+                base = rover
+            } else {
+                # Free the rover block (adding its size to base).
+                # The rover can be the base block.
+                base = mb_prev(base)
+                Z_Free((rover + (SIZEOF_MEMBLOCK as i64)) as ptr<void>)
+                base = mb_next(base)
+                rover = mb_next(base)
+            }
+        } else {
+            rover = mb_next(rover)
+        }
+
+        if mb_tag(base) == PU_FREE and mb_size(base) >= sz {
+            searching = false
+        }
+    }
+
+    # Found a block big enough.
+    let extra: i32 = mb_size(base) - sz
+
+    if extra > MINFRAGMENT {
+        # There will be a free fragment after the allocated block.
+        let newblock: i64 = base + (sz as i64)
+        mb_set_size(newblock, extra)
+        mb_set_tag(newblock, PU_FREE)
+        mb_set_user(newblock, 0)
+        mb_set_prev(newblock, base)
+        mb_set_next(newblock, mb_next(base))
+        mb_set_prev(mb_next(newblock), newblock)
+
+        mb_set_next(base, newblock)
+        mb_set_size(base, sz)
+    }
+
+    if (user as i64) == 0 and tag >= PU_PURGELEVEL {
+        I_Error("Z_Malloc: an owner is required for purgable blocks")
+    }
+
+    mb_set_user(base, user as i64)
+    mb_set_tag(base, tag)
+
+    let result: i64 = base + (SIZEOF_MEMBLOCK as i64)
+
+    if mb_user(base) != 0 {
+        # Hand the block back through the user's pointer.
+        let up: ptr<i64> = mb_user(base) as ptr<i64>
+        up[0] = result
+    }
+
+    # Next allocation will start looking here.
+    zone_set_rover(mainzone, mb_next(base))
+
+    mb_set_id(base, ZONEID)
+
+    return result as ptr<void>
+}
+
+# ---- bulk free --------------------------------------------------------
+
+@flow_api
+function Z_FreeTags(lowtag: i32, hightag: i32) -> void {
+    let cap: i64 = zone_blocklist(mainzone)
+    let mut block: i64 = mb_next(cap)
+    while block != cap {
+        # Get the link before freeing.
+        let next: i64 = mb_next(block)
+
+        if mb_tag(block) != PU_FREE {
+            if mb_tag(block) >= lowtag and mb_tag(block) <= hightag {
+                Z_Free((block + (SIZEOF_MEMBLOCK as i64)) as ptr<void>)
+            }
+        }
+
+        block = next
+    }
+}
+
+# ---- diagnostics ------------------------------------------------------
+
+@flow_api
+function Z_DumpHeap(lowtag: i32, hightag: i32) -> void {
+    printf("%s", "Z_DumpHeap (Flow port: numeric details omitted)\n")
+
+    let cap: i64 = zone_blocklist(mainzone)
+    let mut block: i64 = mb_next(cap)
+    let mut walking: bool = true
+    while walking {
+        if mb_tag(block) >= lowtag and mb_tag(block) <= hightag {
+            printf("%s", "block in tag range\n")
+        }
+
+        if mb_next(block) == cap {
+            # All blocks have been hit.
+            walking = false
+        } else {
+            if block + (mb_size(block) as i64) != mb_next(block) {
+                printf("%s", "ERROR: block size does not touch the next block\n")
+            }
+            if mb_prev(mb_next(block)) != block {
+                printf("%s", "ERROR: next block doesn't have proper back link\n")
+            }
+            if mb_tag(block) == PU_FREE and mb_tag(mb_next(block)) == PU_FREE {
+                printf("%s", "ERROR: two consecutive free blocks\n")
+            }
+            block = mb_next(block)
+        }
+    }
+}
+
+function fdump(f: ptr<void>, s: string) -> void {
+    fwrite(s as ptr<void>, 1, strlen(s), f)
+}
+
+@flow_api
+function Z_FileDumpHeap(f: ptr<void>) -> void {
+    fdump(f, "Z_FileDumpHeap (Flow port: numeric details omitted)\n")
+
+    let cap: i64 = zone_blocklist(mainzone)
+    let mut block: i64 = mb_next(cap)
+    let mut walking: bool = true
+    while walking {
+        fdump(f, "block\n")
+
+        if mb_next(block) == cap {
+            # All blocks have been hit.
+            walking = false
+        } else {
+            if block + (mb_size(block) as i64) != mb_next(block) {
+                fdump(f, "ERROR: block size does not touch the next block\n")
+            }
+            if mb_prev(mb_next(block)) != block {
+                fdump(f, "ERROR: next block doesn't have proper back link\n")
+            }
+            if mb_tag(block) == PU_FREE and mb_tag(mb_next(block)) == PU_FREE {
+                fdump(f, "ERROR: two consecutive free blocks\n")
+            }
+            block = mb_next(block)
+        }
+    }
+}
+
+@flow_api
+function Z_CheckHeap() -> void {
+    let cap: i64 = zone_blocklist(mainzone)
+    let mut block: i64 = mb_next(cap)
+    let mut walking: bool = true
+    while walking {
+        if mb_next(block) == cap {
+            # All blocks have been hit.
+            walking = false
+        } else {
+            if block + (mb_size(block) as i64) != mb_next(block) {
+                I_Error("Z_CheckHeap: block size does not touch the next block")
+            }
+            if mb_prev(mb_next(block)) != block {
+                I_Error("Z_CheckHeap: next block doesn't have proper back link")
+            }
+            if mb_tag(block) == PU_FREE and mb_tag(mb_next(block)) == PU_FREE {
+                I_Error("Z_CheckHeap: two consecutive free blocks")
+            }
+            block = mb_next(block)
+        }
+    }
+}
+
+# ---- tag / user changes -----------------------------------------------
+
+@flow_api
+function Z_ChangeTag2(p: ptr<void>, tag: i32, file: string, line: i32) -> void {
+    let block: i64 = (p as i64) - (SIZEOF_MEMBLOCK as i64)
+
+    if mb_id(block) != ZONEID {
+        I_Error("Z_ChangeTag: block without a ZONEID!")
+    }
+
+    if tag >= PU_PURGELEVEL and mb_user(block) == 0 {
+        I_Error("Z_ChangeTag: an owner is required for purgable blocks")
+    }
+
+    mb_set_tag(block, tag)
+}
+
+@flow_api
+function Z_ChangeUser(p: ptr<void>, user: ptr<void>) -> void {
+    let block: i64 = (p as i64) - (SIZEOF_MEMBLOCK as i64)
+
+    if mb_id(block) != ZONEID {
+        I_Error("Z_ChangeUser: Tried to change user for invalid block!")
+    }
+
+    mb_set_user(block, user as i64)
+    let up: ptr<i64> = user as ptr<i64>
+    up[0] = p as i64
+}
+
+# ---- stats ------------------------------------------------------------
+
+@flow_api
+function Z_FreeMemory() -> i32 {
+    let cap: i64 = zone_blocklist(mainzone)
+    let mut freebytes: i32 = 0
+    let mut block: i64 = mb_next(cap)
+    while block != cap {
+        if mb_tag(block) == PU_FREE or mb_tag(block) >= PU_PURGELEVEL {
+            freebytes = freebytes + mb_size(block)
+        }
+        block = mb_next(block)
+    }
+    return freebytes
+}
+
+@flow_api
+function Z_ZoneSize() -> u32 {
+    return zone_size_of(mainzone) as u32
+}

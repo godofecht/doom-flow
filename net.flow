@@ -1,0 +1,376 @@
+# Network game connect / check, ported from d_net.c to Flow.
+#
+# FEATURE_MULTIPLAYER is #undef (doomfeatures.h), so D_InitNetGame /
+# D_StartNetGame take the stub paths in d_loop.c. This module still
+# preserves the full D_ConnectNetGame / D_CheckNetGame / RunTic /
+# LoadGameSettings / SaveGameSettings / InitConnectData logic.
+#
+# Loop callbacks are called directly from loop.flow (no C fnptr table).
+# Startup printf helpers live here.
+#
+# Struct layouts (LP64, measured with sizeof / offsetof):
+#
+#   net_connect_data_t  sizeof 68
+#     0   gamemode        i32
+#     4   gamemission     i32
+#     8   lowres_turn     i32
+#     12  drone           i32
+#     16  max_players     i32
+#     20  is_freedoom     i32
+#     24  wad_sha1sum     20 bytes
+#     44  deh_sha1sum     20 bytes
+#     64  player_class    i32
+#
+#   net_gamesettings_t  sizeof 100
+#     0   ticdup          i32
+#     4   extratics       i32
+#     8   deathmatch      i32
+#     12  episode         i32
+#     16  nomonsters      i32
+#     20  fast_monsters   i32
+#     24  respawn_monsters i32
+#     28  map             i32
+#     32  skill           i32
+#     36  gameversion     i32
+#     40  lowres_turn     i32
+#     44  new_sync        i32
+#     48  timelimit       i32
+#     52  loadgame        i32
+#     56  random          i32
+#     60  num_players     i32
+#     64  consoleplayer   i32
+#     68  player_classes[8] i32
+#
+# boolean is unsigned int (4 bytes) in doomtype.h.
+
+extern { function calloc(n: i64, size: i64) -> ptr<void> }
+extern { function free(p: ptr<void>) -> void }
+extern { function M_StringCopy(dest: ptr<u8>, src: ptr<u8>, dest_size: i64) -> i32 }
+extern { function printf(fmt: string) -> i32 }
+extern { function printf(fmt: string, a: i32) -> i32 }
+extern { function printf(fmt: string, a: i32, b: i32, c: i32) -> i32 }
+extern { function printf(fmt: string, a: i32, b: i32, c: i32, d: i32) -> i32 }
+
+# argv.flow / checksum.flow / wad.flow (same ABI when integrated).
+extern { function M_CheckParm(check: string) -> i32 }
+extern { function W_Checksum(digest: ptr<u8>) -> void }
+extern { function W_CheckNumForName(name: string) -> i32 }
+
+# Still in C (d_loop.c / g_game.c / d_main.c).
+extern { function D_InitNetGame(connect_data: ptr<u8>) -> i32 }
+extern { function D_StartNetGame(settings: ptr<u8>, callback: ptr<void>) -> void }
+extern { function G_CheckDemoStatus() -> i32 }
+extern { function G_Ticker() -> void }
+extern { function D_DoAdvanceDemo() -> void }
+
+extern { function rmainshim_viewangleoffset_addr() -> ptr<i32> }
+
+function netshim_print_startinfo(skill: i32, dm: i32, map: i32, ep: i32) -> void {
+    printf("startskill %i  deathmatch: %i  startmap: %i  startepisode: %i\n",
+           skill, dm, map, ep)
+}
+
+function netshim_print_playerinfo(player_one_based: i32, num_players: i32) -> void {
+    printf("player %i of %i (%i nodes)\n",
+           player_one_based, num_players, num_players)
+}
+
+function netshim_print_avg() -> void {
+    printf("Austin Virtual Gaming: Levels will end after 20 minutes\n")
+}
+
+function netshim_print_timelimit(minutes: i32) -> void {
+    printf("Levels will end after %d minute", minutes)
+    if minutes > 1 {
+        printf("s")
+    }
+    printf(".\n")
+}
+
+function netshim_print_lowres_note() -> void {
+    printf("NOTE: Turning resolution is reduced; this is probably because there is a client recording a Vanilla demo.\n")
+}
+
+extern { function STAT_lowres_turn() -> i32 }
+extern { function STAT_set_lowres_turn(v: i32) -> void }
+extern { function STAT_nomonsters() -> i32 }
+extern { function STAT_set_nomonsters(v: i32) -> void }
+extern { function STAT_fastparm() -> i32 }
+extern { function STAT_set_fastparm(v: i32) -> void }
+extern { function STAT_respawnparm() -> i32 }
+extern { function STAT_set_respawnparm(v: i32) -> void }
+extern { function STAT_timelimit() -> i32 }
+extern { function STAT_set_timelimit(v: i32) -> void }
+extern { function STAT_gamemission() -> i32 }
+extern { function STAT_startskill() -> i32 }
+extern { function STAT_set_startskill(v: i32) -> void }
+extern { function STAT_startepisode() -> i32 }
+extern { function STAT_set_startepisode(v: i32) -> void }
+extern { function STAT_startmap() -> i32 }
+extern { function STAT_set_startmap(v: i32) -> void }
+extern { function STAT_startloadgame() -> i32 }
+extern { function STAT_set_startloadgame(v: i32) -> void }
+extern { function STAT_autostart() -> i32 }
+extern { function STAT_set_autostart(v: i32) -> void }
+
+extern { function STAT_demorecording() -> i32 }
+extern { function STAT_demoplayback() -> i32 }
+extern { function STAT_advancedemo() -> i32 }
+extern { function PLAYER_at(i: i32) -> ptr<void> }
+extern { function PLAYER_set_message(p: ptr<void>, msg: string) -> void }
+
+# ---- constants (NET_ prefix) ------------------------------------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_set_gamemode(v: i32) -> void }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_set_gameversion(v: i32) -> void }
+extern { function STAT_gameepisode() -> i32 }
+extern { function STAT_set_gameepisode(v: i32) -> void }
+extern { function STAT_gamemap() -> i32 }
+extern { function STAT_set_gamemap(v: i32) -> void }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_set_deathmatch(v: i32) -> void }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_set_netgame(v: i32) -> void }
+extern { function STAT_playeringame(i: i32) -> i32 }
+extern { function STAT_set_playeringame(i: i32, v: i32) -> void }
+extern { function STAT_consoleplayer() -> i32 }
+extern { function STAT_set_consoleplayer(v: i32) -> void }
+extern { function STAT_leveltime() -> i32 }
+extern { function STAT_set_leveltime(v: i32) -> void }
+
+const NET_MAXPLAYERS: i32 = 4                 # doomdef.h MAXPLAYERS
+const NET_SIZEOF_CONNECT: i32 = 68            # sizeof(net_connect_data_t)
+const NET_SIZEOF_SETTINGS: i32 = 100          # sizeof(net_gamesettings_t)
+const NET_SHA1_DIGEST: i32 = 20               # sizeof(sha1_digest_t)
+
+# net_connect_data_t field offsets
+const NET_CD_GAMEMODE: i32 = 0
+const NET_CD_GAMEMISSION: i32 = 4
+const NET_CD_LOWRES_TURN: i32 = 8
+const NET_CD_DRONE: i32 = 12
+const NET_CD_MAX_PLAYERS: i32 = 16
+const NET_CD_IS_FREEDOOM: i32 = 20
+const NET_CD_WAD_SHA1: i32 = 24
+const NET_CD_PLAYER_CLASS: i32 = 64
+
+# net_gamesettings_t field offsets
+const NET_GS_DEATHMATCH: i32 = 8
+const NET_GS_EPISODE: i32 = 12
+const NET_GS_NOMONSTERS: i32 = 16
+const NET_GS_FAST_MONSTERS: i32 = 20
+const NET_GS_RESPAWN_MONSTERS: i32 = 24
+const NET_GS_MAP: i32 = 28
+const NET_GS_SKILL: i32 = 32
+const NET_GS_GAMEVERSION: i32 = 36
+const NET_GS_LOWRES_TURN: i32 = 40
+const NET_GS_TIMELIMIT: i32 = 48
+const NET_GS_LOADGAME: i32 = 52
+const NET_GS_NUM_PLAYERS: i32 = 60
+const NET_GS_CONSOLEPLAYER: i32 = 64
+
+# tables.h: ANG90 = 0x40000000, ANG270 = 0xc0000000 (as signed i32)
+const NET_ANG90: i32 = 1073741824
+const NET_ANG270: i32 = -1073741824
+
+# ---- module state (was net_shim.c) -----------------------------------
+
+let mut netcmds: ptr<void> = null
+let mut net_exitmsg: array<u8, 80> = [
+    80, 108, 97, 121, 101, 114, 32, 49, 32, 108, 101, 102, 116, 32, 116, 104,
+    101, 32, 103, 97, 109, 101, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+@flow_api
+function netshim_netcmds() -> ptr<void> { return netcmds }
+
+@flow_api
+function netshim_set_netcmds(cmds: ptr<void>) -> void { netcmds = cmds }
+
+@flow_api
+function netshim_exitmsg() -> ptr<u8> { return net_exitmsg as ptr<u8> }
+
+# ---- connect / settings field helpers ---------------------------------
+
+function net_get_i32(base: ptr<u8>, off: i32) -> i32 {
+    let p: ptr<i32> = ((base as i64) + off as i64) as ptr<i32>
+    return p[0]
+}
+
+function net_set_i32(base: ptr<u8>, off: i32, v: i32) -> void {
+    let p: ptr<i32> = ((base as i64) + off as i64) as ptr<i32>
+    p[0] = v
+}
+
+function net_wad_sha1(base: ptr<u8>) -> ptr<u8> {
+    return ((base as i64) + NET_CD_WAD_SHA1 as i64) as ptr<u8>
+}
+
+# Called when a player leaves the game (was static PlayerQuitGame).
+function PlayerQuitGame(player_num: i32) -> void {
+    let exitmsg: ptr<u8> = netshim_exitmsg()
+    M_StringCopy(exitmsg, "Player 1 left the game" as ptr<u8>, 80)
+    # Vanilla: bump the '1' at index 7 by player_num.
+    exitmsg[7] = (exitmsg[7] as i32 + player_num) as u8
+
+    STAT_set_playeringame(player_num, 0)
+    PLAYER_set_message(PLAYER_at(STAT_consoleplayer()), exitmsg)
+
+    if STAT_demorecording() != 0 {
+        G_CheckDemoStatus()
+    }
+}
+
+# Advance one tic; called directly from loop.flow TryRunTics.
+@flow_api
+function Net_RunTic(cmds: ptr<void>, ingame: ptr<void>) -> void {
+    let mut i: i32 = 0
+    let ingame_i: ptr<i32> = ingame as ptr<i32>
+    while i < NET_MAXPLAYERS {
+        if STAT_demoplayback() == 0 and STAT_playeringame(i) != 0 and ingame_i[i] == 0 {
+            PlayerQuitGame(i)
+        }
+        i = i + 1
+    }
+
+    netshim_set_netcmds(cmds)
+
+    if STAT_advancedemo() != 0 {
+        D_DoAdvanceDemo()
+    }
+
+    G_Ticker()
+}
+
+function LoadGameSettings(settings: ptr<u8>) -> void {
+    STAT_set_deathmatch(net_get_i32(settings, NET_GS_DEATHMATCH))
+    STAT_set_startepisode(net_get_i32(settings, NET_GS_EPISODE))
+    STAT_set_startmap(net_get_i32(settings, NET_GS_MAP))
+    STAT_set_startskill(net_get_i32(settings, NET_GS_SKILL))
+    STAT_set_startloadgame(net_get_i32(settings, NET_GS_LOADGAME))
+    STAT_set_lowres_turn(net_get_i32(settings, NET_GS_LOWRES_TURN))
+    STAT_set_nomonsters(net_get_i32(settings, NET_GS_NOMONSTERS))
+    STAT_set_fastparm(net_get_i32(settings, NET_GS_FAST_MONSTERS))
+    STAT_set_respawnparm(net_get_i32(settings, NET_GS_RESPAWN_MONSTERS))
+    STAT_set_timelimit(net_get_i32(settings, NET_GS_TIMELIMIT))
+    STAT_set_consoleplayer(net_get_i32(settings, NET_GS_CONSOLEPLAYER))
+
+    if STAT_lowres_turn() != 0 {
+        netshim_print_lowres_note()
+    }
+
+    let num_players: i32 = net_get_i32(settings, NET_GS_NUM_PLAYERS)
+    let mut i: i32 = 0
+    while i < NET_MAXPLAYERS {
+        if i < num_players {
+            STAT_set_playeringame(i, 1)
+        } else {
+            STAT_set_playeringame(i, 0)
+        }
+        i = i + 1
+    }
+}
+
+function SaveGameSettings(settings: ptr<u8>) -> void {
+    net_set_i32(settings, NET_GS_DEATHMATCH, STAT_deathmatch())
+    net_set_i32(settings, NET_GS_EPISODE, STAT_startepisode())
+    net_set_i32(settings, NET_GS_MAP, STAT_startmap())
+    net_set_i32(settings, NET_GS_SKILL, STAT_startskill())
+    net_set_i32(settings, NET_GS_LOADGAME, STAT_startloadgame())
+    net_set_i32(settings, NET_GS_GAMEVERSION, STAT_gameversion())
+    net_set_i32(settings, NET_GS_NOMONSTERS, STAT_nomonsters())
+    net_set_i32(settings, NET_GS_FAST_MONSTERS, STAT_fastparm())
+    net_set_i32(settings, NET_GS_RESPAWN_MONSTERS, STAT_respawnparm())
+    net_set_i32(settings, NET_GS_TIMELIMIT, STAT_timelimit())
+
+    # lowres_turn when recording a Vanilla (non-longtics) demo
+    if M_CheckParm("-record") > 0 and M_CheckParm("-longtics") == 0 {
+        net_set_i32(settings, NET_GS_LOWRES_TURN, 1)
+    } else {
+        net_set_i32(settings, NET_GS_LOWRES_TURN, 0)
+    }
+}
+
+function InitConnectData(connect_data: ptr<u8>) -> void {
+    net_set_i32(connect_data, NET_CD_MAX_PLAYERS, NET_MAXPLAYERS)
+    net_set_i32(connect_data, NET_CD_DRONE, 0)
+
+    if M_CheckParm("-left") > 0 {
+        rmainshim_viewangleoffset_addr()[0] = NET_ANG90
+        net_set_i32(connect_data, NET_CD_DRONE, 1)
+    }
+
+    if M_CheckParm("-right") > 0 {
+        rmainshim_viewangleoffset_addr()[0] = NET_ANG270
+        net_set_i32(connect_data, NET_CD_DRONE, 1)
+    }
+
+    net_set_i32(connect_data, NET_CD_GAMEMODE, STAT_gamemode())
+    net_set_i32(connect_data, NET_CD_GAMEMISSION, STAT_gamemission())
+
+    if M_CheckParm("-record") > 0 and M_CheckParm("-longtics") == 0 {
+        net_set_i32(connect_data, NET_CD_LOWRES_TURN, 1)
+    } else {
+        net_set_i32(connect_data, NET_CD_LOWRES_TURN, 0)
+    }
+
+    W_Checksum(net_wad_sha1(connect_data))
+    # DEH_Checksum skipped: #if ORIGCODE in d_net.c
+
+    if W_CheckNumForName("FREEDOOM") >= 0 {
+        net_set_i32(connect_data, NET_CD_IS_FREEDOOM, 1)
+    } else {
+        net_set_i32(connect_data, NET_CD_IS_FREEDOOM, 0)
+    }
+}
+
+@flow_api
+function D_ConnectNetGame() -> void {
+    let connect_data: ptr<u8> = calloc(1, NET_SIZEOF_CONNECT as i64) as ptr<u8>
+    InitConnectData(connect_data)
+    STAT_set_netgame(D_InitNetGame(connect_data))
+
+    if M_CheckParm("-solo-net") > 0 {
+        STAT_set_netgame(1)
+    }
+
+    free(connect_data as ptr<void>)
+}
+
+@flow_api
+function D_CheckNetGame() -> void {
+    let settings: ptr<u8> = calloc(1, NET_SIZEOF_SETTINGS as i64) as ptr<u8>
+
+    if STAT_netgame() != 0 {
+        STAT_set_autostart(1)
+    }
+
+    SaveGameSettings(settings)
+    D_StartNetGame(settings, null)
+    LoadGameSettings(settings)
+
+    netshim_print_startinfo(
+        STAT_startskill(),
+        STAT_deathmatch(),
+        STAT_startmap(),
+        STAT_startepisode()
+    )
+
+    let num_players: i32 = net_get_i32(settings, NET_GS_NUM_PLAYERS)
+    netshim_print_playerinfo(STAT_consoleplayer() + 1, num_players)
+
+    if STAT_timelimit() > 0 and STAT_deathmatch() != 0 {
+        if STAT_timelimit() == 20 and M_CheckParm("-avg") != 0 {
+            netshim_print_avg()
+        } else {
+            netshim_print_timelimit(STAT_timelimit())
+        }
+    }
+
+    free(settings as ptr<void>)
+}

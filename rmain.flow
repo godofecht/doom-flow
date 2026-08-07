@@ -1,0 +1,998 @@
+# Rendering main loop / setup / geometry utils, ported from r_main.c.
+#
+# Shared POV / lighting / clip-table globals are Flow-owned let mut state
+# with @flow_api RMAIN_* / rmainshim_* accessors. node_t / seg_t /
+# player_t / mobj_t stay C-owned; field access goes through rmainshim_*.
+# Draw-func pointers stored as ptr<void> here; map geom via GEOM_*.
+
+extern { function printf(fmt: string) -> i32 }
+extern { function abs(x: i32) -> i32 }
+extern { function calloc(n: i64, sz: i64) -> ptr<void> }
+
+extern { function FixedMul(a: i32, b: i32) -> i32 }
+extern { function FixedDiv(a: i32, b: i32) -> i32 }
+extern { function SlopeDiv(num: u32, den: u32) -> i32 }
+
+extern { function R_InitData() -> void }
+extern { function R_InitBuffer(width: i32, height: i32) -> void }
+extern { function R_InitPlanes() -> void }
+extern { function R_InitSkyMap() -> void }
+extern { function R_InitTranslationTables() -> void }
+extern { function R_ClearClipSegs() -> void }
+extern { function R_ClearDrawSegs() -> void }
+extern { function R_ClearPlanes() -> void }
+extern { function R_ClearSprites() -> void }
+extern { function R_RenderBSPNode(bspnum: i32) -> void }
+extern { function R_DrawPlanes() -> void }
+extern { function R_DrawMasked() -> void }
+extern { function NetUpdate() -> void }
+extern { function TABLES_finesine(idx: i32) -> i32 }
+extern { function TABLES_finecosine(idx: i32) -> i32 }
+extern { function TABLES_finetangent(idx: i32) -> i32 }
+extern { function DRAW_viewwidth() -> i32 }
+extern { function DRAW_set_viewwidth(v: i32) -> void }
+extern { function DRAW_scaledviewwidth() -> i32 }
+extern { function DRAW_set_scaledviewwidth(v: i32) -> void }
+extern { function DRAW_viewheight() -> i32 }
+extern { function DRAW_set_viewheight(v: i32) -> void }
+extern { function drawshim_viewwindowx_addr() -> ptr<i32> }
+extern { function drawshim_viewwindowy_addr() -> ptr<i32> }
+
+# Draw-func pointers: Flow can store fn addresses as ptr<void> and call
+# via sysshim_call_void (typed void(*)(void) dispatch stays in C).
+
+extern { function sysshim_call_void(fn: ptr<void>) -> void }
+extern { function R_DrawColumn() -> void }
+extern { function R_DrawColumnLow() -> void }
+extern { function R_DrawFuzzColumn() -> void }
+extern { function R_DrawFuzzColumnLow() -> void }
+extern { function R_DrawTranslatedColumn() -> void }
+extern { function R_DrawTranslatedColumnLow() -> void }
+extern { function R_DrawSpan() -> void }
+extern { function R_DrawSpanLow() -> void }
+
+let mut colfunc: ptr<void> = null
+let mut basecolfunc: ptr<void> = null
+let mut fuzzcolfunc: ptr<void> = null
+let mut transcolfunc: ptr<void> = null
+let mut spanfunc: ptr<void> = null
+
+@flow_api
+function rmainshim_set_drawfuncs_hi() -> void {
+    colfunc = R_DrawColumn as ptr<void>
+    basecolfunc = R_DrawColumn as ptr<void>
+    fuzzcolfunc = R_DrawFuzzColumn as ptr<void>
+    transcolfunc = R_DrawTranslatedColumn as ptr<void>
+    spanfunc = R_DrawSpan as ptr<void>
+}
+
+@flow_api
+function rmainshim_set_drawfuncs_lo() -> void {
+    colfunc = R_DrawColumnLow as ptr<void>
+    basecolfunc = R_DrawColumnLow as ptr<void>
+    fuzzcolfunc = R_DrawFuzzColumnLow as ptr<void>
+    transcolfunc = R_DrawTranslatedColumnLow as ptr<void>
+    spanfunc = R_DrawSpanLow as ptr<void>
+}
+
+@flow_api
+function rmainshim_call_spanfunc() -> void { sysshim_call_void(spanfunc) }
+
+@flow_api
+function rmainshim_call_colfunc() -> void { sysshim_call_void(colfunc) }
+
+@flow_api
+function thingshim_set_colfunc_base() -> void { colfunc = basecolfunc }
+
+@flow_api
+function thingshim_set_colfunc_fuzz() -> void { colfunc = fuzzcolfunc }
+
+@flow_api
+function thingshim_set_colfunc_trans() -> void { colfunc = transcolfunc }
+
+extern { function GEOM_node(i: i32) -> ptr<void> }
+extern { function GEOM_subsector(i: i32) -> ptr<void> }
+
+extern { function SEGS_rw_distance() -> i32 }
+extern { function SEGS_rw_normalangle() -> u32 }
+extern { function SEGS_set_walllights_fixed() -> void }
+
+extern { function STAT_setsizeneeded() -> i32 }
+extern { function STAT_set_setsizeneeded(v: i32) -> void }
+extern { function RDATA_colormaps() -> ptr<void> }
+
+extern { function PLANES_set_yslope(i: i32, v: i32) -> void }
+extern { function PLANES_set_distscale(i: i32, v: i32) -> void }
+extern { function THINGS_set_screenheightarray(i: i32, v: i32) -> void }
+extern { function THINGS_set_pspritescale(v: i32) -> void }
+extern { function THINGS_set_pspriteiscale(v: i32) -> void }
+
+extern { function STAT_screenblocks() -> i32 }
+extern { function STAT_detailLevel() -> i32 }
+
+extern { function GEOM_numnodes() -> i32 }
+
+extern { function GEOM_node_x(n: ptr<void>) -> i32 }
+extern { function GEOM_node_y(n: ptr<void>) -> i32 }
+extern { function GEOM_node_dx(n: ptr<void>) -> i32 }
+extern { function GEOM_node_dy(n: ptr<void>) -> i32 }
+extern { function GEOM_node_child(n: ptr<void>, side: i32) -> i32 }
+
+extern { function GEOM_seg_v1(seg: ptr<void>) -> ptr<void> }
+extern { function GEOM_seg_v2(seg: ptr<void>) -> ptr<void> }
+
+extern { function MOBJ_x(m: ptr<void>) -> i32 }
+extern { function MOBJ_y(m: ptr<void>) -> i32 }
+extern { function MOBJ_angle(m: ptr<void>) -> u32 }
+extern { function GEOM_vertex_x(v: ptr<void>) -> i32 }
+extern { function GEOM_vertex_y(v: ptr<void>) -> i32 }
+extern { function PLAYER_mo(p: ptr<void>) -> ptr<void> }
+extern { function PLAYER_viewz(p: ptr<void>) -> i32 }
+extern { function PLAYER_extralight(p: ptr<void>) -> i32 }
+extern { function PLAYER_fixedcolormap(p: ptr<void>) -> i32 }
+
+# ---- constants (r_main.h / tables.h / m_fixed.h / m_bbox.h / doomdata.h)
+
+const RMAIN_FIELDOFVIEW: i32 = 2048
+const RMAIN_FINEANGLES: i32 = 8192
+const RMAIN_ANGLETOFINESHIFT: i32 = 19
+const RMAIN_FRACBITS: i32 = 16
+const RMAIN_FRACUNIT: i32 = 65536
+const RMAIN_SCREENWIDTH: i32 = 320
+const RMAIN_SCREENHEIGHT: i32 = 200
+const RMAIN_LIGHTLEVELS: i32 = 16
+const RMAIN_MAXLIGHTSCALE: i32 = 48
+const RMAIN_LIGHTSCALESHIFT: i32 = 12
+const RMAIN_MAXLIGHTZ: i32 = 128
+const RMAIN_LIGHTZSHIFT: i32 = 20
+const RMAIN_NUMCOLORMAPS: i32 = 32
+const RMAIN_DISTMAP: i32 = 2
+const RMAIN_DBITS: i32 = 5                  # FRACBITS - SLOPEBITS
+const RMAIN_NF_SUBSECTOR: i32 = 32768       # 0x8000
+const RMAIN_SIGNBIT: i32 = 0 - 2147483648   # 0x80000000
+const RMAIN_BOXLEFT: i32 = 2
+const RMAIN_BOXRIGHT: i32 = 3
+const RMAIN_BOXBOTTOM: i32 = 1
+const RMAIN_BOXTOP: i32 = 0
+const RMAIN_ANG90: u32 = 1073741824 as u32  # 0x40000000
+const RMAIN_ANG180: u32 = 2147483648 as u32 # 0x80000000
+const RMAIN_ANG270: u32 = 3221225472 as u32 # 0xc0000000
+
+const RMAIN_VIEWANGLETOX_LEN: i32 = 4096    # FINEANGLES/2
+const RMAIN_XTOVIEWANGLE_LEN: i32 = 321       # SCREENWIDTH+1
+const RMAIN_SCALELIGHT_LEN: i32 = 768         # LIGHTLEVELS*MAXLIGHTSCALE
+const RMAIN_ZLIGHT_LEN: i32 = 2048            # LIGHTLEVELS*MAXLIGHTZ
+
+# ---- shared globals (were DEFINEd in rmain_shim.c / r_main.c) ---------
+
+let mut viewangleoffset: i32 = 0
+let mut validcount: i32 = 1
+let mut centerx: i32 = 0
+let mut centery: i32 = 0
+let mut centerxfrac: i32 = 0
+let mut centeryfrac: i32 = 0
+let mut projection: i32 = 0
+let mut framecount: i32 = 0
+let mut sscount: i32 = 0
+let mut viewx: i32 = 0
+let mut viewy: i32 = 0
+let mut viewz: i32 = 0
+let mut viewangle: u32 = 0
+let mut viewcos: i32 = 0
+let mut viewsin: i32 = 0
+let mut detailshift: i32 = 0
+let mut clipangle: u32 = 0
+let mut extralight: i32 = 0
+let mut fixedcolormap: ptr<void> = null
+let mut viewplayer: ptr<void> = null
+let mut setblocks: i32 = 0
+let mut setdetail: i32 = 0
+
+let mut viewangletox: ptr<i32> = null
+let mut xtoviewangle: ptr<u32> = null
+let mut scalelight: ptr<ptr<void> > = null
+let mut scalelightfixed: ptr<ptr<void> > = null
+let mut zlight: ptr<ptr<void> > = null
+
+function rmain_ensure_tables() -> void {
+    if (viewangletox as i64) == 0 {
+        viewangletox = calloc(RMAIN_VIEWANGLETOX_LEN as i64, 4) as ptr<i32>
+        xtoviewangle = calloc(RMAIN_XTOVIEWANGLE_LEN as i64, 4) as ptr<u32>
+        scalelight = calloc(RMAIN_SCALELIGHT_LEN as i64, 8) as ptr<ptr<void> >
+        scalelightfixed = calloc(RMAIN_MAXLIGHTSCALE as i64, 8) as ptr<ptr<void> >
+        zlight = calloc(RMAIN_ZLIGHT_LEN as i64, 8) as ptr<ptr<void> >
+    }
+}
+
+function rmain_zlight_idx(light: i32, index: i32) -> i32 {
+    return light * RMAIN_MAXLIGHTZ + index
+}
+
+function rmain_scalelight_idx(light: i32, index: i32) -> i32 {
+    return light * RMAIN_MAXLIGHTSCALE + index
+}
+
+@flow_api
+function rmainshim_viewangleoffset_addr() -> ptr<i32> { return &viewangleoffset }
+
+@flow_api
+function rmainshim_validcount_addr() -> ptr<i32> { return &validcount }
+
+@flow_api
+function rmainshim_centerx_addr() -> ptr<i32> { return &centerx }
+
+@flow_api
+function rmainshim_centery_addr() -> ptr<i32> { return &centery }
+
+@flow_api
+function rmainshim_centerxfrac_addr() -> ptr<i32> { return &centerxfrac }
+
+@flow_api
+function rmainshim_centeryfrac_addr() -> ptr<i32> { return &centeryfrac }
+
+@flow_api
+function rmainshim_projection_addr() -> ptr<i32> { return &projection }
+
+@flow_api
+function rmainshim_framecount_addr() -> ptr<i32> { return &framecount }
+
+@flow_api
+function rmainshim_sscount_addr() -> ptr<i32> { return &sscount }
+
+@flow_api
+function rmainshim_viewx_addr() -> ptr<i32> { return &viewx }
+
+@flow_api
+function rmainshim_viewy_addr() -> ptr<i32> { return &viewy }
+
+@flow_api
+function rmainshim_viewz_addr() -> ptr<i32> { return &viewz }
+
+@flow_api
+function rmainshim_viewangle_addr() -> ptr<u32> { return &viewangle }
+
+@flow_api
+function rmainshim_viewcos_addr() -> ptr<i32> { return &viewcos }
+
+@flow_api
+function rmainshim_viewsin_addr() -> ptr<i32> { return &viewsin }
+
+@flow_api
+function rmainshim_detailshift_addr() -> ptr<i32> { return &detailshift }
+
+@flow_api
+function rmainshim_clipangle_addr() -> ptr<u32> { return &clipangle }
+
+@flow_api
+function rmainshim_extralight_addr() -> ptr<i32> { return &extralight }
+
+@flow_api
+function rmainshim_fixedcolormap_addr() -> ptr<ptr<void> > { return &fixedcolormap }
+
+@flow_api
+function rmainshim_viewplayer_addr() -> ptr<ptr<void> > { return &viewplayer }
+
+@flow_api
+function rmainshim_setblocks_addr() -> ptr<i32> { return &setblocks }
+
+@flow_api
+function rmainshim_setdetail_addr() -> ptr<i32> { return &setdetail }
+
+@flow_api
+function rmainshim_viewangletox() -> ptr<i32> {
+    rmain_ensure_tables()
+    return viewangletox
+}
+
+@flow_api
+function rmainshim_xtoviewangle() -> ptr<u32> {
+    rmain_ensure_tables()
+    return xtoviewangle
+}
+
+@flow_api
+function rmainshim_set_zlight(light: i32, index: i32, p: ptr<void>) -> void {
+    rmain_ensure_tables()
+    zlight[rmain_zlight_idx(light, index)] = p
+}
+
+@flow_api
+function rmainshim_set_scalelight(light: i32, index: i32, p: ptr<void>) -> void {
+    rmain_ensure_tables()
+    scalelight[rmain_scalelight_idx(light, index)] = p
+}
+
+@flow_api
+function rmainshim_set_scalelightfixed(index: i32, p: ptr<void>) -> void {
+    rmain_ensure_tables()
+    scalelightfixed[index] = p
+}
+
+@flow_api
+function RMAIN_zlight(light: i32, index: i32) -> ptr<void> {
+    rmain_ensure_tables()
+    return zlight[rmain_zlight_idx(light, index)]
+}
+
+@flow_api
+function RMAIN_scalelight_row(lightnum: i32) -> ptr<ptr<void> > {
+    rmain_ensure_tables()
+    return ((scalelight as i64) + (rmain_scalelight_idx(lightnum, 0) as i64) * 8) as ptr<ptr<void> >
+}
+
+@flow_api
+function RMAIN_scalelightfixed() -> ptr<ptr<void> > {
+    rmain_ensure_tables()
+    return scalelightfixed
+}
+
+# Shared POV / lighting / clip-table / validcount getters. Prefer these
+# over per-module planeshim_/bspshim_/segshim_/thingshim_ clones.
+# Distinct from PLAYER_extralight / PLAYER_fixedcolormap (player_t fields).
+
+@flow_api
+function RMAIN_centery() -> i32 {
+    return centery
+}
+
+@flow_api
+function RMAIN_viewx() -> i32 {
+    return rmainshim_viewx_addr()[0]
+}
+
+@flow_api
+function RMAIN_viewy() -> i32 {
+    return rmainshim_viewy_addr()[0]
+}
+
+@flow_api
+function RMAIN_viewz() -> i32 {
+    return rmainshim_viewz_addr()[0]
+}
+
+@flow_api
+function RMAIN_viewangle() -> u32 {
+    return rmainshim_viewangle_addr()[0]
+}
+
+@flow_api
+function RMAIN_clipangle() -> u32 {
+    return rmainshim_clipangle_addr()[0]
+}
+
+@flow_api
+function RMAIN_detailshift() -> i32 {
+    return rmainshim_detailshift_addr()[0]
+}
+
+@flow_api
+function RMAIN_projection() -> i32 {
+    return rmainshim_projection_addr()[0]
+}
+
+@flow_api
+function RMAIN_centerxfrac() -> i32 {
+    return rmainshim_centerxfrac_addr()[0]
+}
+
+@flow_api
+function RMAIN_viewcos() -> i32 {
+    return rmainshim_viewcos_addr()[0]
+}
+
+@flow_api
+function RMAIN_viewsin() -> i32 {
+    return rmainshim_viewsin_addr()[0]
+}
+
+@flow_api
+function RMAIN_validcount() -> i32 {
+    return rmainshim_validcount_addr()[0]
+}
+
+@flow_api
+function RMAIN_set_validcount(v: i32) -> void {
+    rmainshim_validcount_addr()[0] = v
+}
+
+@flow_api
+function RMAIN_extralight() -> i32 {
+    return rmainshim_extralight_addr()[0]
+}
+
+@flow_api
+function RMAIN_set_extralight(v: i32) -> void {
+    rmainshim_extralight_addr()[0] = v
+}
+
+@flow_api
+function RMAIN_fixedcolormap() -> ptr<void> {
+    return rmainshim_fixedcolormap_addr()[0]
+}
+
+@flow_api
+function RMAIN_set_fixedcolormap(v: ptr<void>) -> void {
+    rmainshim_fixedcolormap_addr()[0] = v
+}
+
+@flow_api
+function RMAIN_centeryfrac() -> i32 {
+    return rmainshim_centeryfrac_addr()[0]
+}
+
+@flow_api
+function RMAIN_xtoviewangle(x: i32) -> u32 {
+    return rmainshim_xtoviewangle()[x]
+}
+
+@flow_api
+function RMAIN_viewangletox(angle: i32) -> i32 {
+    return rmainshim_viewangletox()[angle]
+}
+
+@flow_api
+function RMAIN_viewwindowx() -> i32 {
+    return drawshim_viewwindowx_addr()[0]
+}
+
+@flow_api
+function RMAIN_viewwindowy() -> i32 {
+    return drawshim_viewwindowy_addr()[0]
+}
+
+@flow_api
+function RMAIN_viewangleoffset() -> i32 {
+    return viewangleoffset
+}
+
+@flow_api
+function RMAIN_viewplayer() -> ptr<void> {
+    return viewplayer
+}
+
+#
+# R_AddPointToBox
+# Expand a given bbox so that it encloses a given point.
+#
+
+@flow_api
+function R_AddPointToBox(x: i32, y: i32, box: ptr<i32>) -> void {
+    if x < box[RMAIN_BOXLEFT] {
+        box[RMAIN_BOXLEFT] = x
+    }
+    if x > box[RMAIN_BOXRIGHT] {
+        box[RMAIN_BOXRIGHT] = x
+    }
+    if y < box[RMAIN_BOXBOTTOM] {
+        box[RMAIN_BOXBOTTOM] = y
+    }
+    if y > box[RMAIN_BOXTOP] {
+        box[RMAIN_BOXTOP] = y
+    }
+}
+
+#
+# R_PointOnSide
+# Traverse BSP (sub) tree, check point against partition plane.
+# Returns side 0 (front) or 1 (back).
+#
+
+@flow_api
+function R_PointOnSide(x: i32, y: i32, node: ptr<void>) -> i32 {
+    let ndx: i32 = GEOM_node_dx(node)
+    let ndy: i32 = GEOM_node_dy(node)
+    let nx: i32 = GEOM_node_x(node)
+    let ny: i32 = GEOM_node_y(node)
+
+    if ndx == 0 {
+        if x <= nx {
+            if ndy > 0 {
+                return 1
+            }
+            return 0
+        }
+        if ndy < 0 {
+            return 1
+        }
+        return 0
+    }
+    if ndy == 0 {
+        if y <= ny {
+            if ndx < 0 {
+                return 1
+            }
+            return 0
+        }
+        if ndx > 0 {
+            return 1
+        }
+        return 0
+    }
+
+    let dx: i32 = x - nx
+    let dy: i32 = y - ny
+
+    # Try to quickly decide by looking at sign bits.
+    if ((ndy ^ ndx ^ dx ^ dy) & RMAIN_SIGNBIT) != 0 {
+        if ((ndy ^ dx) & RMAIN_SIGNBIT) != 0 {
+            return 1
+        }
+        return 0
+    }
+
+    let left: i32 = FixedMul(ndy >> RMAIN_FRACBITS, dx)
+    let right: i32 = FixedMul(dy, ndx >> RMAIN_FRACBITS)
+
+    if right < left {
+        return 0
+    }
+    return 1
+}
+
+@flow_api
+function R_PointOnSegSide(x: i32, y: i32, line: ptr<void>) -> i32 {
+    let v1: ptr<void> = GEOM_seg_v1(line)
+    let v2: ptr<void> = GEOM_seg_v2(line)
+    let lx: i32 = GEOM_vertex_x(v1)
+    let ly: i32 = GEOM_vertex_y(v1)
+    let ldx: i32 = GEOM_vertex_x(v2) - lx
+    let ldy: i32 = GEOM_vertex_y(v2) - ly
+
+    if ldx == 0 {
+        if x <= lx {
+            if ldy > 0 {
+                return 1
+            }
+            return 0
+        }
+        if ldy < 0 {
+            return 1
+        }
+        return 0
+    }
+    if ldy == 0 {
+        if y <= ly {
+            if ldx < 0 {
+                return 1
+            }
+            return 0
+        }
+        if ldx > 0 {
+            return 1
+        }
+        return 0
+    }
+
+    let dx: i32 = x - lx
+    let dy: i32 = y - ly
+
+    if ((ldy ^ ldx ^ dx ^ dy) & RMAIN_SIGNBIT) != 0 {
+        if ((ldy ^ dx) & RMAIN_SIGNBIT) != 0 {
+            return 1
+        }
+        return 0
+    }
+
+    let left: i32 = FixedMul(ldy >> RMAIN_FRACBITS, dx)
+    let right: i32 = FixedMul(dy, ldx >> RMAIN_FRACBITS)
+
+    if right < left {
+        return 0
+    }
+    return 1
+}
+
+#
+# R_PointToAngle
+# Global angle from cartesian coords relative to viewx/viewy.
+#
+
+@flow_api
+function R_PointToAngle(x_in: i32, y_in: i32) -> u32 {
+    let mut x: i32 = x_in - rmainshim_viewx_addr()[0]
+    let mut y: i32 = y_in - rmainshim_viewy_addr()[0]
+
+    if x == 0 and y == 0 {
+        return 0 as u32
+    }
+
+    if x >= 0 {
+        if y >= 0 {
+            if x > y {
+                # octant 0
+                return TABLES_tantoangle(SlopeDiv(y as u32, x as u32))
+            } else {
+                # octant 1
+                return RMAIN_ANG90 - (1 as u32) - TABLES_tantoangle(SlopeDiv(x as u32, y as u32))
+            }
+        } else {
+            y = 0 - y
+            if x > y {
+                # octant 8
+                return (0 as u32) - TABLES_tantoangle(SlopeDiv(y as u32, x as u32))
+            } else {
+                # octant 7
+                return RMAIN_ANG270 + TABLES_tantoangle(SlopeDiv(x as u32, y as u32))
+            }
+        }
+    } else {
+        x = 0 - x
+        if y >= 0 {
+            if x > y {
+                # octant 3
+                return RMAIN_ANG180 - (1 as u32) - TABLES_tantoangle(SlopeDiv(y as u32, x as u32))
+            } else {
+                # octant 2
+                return RMAIN_ANG90 + TABLES_tantoangle(SlopeDiv(x as u32, y as u32))
+            }
+        } else {
+            y = 0 - y
+            if x > y {
+                # octant 4
+                return RMAIN_ANG180 + TABLES_tantoangle(SlopeDiv(y as u32, x as u32))
+            } else {
+                # octant 5
+                return RMAIN_ANG270 - (1 as u32) - TABLES_tantoangle(SlopeDiv(x as u32, y as u32))
+            }
+        }
+    }
+}
+
+@flow_api
+function R_PointToAngle2(x1: i32, y1: i32, x2: i32, y2: i32) -> u32 {
+    # Exact C: temporarily clobbers viewx/viewy.
+    rmainshim_viewx_addr()[0] = x1
+    rmainshim_viewy_addr()[0] = y1
+    return R_PointToAngle(x2, y2)
+}
+
+@flow_api
+function R_PointToDist(x: i32, y: i32) -> i32 {
+    let mut dx: i32 = abs(x - rmainshim_viewx_addr()[0])
+    let mut dy: i32 = abs(y - rmainshim_viewy_addr()[0])
+
+    if dy > dx {
+        let temp: i32 = dx
+        dx = dy
+        dy = temp
+    }
+
+    let mut frac: i32 = 0
+    if dx != 0 {
+        frac = FixedDiv(dy, dx)
+    }
+
+    let angle: i32 = ((TABLES_tantoangle(frac >> RMAIN_DBITS) + RMAIN_ANG90)
+        >> (RMAIN_ANGLETOFINESHIFT as u32)) as i32
+
+    return FixedDiv(dx, TABLES_finesine(angle as i32))
+}
+
+# UNUSED - tables come from tables.c
+function rmain_init_point_to_angle() -> void {
+}
+
+function rmain_init_tables() -> void {
+}
+
+#
+# R_ScaleFromGlobalAngle
+# Texture mapping scale for the current line at the given angle.
+# rw_distance must be calculated first.
+#
+
+@flow_api
+function R_ScaleFromGlobalAngle(visangle: u32) -> i32 {
+    let anglea: u32 = RMAIN_ANG90 + (visangle - rmainshim_viewangle_addr()[0])
+    let angleb: u32 = RMAIN_ANG90 + (visangle - SEGS_rw_normalangle())
+
+    let sinea: i32 = TABLES_finesine((anglea >> RMAIN_ANGLETOFINESHIFT) as i32)
+    let sineb: i32 = TABLES_finesine((angleb >> RMAIN_ANGLETOFINESHIFT) as i32)
+    let num: i32 = FixedMul(rmainshim_projection_addr()[0], sineb) << rmainshim_detailshift_addr()[0]
+    let den: i32 = FixedMul(SEGS_rw_distance(), sinea)
+
+    let mut scale: i32 = 0
+    if den > (num >> 16) {
+        scale = FixedDiv(num, den)
+        if scale > 64 * RMAIN_FRACUNIT {
+            scale = 64 * RMAIN_FRACUNIT
+        } elif scale < 256 {
+            scale = 256
+        }
+    } else {
+        scale = 64 * RMAIN_FRACUNIT
+    }
+    return scale
+}
+
+#
+# R_InitTextureMapping
+#
+
+function rmain_init_texture_mapping() -> void {
+    let vat: ptr<i32> = rmainshim_viewangletox()
+    let xtv: ptr<u32> = rmainshim_xtoviewangle()
+    let centerxfrac: i32 = rmainshim_centerxfrac_addr()[0]
+    let centerx: i32 = rmainshim_centerx_addr()[0]
+    let viewwidth: i32 = DRAW_viewwidth()
+    let half: i32 = RMAIN_FINEANGLES / 2
+
+    # focallength so FIELDOFVIEW angles covers SCREENWIDTH
+    let focallength: i32 = FixedDiv(
+        centerxfrac,
+        TABLES_finetangent(RMAIN_FINEANGLES / 4 + RMAIN_FIELDOFVIEW / 2))
+
+    for i in 0 to half {
+        let mut t: i32 = 0
+        let ft: i32 = TABLES_finetangent(i)
+        if ft > RMAIN_FRACUNIT * 2 {
+            t = 0 - 1
+        } elif ft < (0 - RMAIN_FRACUNIT * 2) {
+            t = viewwidth + 1
+        } else {
+            t = FixedMul(ft, focallength)
+            t = (centerxfrac - t + RMAIN_FRACUNIT - 1) >> RMAIN_FRACBITS
+            if t < (0 - 1) {
+                t = 0 - 1
+            } elif t > viewwidth + 1 {
+                t = viewwidth + 1
+            }
+        }
+        vat[i] = t
+    }
+
+    # Scan viewangletox[] to generate xtoviewangle[]
+    for x in 0 to viewwidth + 1 {
+        let mut i: i32 = 0
+        while vat[i] > x {
+            i = i + 1
+        }
+        xtv[x] = ((i as u32) << (RMAIN_ANGLETOFINESHIFT as u32)) - RMAIN_ANG90
+    }
+
+    # Take out the fencepost cases from viewangletox.
+    for i2 in 0 to half {
+        if vat[i2] == (0 - 1) {
+            vat[i2] = 0
+        } elif vat[i2] == viewwidth + 1 {
+            vat[i2] = viewwidth
+        }
+    }
+
+    rmainshim_clipangle_addr()[0] = xtv[0]
+}
+
+#
+# R_InitLightTables
+# Only inits the zlight table; scalelight changes with view size.
+#
+
+function rmain_init_light_tables() -> void {
+    let cmaps: ptr<void> = RDATA_colormaps()
+    for i in 0 to RMAIN_LIGHTLEVELS {
+        let startmap: i32 = ((RMAIN_LIGHTLEVELS - 1 - i) * 2) * RMAIN_NUMCOLORMAPS / RMAIN_LIGHTLEVELS
+        for j in 0 to RMAIN_MAXLIGHTZ {
+            let mut scale: i32 = FixedDiv(
+                (RMAIN_SCREENWIDTH / 2) * RMAIN_FRACUNIT,
+                (j + 1) << RMAIN_LIGHTZSHIFT)
+            scale = scale >> RMAIN_LIGHTSCALESHIFT
+            let mut level: i32 = startmap - scale / RMAIN_DISTMAP
+            if level < 0 {
+                level = 0
+            }
+            if level >= RMAIN_NUMCOLORMAPS {
+                level = RMAIN_NUMCOLORMAPS - 1
+            }
+            let p: ptr<void> = ((cmaps as i64) + (level as i64) * 256) as ptr<void>
+            rmainshim_set_zlight(i, j, p)
+        }
+    }
+}
+
+#
+# R_SetViewSize
+# Deferred; change takes effect next refresh.
+#
+
+@flow_api
+function R_SetViewSize(blocks: i32, detail: i32) -> void {
+    STAT_set_setsizeneeded(1)
+    rmainshim_setblocks_addr()[0] = blocks
+    rmainshim_setdetail_addr()[0] = detail
+}
+
+#
+# R_ExecuteSetViewSize
+#
+
+@flow_api
+function R_ExecuteSetViewSize() -> void {
+    STAT_set_setsizeneeded(0)
+
+    let setblocks: i32 = rmainshim_setblocks_addr()[0]
+    let setdetail: i32 = rmainshim_setdetail_addr()[0]
+
+    if setblocks == 11 {
+        DRAW_set_scaledviewwidth(RMAIN_SCREENWIDTH)
+        DRAW_set_viewheight(RMAIN_SCREENHEIGHT)
+    } else {
+        DRAW_set_scaledviewwidth(setblocks * 32)
+        DRAW_set_viewheight((setblocks * 168 / 10) & (0 - 8))
+    }
+
+    rmainshim_detailshift_addr()[0] = setdetail
+    let scaledviewwidth: i32 = DRAW_scaledviewwidth()
+    DRAW_set_viewwidth(scaledviewwidth >> setdetail)
+
+    let viewwidth: i32 = DRAW_viewwidth()
+    let viewheight: i32 = DRAW_viewheight()
+    let detailshift: i32 = rmainshim_detailshift_addr()[0]
+
+    rmainshim_centery_addr()[0] = viewheight / 2
+    rmainshim_centerx_addr()[0] = viewwidth / 2
+    rmainshim_centerxfrac_addr()[0] = rmainshim_centerx_addr()[0] << RMAIN_FRACBITS
+    rmainshim_centeryfrac_addr()[0] = rmainshim_centery_addr()[0] << RMAIN_FRACBITS
+    rmainshim_projection_addr()[0] = rmainshim_centerxfrac_addr()[0]
+
+    if detailshift == 0 {
+        rmainshim_set_drawfuncs_hi()
+    } else {
+        rmainshim_set_drawfuncs_lo()
+    }
+
+    R_InitBuffer(scaledviewwidth, viewheight)
+    rmain_init_texture_mapping()
+
+    # psprite scales
+    THINGS_set_pspritescale(RMAIN_FRACUNIT * viewwidth / RMAIN_SCREENWIDTH)
+    THINGS_set_pspriteiscale(RMAIN_FRACUNIT * RMAIN_SCREENWIDTH / viewwidth)
+
+    # thing clipping
+    for i in 0 to viewwidth {
+        THINGS_set_screenheightarray(i, viewheight)
+    }
+
+    # planes
+    for i2 in 0 to viewheight {
+        let mut dy: i32 = ((i2 - viewheight / 2) << RMAIN_FRACBITS) + RMAIN_FRACUNIT / 2
+        dy = abs(dy)
+        PLANES_set_yslope(i2, FixedDiv(
+            ((viewwidth << detailshift) / 2) * RMAIN_FRACUNIT, dy))
+    }
+
+    let xtv: ptr<u32> = rmainshim_xtoviewangle()
+    for i3 in 0 to viewwidth {
+        let cosadj: i32 = abs(TABLES_finecosine((xtv[i3] >> RMAIN_ANGLETOFINESHIFT) as i32))
+        PLANES_set_distscale(i3, FixedDiv(RMAIN_FRACUNIT, cosadj))
+    }
+
+    # light levels for each level / scale combination
+    let cmaps: ptr<void> = RDATA_colormaps()
+    for i4 in 0 to RMAIN_LIGHTLEVELS {
+        let startmap: i32 = ((RMAIN_LIGHTLEVELS - 1 - i4) * 2) * RMAIN_NUMCOLORMAPS / RMAIN_LIGHTLEVELS
+        for j in 0 to RMAIN_MAXLIGHTSCALE {
+            let mut level: i32 = startmap - j * RMAIN_SCREENWIDTH / (viewwidth << detailshift) / RMAIN_DISTMAP
+            if level < 0 {
+                level = 0
+            }
+            if level >= RMAIN_NUMCOLORMAPS {
+                level = RMAIN_NUMCOLORMAPS - 1
+            }
+            let p: ptr<void> = ((cmaps as i64) + (level as i64) * 256) as ptr<void>
+            rmainshim_set_scalelight(i4, j, p)
+        }
+    }
+}
+
+#
+# R_Init
+#
+
+@flow_api
+function R_Init() -> void {
+    R_InitData()
+    printf(".")
+    rmain_init_point_to_angle()
+    printf(".")
+    rmain_init_tables()
+    printf(".")
+
+    R_SetViewSize(STAT_screenblocks(), STAT_detailLevel())
+    R_InitPlanes()
+    printf(".")
+    rmain_init_light_tables()
+    printf(".")
+    R_InitSkyMap()
+    R_InitTranslationTables()
+    printf(".")
+
+    rmainshim_framecount_addr()[0] = 0
+}
+
+#
+# R_PointInSubsector
+#
+
+@flow_api
+function R_PointInSubsector(x: i32, y: i32) -> ptr<void> {
+    if GEOM_numnodes() == 0 {
+        return GEOM_subsector(0)
+    }
+
+    let mut nodenum: i32 = GEOM_numnodes() - 1
+    while (nodenum & RMAIN_NF_SUBSECTOR) == 0 {
+        let node: ptr<void> = GEOM_node(nodenum)
+        let side: i32 = R_PointOnSide(x, y, node)
+        nodenum = GEOM_node_child(node, side)
+    }
+
+    return GEOM_subsector(nodenum & (0 - 1 - RMAIN_NF_SUBSECTOR))
+}
+
+#
+# R_SetupFrame
+#
+
+function rmain_setup_frame(player: ptr<void>) -> void {
+    rmainshim_viewplayer_addr()[0] = player
+    let mo: ptr<void> = PLAYER_mo(player)
+    rmainshim_viewx_addr()[0] = MOBJ_x(mo)
+    rmainshim_viewy_addr()[0] = MOBJ_y(mo)
+    rmainshim_viewangle_addr()[0] = MOBJ_angle(mo)
+        + (rmainshim_viewangleoffset_addr()[0] as u32)
+    RMAIN_set_extralight(PLAYER_extralight(player))
+    rmainshim_viewz_addr()[0] = PLAYER_viewz(player)
+
+    let va: u32 = rmainshim_viewangle_addr()[0]
+    rmainshim_viewsin_addr()[0] = TABLES_finesine((va >> RMAIN_ANGLETOFINESHIFT) as i32)
+    rmainshim_viewcos_addr()[0] = TABLES_finecosine((va >> RMAIN_ANGLETOFINESHIFT) as i32)
+
+    rmainshim_sscount_addr()[0] = 0
+
+    let fcmap: i32 = PLAYER_fixedcolormap(player)
+    if fcmap != 0 {
+        # Exact C: colormaps + fixedcolormap*256*sizeof(lighttable_t)
+        # lighttable_t is byte, so *1.
+        let base: ptr<void> = RDATA_colormaps()
+        RMAIN_set_fixedcolormap(
+            ((base as i64) + (fcmap as i64) * 256) as ptr<void>)
+        SEGS_set_walllights_fixed()
+        let fc: ptr<void> = RMAIN_fixedcolormap()
+        for i in 0 to RMAIN_MAXLIGHTSCALE {
+            rmainshim_set_scalelightfixed(i, fc)
+        }
+    } else {
+        RMAIN_set_fixedcolormap(null)
+    }
+
+    rmainshim_framecount_addr()[0] = rmainshim_framecount_addr()[0] + 1
+    RMAIN_set_validcount(RMAIN_validcount() + 1)
+}
+
+#
+# R_RenderPlayerView
+#
+
+@flow_api
+function R_RenderPlayerView(player: ptr<void>) -> void {
+    rmain_setup_frame(player)
+
+    R_ClearClipSegs()
+    R_ClearDrawSegs()
+    R_ClearPlanes()
+    R_ClearSprites()
+
+    NetUpdate()
+
+    R_RenderBSPNode(GEOM_numnodes() - 1)
+
+    NetUpdate()
+
+    R_DrawPlanes()
+
+    NetUpdate()
+
+    R_DrawMasked()
+
+    NetUpdate()
+}

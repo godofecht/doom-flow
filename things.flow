@@ -1,0 +1,1150 @@
+# Sprite / masked drawing, ported from r_things.c to Flow.
+#
+# Shared clip / scale globals, sprites[] / numsprites, and sprite init
+# scratch (sprtemp) are Flow-owned via offsetof/calloc below. Column
+# drawer fnptr switching (colfunc) lives in rmain.flow.
+#
+# vissprite_t is module-private: Flow VisSprite (LP64 sizeof 80, matches
+# C) allocated as a heap pool so sort-list pointers stay stable.
+# overflow / sorted-head sentinels are module statics.
+#
+# mobj_t via MOBJ_*; sector_t via GEOM_*; drawseg_t via BSP_*;
+# patch_t via PATCH_* / RDATA_PATCH_*; lighting / viewplayer via RMAIN_*;
+# pspdef_t via PSP_*.
+
+extern { function memset(dest: ptr<void>, c: i32, n: i64) -> ptr<void> }
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+extern { function calloc(n: i64, sz: i64) -> ptr<void> }
+extern { function abs(x: i32) -> i32 }
+extern { function I_Error(msg: string) -> void }
+
+extern { function FixedMul(a: i32, b: i32) -> i32 }
+extern { function FixedDiv(a: i32, b: i32) -> i32 }
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function W_CacheLumpNum(lumpnum: i32, tag: i32) -> ptr<void> }
+extern { function W_GetNumForName(name: string) -> i32 }
+extern { function R_PointToAngle(x: i32, y: i32) -> u32 }
+extern { function R_PointOnSegSide(x: i32, y: i32, line: ptr<void>) -> i32 }
+extern { function R_RenderMaskedSegRange(ds: ptr<void>, x1: i32, x2: i32) -> void }
+extern { function wadflow_lumpinfo() -> ptr<u8> }
+extern { function drawshim_translationtables_addr() -> ptr<ptr<u8> > }
+extern { function thingshim_set_colfunc_base() -> void }
+extern { function thingshim_set_colfunc_fuzz() -> void }
+extern { function thingshim_set_colfunc_trans() -> void }
+extern { function DRAW_viewwidth() -> i32 }
+extern { function DRAW_viewheight() -> i32 }
+extern { function DRAW_dc_texturemid() -> i32 }
+extern { function DRAW_set_dc_texturemid(v: i32) -> void }
+extern { function DRAW_dc_x() -> i32 }
+extern { function DRAW_set_dc_x(v: i32) -> void }
+extern { function DRAW_dc_yl() -> i32 }
+extern { function DRAW_set_dc_yl(v: i32) -> void }
+extern { function DRAW_dc_yh() -> i32 }
+extern { function DRAW_set_dc_yh(v: i32) -> void }
+extern { function DRAW_set_dc_iscale(v: i32) -> void }
+extern { function DRAW_set_dc_source(p: ptr<void>) -> void }
+extern { function DRAW_dc_colormap() -> ptr<void> }
+extern { function DRAW_set_dc_colormap(p: ptr<void>) -> void }
+extern { function DRAW_set_dc_translation(p: ptr<void>) -> void }
+extern { function RMAIN_viewx() -> i32 }
+extern { function RMAIN_viewy() -> i32 }
+extern { function RMAIN_viewz() -> i32 }
+extern { function RMAIN_viewsin() -> i32 }
+extern { function RMAIN_viewcos() -> i32 }
+extern { function RMAIN_detailshift() -> i32 }
+extern { function RMAIN_projection() -> i32 }
+extern { function RMAIN_centerxfrac() -> i32 }
+extern { function RMAIN_validcount() -> i32 }
+extern { function RMAIN_extralight() -> i32 }
+extern { function RMAIN_fixedcolormap() -> ptr<void> }
+extern { function RMAIN_centeryfrac() -> i32 }
+extern { function RMAIN_viewangleoffset() -> i32 }
+extern { function RMAIN_viewplayer() -> ptr<void> }
+extern { function RMAIN_scalelight_row(lightnum: i32) -> ptr<ptr<void> > }
+
+extern { function rmainshim_call_colfunc() -> void }
+extern { function PATCH_columnofs(p: ptr<void>, col: i32) -> i32 }
+
+extern { function MOBJ_x(m: ptr<void>) -> i32 }
+extern { function MOBJ_y(m: ptr<void>) -> i32 }
+extern { function MOBJ_z(m: ptr<void>) -> i32 }
+extern { function MOBJ_angle(m: ptr<void>) -> u32 }
+extern { function MOBJ_sprite(m: ptr<void>) -> i32 }
+extern { function MOBJ_frame(m: ptr<void>) -> i32 }
+extern { function MOBJ_flags(m: ptr<void>) -> i32 }
+extern { function MOBJ_snext(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_subsector(m: ptr<void>) -> ptr<void> }
+
+extern { function GEOM_sector_validcount(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_set_validcount(s: ptr<void>, v: i32) -> void }
+extern { function GEOM_sector_lightlevel(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_thinglist(s: ptr<void>) -> ptr<void> }
+extern { function GEOM_subsector_sector(ss: ptr<void>) -> ptr<void> }
+
+extern { function PLAYER_psp(p: ptr<void>, i: i32) -> ptr<void> }
+extern { function PSP_state(psp: ptr<void>) -> ptr<void> }
+extern { function PSP_sx(psp: ptr<void>) -> i32 }
+extern { function PSP_sy(psp: ptr<void>) -> i32 }
+extern { function STATE_sprite(st: ptr<void>) -> i32 }
+extern { function STATE_frame(st: ptr<void>) -> i32 }
+
+extern { function BSP_ds_count() -> i32 }
+extern { function BSP_drawseg(i: i32) -> ptr<void> }
+extern { function BSP_ds_x1(ds: ptr<void>) -> i32 }
+extern { function BSP_ds_x2(ds: ptr<void>) -> i32 }
+extern { function BSP_ds_scale1(ds: ptr<void>) -> i32 }
+extern { function BSP_ds_scale2(ds: ptr<void>) -> i32 }
+extern { function BSP_ds_silhouette(ds: ptr<void>) -> i32 }
+extern { function BSP_ds_bsilheight(ds: ptr<void>) -> i32 }
+extern { function BSP_ds_tsilheight(ds: ptr<void>) -> i32 }
+extern { function BSP_ds_curline(ds: ptr<void>) -> ptr<void> }
+extern { function BSP_ds_sprtopclip(ds: ptr<void>) -> ptr<void> }
+extern { function BSP_ds_sprbottomclip(ds: ptr<void>) -> ptr<void> }
+extern { function BSP_ds_maskedtexturecol(ds: ptr<void>) -> ptr<void> }
+extern { function PLAYER_mo(p: ptr<void>) -> ptr<void> }
+extern { function PLAYER_power(p: ptr<void>, pw: i32) -> i32 }
+
+extern { function STAT_modifiedgame() -> i32 }
+extern { function RDATA_firstspritelump() -> i32 }
+extern { function RDATA_lastspritelump() -> i32 }
+extern { function RDATA_spritewidth(lump: i32) -> i32 }
+extern { function RDATA_spriteoffset(lump: i32) -> i32 }
+extern { function RDATA_spritetopoffset(lump: i32) -> i32 }
+extern { function RDATA_colormaps() -> ptr<void> }
+
+# ---- constants --------------------------------------------------------
+
+# r_things.h / i_video.h / m_fixed.h / z_zone.h / r_main.h / tables.h
+const THINGS_MAXVISSPRITES: i32 = 128
+const THINGS_SCREENWIDTH: i32 = 320
+const THINGS_SIZEOF_VISSPRITE: i32 = 80
+const THINGS_FRACUNIT: i32 = 65536
+const THINGS_FRACBITS: i32 = 16
+const THINGS_MINZ: i32 = 262144              # FRACUNIT*4
+const THINGS_BASEYCENTER: i32 = 100
+const THINGS_PU_STATIC: i32 = 1
+const THINGS_PU_CACHE: i32 = 8
+const THINGS_LIGHTLEVELS: i32 = 16
+const THINGS_LIGHTSEGSHIFT: i32 = 4
+const THINGS_MAXLIGHTSCALE: i32 = 48
+const THINGS_LIGHTSCALESHIFT: i32 = 12
+const THINGS_ANG45_2_X9: u32 = 2415919104 as u32   # (ANG45/2)*9
+const THINGS_INT_MAX: i32 = 2147483647
+const THINGS_NUMPSPRITES: i32 = 2
+
+# spriteframe_t / spritedef_t LP64 offsetof (verified vs r_defs.h)
+const THINGS_SIZEOF_SPRITEFRAME: i32 = 28
+const THINGS_SF_ROTATE: i32 = 0
+const THINGS_SF_LUMP: i32 = 4
+const THINGS_SF_FLIP: i32 = 20
+const THINGS_SIZEOF_SPRITEDEF: i32 = 16
+const THINGS_SD_NUMFRAMES: i32 = 0
+const THINGS_SD_SPRITEFRAMES: i32 = 8
+
+# p_mobj.h / p_pspr.h / doomdef.h
+const THINGS_MF_SHADOW: i32 = 262144         # 0x40000
+const THINGS_MF_TRANSLATION: i32 = 201326592 # 0xc000000
+const THINGS_MF_TRANSSHIFT: i32 = 26
+const THINGS_FF_FULLBRIGHT: i32 = 32768      # 0x8000
+const THINGS_FF_FRAMEMASK: i32 = 32767       # 0x7fff
+const THINGS_PW_INVISIBILITY: i32 = 2
+const THINGS_SIL_BOTTOM: i32 = 1
+const THINGS_SIL_TOP: i32 = 2
+const THINGS_SIL_BOTH: i32 = 3
+
+const THINGS_WAD_LUMP_STRIDE: i32 = 40
+const THINGS_SPRTEMP_FRAMES: i32 = 29
+
+# ---- shared renderer / sprite state (Flow-owned) ----------------------
+
+let mut things_pspritescale: i32 = 0
+let mut things_pspriteiscale: i32 = 0
+let mut things_spryscale: i32 = 0
+let mut things_sprtopscreen: i32 = 0
+let mut things_mfloorclip: ptr<void> = null
+let mut things_mceilingclip: ptr<void> = null
+let mut things_sprites: ptr<void> = null
+let mut things_numsprites: i32 = 0
+let mut things_sprtemp: ptr<void> = null
+let mut things_maxframe: i32 = 0
+let mut things_spritename: ptr<void> = null
+
+let mut things_negonearray: array<i16, 320> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+let mut things_screenheightarray: array<i16, 320> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+function things_ensure_sprtemp() -> void {
+    if (things_sprtemp as i64) == 0 {
+        things_sprtemp = calloc(
+            THINGS_SPRTEMP_FRAMES as i64,
+            THINGS_SIZEOF_SPRITEFRAME as i64)
+    }
+}
+
+function things_tolower(c: i32) -> i32 {
+    if c >= 65 and c <= 90 {
+        return c + 32
+    }
+    return c
+}
+
+function things_lump_name_char(lump: i32, idx: i32) -> i32 {
+    let base: ptr<u8> = wadflow_lumpinfo()
+    return base[lump * THINGS_WAD_LUMP_STRIDE + idx] as i32
+}
+
+function things_lump_name_ptr(lump: i32) -> ptr<u8> {
+    return ((wadflow_lumpinfo() as i64) + (lump * THINGS_WAD_LUMP_STRIDE) as i64) as ptr<u8>
+}
+
+function things_lump_name_ncasecmp4(lump: i32, name: ptr<void>) -> i32 {
+    let ln: ptr<u8> = things_lump_name_ptr(lump)
+    let nm: ptr<u8> = name as ptr<u8>
+    for i in 0 to 4 {
+        let ca: i32 = things_tolower(ln[i] as i32)
+        let cb: i32 = things_tolower(nm[i] as i32)
+        if ca != cb {
+            return 0
+        }
+    }
+    return 1
+}
+
+function things_sf_temp(frame: i32) -> ptr<u8> {
+    return ((things_sprtemp as i64)
+        + (frame * THINGS_SIZEOF_SPRITEFRAME) as i64) as ptr<u8>
+}
+
+function things_sd_at(i: i32) -> ptr<u8> {
+    return ((things_sprites as i64)
+        + (i * THINGS_SIZEOF_SPRITEDEF) as i64) as ptr<u8>
+}
+
+function things_sf_installed(sprite: i32, frame: i32) -> ptr<u8> {
+    let frames_ptr: ptr<ptr<void> > = ((things_sd_at(sprite) as i64)
+        + THINGS_SD_SPRITEFRAMES as i64) as ptr<ptr<void> >
+    let frames: ptr<u8> = frames_ptr[0] as ptr<u8>
+    return ((frames as i64) + (frame * THINGS_SIZEOF_SPRITEFRAME) as i64) as ptr<u8>
+}
+
+function things_sf_rotate(sf: ptr<u8>) -> i32 {
+    let p: ptr<i32> = sf as ptr<i32>
+    return p[0]
+}
+
+function things_sf_set_rotate(sf: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = sf as ptr<i32>
+    p[0] = v
+}
+
+function things_sf_lump(sf: ptr<u8>, rot: i32) -> i32 {
+    let p: ptr<i16> = ((sf as i64) + THINGS_SF_LUMP as i64) as ptr<i16>
+    return p[rot] as i32
+}
+
+function things_sf_set_lump(sf: ptr<u8>, rot: i32, v: i32) -> void {
+    let p: ptr<i16> = ((sf as i64) + THINGS_SF_LUMP as i64) as ptr<i16>
+    p[rot] = v as i16
+}
+
+function things_sf_flip(sf: ptr<u8>, rot: i32) -> i32 {
+    let p: ptr<u8> = ((sf as i64) + THINGS_SF_FLIP as i64) as ptr<u8>
+    return p[rot] as i32
+}
+
+function things_sf_set_flip(sf: ptr<u8>, rot: i32, v: i32) -> void {
+    let p: ptr<u8> = ((sf as i64) + THINGS_SF_FLIP as i64) as ptr<u8>
+    p[rot] = v as u8
+}
+
+function things_sd_numframes(i: i32) -> i32 {
+    let sd: ptr<i32> = things_sd_at(i) as ptr<i32>
+    return sd[0]
+}
+
+function things_sd_set_numframes(i: i32, n: i32) -> void {
+    let sd: ptr<i32> = things_sd_at(i) as ptr<i32>
+    sd[0] = n
+}
+
+function things_clip_at(clip: ptr<void>, x: i32) -> i16 {
+    let p: ptr<i16> = clip as ptr<i16>
+    return p[x]
+}
+
+function things_clip_set(clip: ptr<void>, x: i32, v: i32) -> void {
+    let p: ptr<i16> = clip as ptr<i16>
+    p[x] = v as i16
+}
+
+function things_translation_for_flags(flags: i32) -> ptr<void> {
+    let tables: ptr<u8> = drawshim_translationtables_addr()[0]
+    let shift: i32 = THINGS_MF_TRANSSHIFT - 8
+    return ((tables as i64) - 256
+        + (((flags & THINGS_MF_TRANSLATION) >> shift) as i64)) as ptr<void>
+}
+
+@flow_api
+function thingshim_numsprites() -> i32 { return things_numsprites }
+
+@flow_api
+function thingshim_sprite_numframes(i: i32) -> i32 { return things_sd_numframes(i) }
+
+@flow_api
+function thingshim_sprite_frame_rotate(sprite: i32, frame: i32) -> i32 {
+    return things_sf_rotate(things_sf_installed(sprite, frame))
+}
+
+@flow_api
+function thingshim_sprite_frame_lump(sprite: i32, frame: i32, rot: i32) -> i32 {
+    return things_sf_lump(things_sf_installed(sprite, frame), rot)
+}
+
+@flow_api
+function thingshim_sprite_frame_flip(sprite: i32, frame: i32, rot: i32) -> i32 {
+    return things_sf_flip(things_sf_installed(sprite, frame), rot)
+}
+
+# Matches C vissprite_t (LP64 sizeof 80): ptr padding after patch.
+struct VisSprite {
+    prev: ptr<VisSprite>,
+    next: ptr<VisSprite>,
+    x1: i32,
+    x2: i32,
+    gx: i32,
+    gy: i32,
+    gz: i32,
+    gzt: i32,
+    startfrac: i32,
+    scale: i32,
+    xiscale: i32,
+    texturemid: i32,
+    patch: i32,
+    colormap: ptr<void>,
+    mobjflags: i32
+}
+
+# ---- private module state ---------------------------------------------
+
+let mut vissprites: ptr<VisSprite> = null
+let mut vissprite_p: ptr<VisSprite> = null
+let mut vissprites_end: ptr<VisSprite> = null
+let mut spritelights: ptr<ptr<void> > = null
+
+function things_scalelight_row(lightnum: i32) -> ptr<ptr<void> > {
+    if lightnum < 0 {
+        return RMAIN_scalelight_row(0)
+    } elif lightnum >= THINGS_LIGHTLEVELS {
+        return RMAIN_scalelight_row(THINGS_LIGHTLEVELS - 1)
+    } else {
+        return RMAIN_scalelight_row(lightnum)
+    }
+}
+
+let mut overflowsprite: VisSprite = VisSprite {
+    prev: null, next: null, x1: 0, x2: 0, gx: 0, gy: 0, gz: 0, gzt: 0,
+    startfrac: 0, scale: 0, xiscale: 0, texturemid: 0, patch: 0,
+    colormap: null, mobjflags: 0
+}
+
+let mut vsprsortedhead: VisSprite = VisSprite {
+    prev: null, next: null, x1: 0, x2: 0, gx: 0, gy: 0, gz: 0, gzt: 0,
+    startfrac: 0, scale: 0, xiscale: 0, texturemid: 0, patch: 0,
+    colormap: null, mobjflags: 0
+}
+
+let mut clipbot: array<i16, 320> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+let mut cliptop: array<i16, 320> = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+function things_ensure() -> void {
+    if (vissprites as i64) == 0 {
+        vissprites = calloc(THINGS_MAXVISSPRITES as i64, THINGS_SIZEOF_VISSPRITE as i64) as ptr<VisSprite>
+        vissprites_end = ((vissprites as i64)
+            + (THINGS_MAXVISSPRITES as i64) * (THINGS_SIZEOF_VISSPRITE as i64)) as ptr<VisSprite>
+        vissprite_p = vissprites
+    }
+}
+
+function vs_zero() -> VisSprite {
+    return VisSprite {
+        prev: null, next: null, x1: 0, x2: 0, gx: 0, gy: 0, gz: 0, gzt: 0,
+        startfrac: 0, scale: 0, xiscale: 0, texturemid: 0, patch: 0,
+        colormap: null, mobjflags: 0
+    }
+}
+
+# ---- R_InstallSpriteLump ----------------------------------------------
+
+function R_InstallSpriteLump(lump: i32, frame: u32, rotation: u32, flipped: i32) -> void {
+    things_ensure_sprtemp()
+    if frame >= 29 as u32 or rotation > 8 as u32 {
+        I_Error("R_InstallSpriteLump: Bad frame characters in lump")
+    }
+
+    let sft: ptr<u8> = things_sf_temp(frame as i32)
+    if (frame as i32) > things_maxframe {
+        things_maxframe = frame as i32
+    }
+
+    if rotation == 0 as u32 {
+        if things_sf_rotate(sft) == 0 {
+            I_Error("R_InitSprites: Sprite frame has multip rot=0 lump")
+        }
+        if things_sf_rotate(sft) == 1 {
+            I_Error("R_InitSprites: Sprite frame has rotations and a rot=0 lump")
+        }
+        things_sf_set_rotate(sft, 0)
+        for r in 0 to 8 {
+            things_sf_set_lump(sft, r, lump - RDATA_firstspritelump())
+            things_sf_set_flip(sft, r, flipped)
+        }
+        return
+    }
+
+    if things_sf_rotate(sft) == 0 {
+        I_Error("R_InitSprites: Sprite frame has rotations and a rot=0 lump")
+    }
+
+    things_sf_set_rotate(sft, 1)
+    let rot: u32 = rotation - 1 as u32
+    if things_sf_lump(sft, rot as i32) != 0 - 1 {
+        I_Error("R_InitSprites: Sprite has two lumps mapped to it")
+    }
+    things_sf_set_lump(sft, rot as i32, lump - RDATA_firstspritelump())
+    things_sf_set_flip(sft, rot as i32, flipped)
+}
+
+# ---- R_InitSpriteDefs -------------------------------------------------
+
+function R_InitSpriteDefs(namelist: ptr<ptr<u8> >) -> void {
+    things_ensure_sprtemp()
+    let mut check: i32 = 0
+    while (namelist[check] as i64) != 0 {
+        check = check + 1
+    }
+    things_numsprites = check
+
+    if things_numsprites == 0 {
+        return
+    }
+
+    things_sprites = Z_Malloc(
+        things_numsprites * THINGS_SIZEOF_SPRITEDEF,
+        THINGS_PU_STATIC,
+        null)
+
+    let start: i32 = RDATA_firstspritelump() - 1
+    let end: i32 = RDATA_lastspritelump() + 1
+
+    for i in 0 to things_numsprites {
+        things_spritename = namelist[i] as ptr<void>
+        memset(things_sprtemp, 0 - 1,
+            (THINGS_SPRTEMP_FRAMES * THINGS_SIZEOF_SPRITEFRAME) as i64)
+        things_maxframe = 0 - 1
+
+        for l in (start + 1) to end {
+            if things_lump_name_ncasecmp4(l, things_spritename) != 0 {
+                let frame: i32 = things_lump_name_char(l, 4) - 65   # 'A'
+                let rotation: i32 = things_lump_name_char(l, 5) - 48 # '0'
+
+                let mut patched: i32 = l
+                if STAT_modifiedgame() != 0 {
+                    patched = W_GetNumForName(things_lump_name_ptr(l) as string)
+                }
+
+                R_InstallSpriteLump(patched, frame as u32, rotation as u32, 0)
+
+                if things_lump_name_char(l, 6) != 0 {
+                    let frame2: i32 = things_lump_name_char(l, 6) - 65
+                    let rotation2: i32 = things_lump_name_char(l, 7) - 48
+                    R_InstallSpriteLump(l, frame2 as u32, rotation2 as u32, 1)
+                }
+            }
+        }
+
+        if things_maxframe == 0 - 1 {
+            things_sd_set_numframes(i, 0)
+        } else {
+            let mut maxf: i32 = things_maxframe + 1
+            things_maxframe = maxf
+
+            for frame in 0 to maxf {
+                let sft: ptr<u8> = things_sf_temp(frame)
+                let rot: i32 = things_sf_rotate(sft)
+                if rot == 0 - 1 {
+                    I_Error("R_InitSprites: No patches found for sprite frame")
+                } elif rot == 1 {
+                    for rotation in 0 to 8 {
+                        if things_sf_lump(sft, rotation) == 0 - 1 {
+                            I_Error("R_InitSprites: Sprite frame is missing rotations")
+                        }
+                    }
+                }
+            }
+
+            things_sd_set_numframes(i, maxf)
+            let frames: ptr<void> = Z_Malloc(
+                maxf * THINGS_SIZEOF_SPRITEFRAME,
+                THINGS_PU_STATIC,
+                null)
+            let frames_ptr: ptr<ptr<void> > = ((things_sd_at(i) as i64)
+                + THINGS_SD_SPRITEFRAMES as i64) as ptr<ptr<void> >
+            frames_ptr[0] = frames
+            memcpy(
+                frames,
+                things_sprtemp,
+                (maxf * THINGS_SIZEOF_SPRITEFRAME) as i64)
+        }
+    }
+}
+
+# ---- R_InitSprites / R_ClearSprites / R_NewVisSprite -------------------
+
+
+# Shared sprite/clip scratch APIs. Prefer these over segshim_/rmainshim_/
+# planeshim_ clones of the same globals.
+
+@flow_api
+function THINGS_spryscale() -> i32 {
+    return things_spryscale
+}
+
+@flow_api
+function THINGS_set_spryscale(v: i32) -> void {
+    things_spryscale = v
+}
+
+@flow_api
+function THINGS_sprtopscreen() -> i32 {
+    return things_sprtopscreen
+}
+
+@flow_api
+function THINGS_set_sprtopscreen(v: i32) -> void {
+    things_sprtopscreen = v
+}
+
+@flow_api
+function THINGS_mfloorclip() -> ptr<void> {
+    return things_mfloorclip
+}
+
+@flow_api
+function THINGS_set_mfloorclip(p: ptr<void>) -> void {
+    things_mfloorclip = p
+}
+
+@flow_api
+function THINGS_mceilingclip() -> ptr<void> {
+    return things_mceilingclip
+}
+
+@flow_api
+function THINGS_set_mceilingclip(p: ptr<void>) -> void {
+    things_mceilingclip = p
+}
+
+@flow_api
+function THINGS_negonearray() -> ptr<void> {
+    return &things_negonearray as ptr<void>
+}
+
+@flow_api
+function THINGS_screenheightarray() -> ptr<void> {
+    return &things_screenheightarray as ptr<void>
+}
+
+@flow_api
+function THINGS_set_screenheightarray(i: i32, v: i32) -> void {
+    things_clip_set(&things_screenheightarray as ptr<void>, i, v)
+}
+
+@flow_api
+function THINGS_pspritescale() -> i32 {
+    return things_pspritescale
+}
+
+@flow_api
+function THINGS_set_pspritescale(v: i32) -> void {
+    things_pspritescale = v
+}
+
+@flow_api
+function THINGS_pspriteiscale() -> i32 {
+    return things_pspriteiscale
+}
+
+@flow_api
+function THINGS_set_pspriteiscale(v: i32) -> void {
+    things_pspriteiscale = v
+}
+
+@flow_api
+function R_InitSprites(namelist: ptr<ptr<u8> >) -> void {
+    things_ensure()
+    let neg: ptr<void> = THINGS_negonearray()
+    for i in 0 to THINGS_SCREENWIDTH {
+        things_clip_set(neg, i, 0 - 1)
+    }
+    R_InitSpriteDefs(namelist)
+}
+
+@flow_api
+function R_ClearSprites() -> void {
+    things_ensure()
+    vissprite_p = vissprites
+}
+
+function R_NewVisSprite() -> ptr<VisSprite> {
+    if (vissprite_p as i64) == (vissprites_end as i64) {
+        return &overflowsprite
+    }
+    let result: ptr<VisSprite> = vissprite_p
+    vissprite_p = ((vissprite_p as i64) + THINGS_SIZEOF_VISSPRITE as i64) as ptr<VisSprite>
+    return result
+}
+
+# ---- R_DrawMaskedColumn -----------------------------------------------
+
+@flow_api
+function R_DrawMaskedColumn(column: ptr<void>) -> void {
+    let mut col: ptr<u8> = column as ptr<u8>
+    let basetexturemid: i32 = DRAW_dc_texturemid()
+    let spryscale: i32 = THINGS_spryscale()
+    let sprtopscreen: i32 = THINGS_sprtopscreen()
+    let floorclip: ptr<void> = THINGS_mfloorclip()
+    let ceilingclip: ptr<void> = THINGS_mceilingclip()
+
+    while col[0] != 255 as u8 {
+        let topdelta: i32 = col[0] as i32
+        let length: i32 = col[1] as i32
+        let topscreen: i32 = sprtopscreen + spryscale * topdelta
+        let bottomscreen: i32 = topscreen + spryscale * length
+
+        DRAW_set_dc_yl((topscreen + THINGS_FRACUNIT - 1) >> THINGS_FRACBITS)
+        DRAW_set_dc_yh((bottomscreen - 1) >> THINGS_FRACBITS)
+
+        let dc_x: i32 = DRAW_dc_x()
+        if DRAW_dc_yh() >= (things_clip_at(floorclip, dc_x) as i32) {
+            DRAW_set_dc_yh((things_clip_at(floorclip, dc_x) as i32) - 1)
+        }
+        if DRAW_dc_yl() <= (things_clip_at(ceilingclip, dc_x) as i32) {
+            DRAW_set_dc_yl((things_clip_at(ceilingclip, dc_x) as i32) + 1)
+        }
+
+        if DRAW_dc_yl() <= DRAW_dc_yh() {
+            DRAW_set_dc_source(((col as i64) + 3) as ptr<void>)
+            DRAW_set_dc_texturemid(basetexturemid - (topdelta << THINGS_FRACBITS))
+            rmainshim_call_colfunc()
+        }
+
+        col = ((col as i64) + (length as i64) + 4) as ptr<u8>
+    }
+
+    DRAW_set_dc_texturemid(basetexturemid)
+}
+
+# ---- R_DrawVisSprite --------------------------------------------------
+
+function R_DrawVisSprite(vis: ptr<VisSprite>, x1: i32, x2: i32) -> void {
+    let patch: ptr<void> = W_CacheLumpNum(
+        vis[0].patch + RDATA_firstspritelump(), THINGS_PU_CACHE)
+
+    DRAW_set_dc_colormap(vis[0].colormap)
+
+    if (DRAW_dc_colormap() as i64) == 0 {
+        thingshim_set_colfunc_fuzz()
+    } elif (vis[0].mobjflags & THINGS_MF_TRANSLATION) != 0 {
+        thingshim_set_colfunc_trans()
+        DRAW_set_dc_translation(things_translation_for_flags(vis[0].mobjflags))
+    }
+
+    DRAW_set_dc_iscale(abs(vis[0].xiscale) >> RMAIN_detailshift())
+    DRAW_set_dc_texturemid(vis[0].texturemid)
+    let mut frac: i32 = vis[0].startfrac
+    THINGS_set_spryscale(vis[0].scale)
+    THINGS_set_sprtopscreen(
+        RMAIN_centeryfrac() - FixedMul(DRAW_dc_texturemid(), vis[0].scale))
+
+    let mut dc_x: i32 = vis[0].x1
+    while dc_x <= vis[0].x2 {
+        DRAW_set_dc_x(dc_x)
+        let texturecolumn: i32 = frac >> THINGS_FRACBITS
+        let column: ptr<u8> = ((patch as i64)
+            + (PATCH_columnofs(patch, texturecolumn) as i64)) as ptr<u8>
+        R_DrawMaskedColumn(column as ptr<void>)
+        frac = frac + vis[0].xiscale
+        dc_x = dc_x + 1
+    }
+
+    thingshim_set_colfunc_base()
+}
+
+# ---- R_ProjectSprite --------------------------------------------------
+
+function R_ProjectSprite(thing: ptr<void>) -> void {
+    let tr_x: i32 = MOBJ_x(thing) - RMAIN_viewx()
+    let tr_y: i32 = MOBJ_y(thing) - RMAIN_viewy()
+
+    let mut gxt: i32 = FixedMul(tr_x, RMAIN_viewcos())
+    let mut gyt: i32 = 0 - FixedMul(tr_y, RMAIN_viewsin())
+    let tz: i32 = gxt - gyt
+
+    if tz < THINGS_MINZ {
+        return
+    }
+
+    let xscale: i32 = FixedDiv(RMAIN_projection(), tz)
+
+    gxt = 0 - FixedMul(tr_x, RMAIN_viewsin())
+    gyt = FixedMul(tr_y, RMAIN_viewcos())
+    let mut tx: i32 = 0 - (gyt + gxt)
+
+    if abs(tx) > (tz << 2) {
+        return
+    }
+
+    let sprite: i32 = MOBJ_sprite(thing)
+    let frame: i32 = MOBJ_frame(thing)
+    let sprframe_i: i32 = frame & THINGS_FF_FRAMEMASK
+
+    let mut lump: i32 = 0
+    let mut flip: i32 = 0
+
+    if things_sf_rotate(things_sf_installed(sprite, sprframe_i)) != 0 {
+        let ang: u32 = R_PointToAngle(MOBJ_x(thing), MOBJ_y(thing))
+        let rot: u32 = (ang - MOBJ_angle(thing) + THINGS_ANG45_2_X9) >> 29
+        lump = things_sf_lump(things_sf_installed(sprite, sprframe_i), rot as i32)
+        flip = things_sf_flip(things_sf_installed(sprite, sprframe_i), rot as i32)
+    } else {
+        lump = things_sf_lump(things_sf_installed(sprite, sprframe_i), 0)
+        flip = things_sf_flip(things_sf_installed(sprite, sprframe_i), 0)
+    }
+
+    tx = tx - RDATA_spriteoffset(lump)
+    let x1: i32 = (RMAIN_centerxfrac() + FixedMul(tx, xscale)) >> THINGS_FRACBITS
+
+    if x1 > DRAW_viewwidth() {
+        return
+    }
+
+    tx = tx + RDATA_spritewidth(lump)
+    let x2: i32 = ((RMAIN_centerxfrac() + FixedMul(tx, xscale)) >> THINGS_FRACBITS) - 1
+
+    if x2 < 0 {
+        return
+    }
+
+    let vis: ptr<VisSprite> = R_NewVisSprite()
+    vis[0].mobjflags = MOBJ_flags(thing)
+    vis[0].scale = xscale << RMAIN_detailshift()
+    vis[0].gx = MOBJ_x(thing)
+    vis[0].gy = MOBJ_y(thing)
+    vis[0].gz = MOBJ_z(thing)
+    vis[0].gzt = MOBJ_z(thing) + RDATA_spritetopoffset(lump)
+    vis[0].texturemid = vis[0].gzt - RMAIN_viewz()
+
+    if x1 < 0 {
+        vis[0].x1 = 0
+    } else {
+        vis[0].x1 = x1
+    }
+    if x2 >= DRAW_viewwidth() {
+        vis[0].x2 = DRAW_viewwidth() - 1
+    } else {
+        vis[0].x2 = x2
+    }
+
+    let iscale: i32 = FixedDiv(THINGS_FRACUNIT, xscale)
+
+    if flip != 0 {
+        vis[0].startfrac = RDATA_spritewidth(lump) - 1
+        vis[0].xiscale = 0 - iscale
+    } else {
+        vis[0].startfrac = 0
+        vis[0].xiscale = iscale
+    }
+
+    if vis[0].x1 > x1 {
+        vis[0].startfrac = vis[0].startfrac + vis[0].xiscale * (vis[0].x1 - x1)
+    }
+    vis[0].patch = lump
+
+    if (MOBJ_flags(thing) & THINGS_MF_SHADOW) != 0 {
+        vis[0].colormap = null
+    } elif (RMAIN_fixedcolormap() as i64) != 0 {
+        vis[0].colormap = RMAIN_fixedcolormap()
+    } elif (frame & THINGS_FF_FULLBRIGHT) != 0 {
+        vis[0].colormap = RDATA_colormaps()
+    } else {
+        let mut index: i32 = xscale >> (THINGS_LIGHTSCALESHIFT - RMAIN_detailshift())
+        if index >= THINGS_MAXLIGHTSCALE {
+            index = THINGS_MAXLIGHTSCALE - 1
+        }
+        vis[0].colormap = spritelights[index]
+    }
+}
+
+# ---- R_AddSprites -----------------------------------------------------
+
+@flow_api
+function R_AddSprites(sec: ptr<void>) -> void {
+    if GEOM_sector_validcount(sec) == RMAIN_validcount() {
+        return
+    }
+    GEOM_sector_set_validcount(sec, RMAIN_validcount())
+
+    let lightnum: i32 = (GEOM_sector_lightlevel(sec) >> THINGS_LIGHTSEGSHIFT)
+        + RMAIN_extralight()
+    spritelights = things_scalelight_row(lightnum)
+
+    let mut thing: ptr<void> = GEOM_sector_thinglist(sec)
+    while (thing as i64) != 0 {
+        R_ProjectSprite(thing)
+        thing = MOBJ_snext(thing)
+    }
+}
+
+# ---- R_DrawPSprite / R_DrawPlayerSprites ------------------------------
+
+function R_DrawPSprite(psp: ptr<void>) -> void {
+    let st: ptr<void> = PSP_state(psp)
+    let sprite: i32 = STATE_sprite(st)
+    let frame: i32 = STATE_frame(st)
+    let sprframe_i: i32 = frame & THINGS_FF_FRAMEMASK
+
+    let lump: i32 = things_sf_lump(things_sf_installed(sprite, sprframe_i), 0)
+    let flip: i32 = things_sf_flip(things_sf_installed(sprite, sprframe_i), 0)
+
+    let mut tx: i32 = PSP_sx(psp) - 160 * THINGS_FRACUNIT
+    tx = tx - RDATA_spriteoffset(lump)
+    let x1: i32 = (RMAIN_centerxfrac()
+        + FixedMul(tx, THINGS_pspritescale())) >> THINGS_FRACBITS
+
+    if x1 > DRAW_viewwidth() {
+        return
+    }
+
+    tx = tx + RDATA_spritewidth(lump)
+    let x2: i32 = ((RMAIN_centerxfrac()
+        + FixedMul(tx, THINGS_pspritescale())) >> THINGS_FRACBITS) - 1
+
+    if x2 < 0 {
+        return
+    }
+
+    let mut avis: VisSprite = vs_zero()
+    let vis: ptr<VisSprite> = &avis
+    vis[0].mobjflags = 0
+    vis[0].texturemid = (THINGS_BASEYCENTER << THINGS_FRACBITS) + THINGS_FRACUNIT / 2
+        - (PSP_sy(psp) - RDATA_spritetopoffset(lump))
+
+    if x1 < 0 {
+        vis[0].x1 = 0
+    } else {
+        vis[0].x1 = x1
+    }
+    if x2 >= DRAW_viewwidth() {
+        vis[0].x2 = DRAW_viewwidth() - 1
+    } else {
+        vis[0].x2 = x2
+    }
+
+    vis[0].scale = THINGS_pspritescale() << RMAIN_detailshift()
+
+    if flip != 0 {
+        vis[0].xiscale = 0 - THINGS_pspriteiscale()
+        vis[0].startfrac = RDATA_spritewidth(lump) - 1
+    } else {
+        vis[0].xiscale = THINGS_pspriteiscale()
+        vis[0].startfrac = 0
+    }
+
+    if vis[0].x1 > x1 {
+        vis[0].startfrac = vis[0].startfrac + vis[0].xiscale * (vis[0].x1 - x1)
+    }
+
+    vis[0].patch = lump
+
+    let player: ptr<void> = RMAIN_viewplayer()
+    let invis: i32 = PLAYER_power(player, THINGS_PW_INVISIBILITY)
+    if invis > 4 * 32 or (invis & 8) != 0 {
+        vis[0].colormap = null
+    } elif (RMAIN_fixedcolormap() as i64) != 0 {
+        vis[0].colormap = RMAIN_fixedcolormap()
+    } elif (frame & THINGS_FF_FULLBRIGHT) != 0 {
+        vis[0].colormap = RDATA_colormaps()
+    } else {
+        vis[0].colormap = spritelights[THINGS_MAXLIGHTSCALE - 1]
+    }
+
+    R_DrawVisSprite(vis, vis[0].x1, vis[0].x2)
+}
+
+function R_DrawPlayerSprites() -> void {
+    let player: ptr<void> = RMAIN_viewplayer()
+    let mo: ptr<void> = PLAYER_mo(player)
+    let sec: ptr<void> = GEOM_subsector_sector(MOBJ_subsector(mo))
+    let lightnum: i32 = (GEOM_sector_lightlevel(sec) >> THINGS_LIGHTSEGSHIFT)
+        + RMAIN_extralight()
+    spritelights = things_scalelight_row(lightnum)
+
+    THINGS_set_mfloorclip(THINGS_screenheightarray())
+    THINGS_set_mceilingclip(THINGS_negonearray())
+
+    for i in 0 to THINGS_NUMPSPRITES {
+        let psp: ptr<void> = PLAYER_psp(player, i)
+        if (PSP_state(psp) as i64) != 0 {
+            R_DrawPSprite(psp)
+        }
+    }
+}
+
+# ---- R_SortVisSprites -------------------------------------------------
+
+@flow_api
+function R_SortVisSprites() -> void {
+    let count: i32 = (((vissprite_p as i64) - (vissprites as i64))
+        / (THINGS_SIZEOF_VISSPRITE as i64)) as i32
+
+    let mut unsorted: VisSprite = vs_zero()
+    let up: ptr<VisSprite> = &unsorted
+    up[0].next = up
+    up[0].prev = up
+
+    if count == 0 {
+        return
+    }
+
+    let mut ds: ptr<VisSprite> = vissprites
+    while (ds as i64) < (vissprite_p as i64) {
+        ds[0].next = ((ds as i64) + THINGS_SIZEOF_VISSPRITE as i64) as ptr<VisSprite>
+        ds[0].prev = ((ds as i64) - THINGS_SIZEOF_VISSPRITE as i64) as ptr<VisSprite>
+        ds = ds[0].next
+    }
+
+    vissprites[0].prev = up
+    up[0].next = vissprites
+    let last: ptr<VisSprite> = ((vissprite_p as i64) - THINGS_SIZEOF_VISSPRITE as i64) as ptr<VisSprite>
+    last[0].next = up
+    up[0].prev = last
+
+    let head: ptr<VisSprite> = &vsprsortedhead
+    head[0].next = head
+    head[0].prev = head
+
+    for _i in 0 to count {
+        let mut bestscale: i32 = THINGS_INT_MAX
+        let mut best: ptr<VisSprite> = up[0].next
+        ds = up[0].next
+        while (ds as i64) != (up as i64) {
+            if ds[0].scale < bestscale {
+                bestscale = ds[0].scale
+                best = ds
+            }
+            ds = ds[0].next
+        }
+        best[0].next[0].prev = best[0].prev
+        best[0].prev[0].next = best[0].next
+        best[0].next = head
+        best[0].prev = head[0].prev
+        head[0].prev[0].next = best
+        head[0].prev = best
+    }
+}
+
+# ---- R_DrawSprite -----------------------------------------------------
+
+function R_DrawSprite(spr: ptr<VisSprite>) -> void {
+    for x in spr[0].x1 to (spr[0].x2 + 1) {
+        clipbot[x] = (0 - 2) as i16
+        cliptop[x] = (0 - 2) as i16
+    }
+
+    let mut di: i32 = BSP_ds_count() - 1
+    while di >= 0 {
+        let ds: ptr<void> = BSP_drawseg(di)
+
+        if BSP_ds_x1(ds) > spr[0].x2
+            or BSP_ds_x2(ds) < spr[0].x1
+            or (BSP_ds_silhouette(ds) == 0
+                and (BSP_ds_maskedtexturecol(ds) as i64) == 0) {
+            di = di - 1
+        } else {
+            let mut r1: i32 = BSP_ds_x1(ds)
+            if r1 < spr[0].x1 {
+                r1 = spr[0].x1
+            }
+            let mut r2: i32 = BSP_ds_x2(ds)
+            if r2 > spr[0].x2 {
+                r2 = spr[0].x2
+            }
+
+            let mut lowscale: i32 = 0
+            let mut scale: i32 = 0
+            if BSP_ds_scale1(ds) > BSP_ds_scale2(ds) {
+                lowscale = BSP_ds_scale2(ds)
+                scale = BSP_ds_scale1(ds)
+            } else {
+                lowscale = BSP_ds_scale1(ds)
+                scale = BSP_ds_scale2(ds)
+            }
+
+            if scale < spr[0].scale
+                or (lowscale < spr[0].scale
+                    and R_PointOnSegSide(spr[0].gx, spr[0].gy, BSP_ds_curline(ds)) == 0) {
+                if (BSP_ds_maskedtexturecol(ds) as i64) != 0 {
+                    R_RenderMaskedSegRange(ds, r1, r2)
+                }
+                di = di - 1
+            } else {
+                let mut silhouette: i32 = BSP_ds_silhouette(ds)
+                if spr[0].gz >= BSP_ds_bsilheight(ds) {
+                    silhouette = silhouette & (0 - 1 - THINGS_SIL_BOTTOM)
+                }
+                if spr[0].gzt <= BSP_ds_tsilheight(ds) {
+                    silhouette = silhouette & (0 - 1 - THINGS_SIL_TOP)
+                }
+
+                if silhouette == THINGS_SIL_BOTTOM {
+                    let bot: ptr<void> = BSP_ds_sprbottomclip(ds)
+                    for x in r1 to (r2 + 1) {
+                        if (clipbot[x] as i32) == 0 - 2 {
+                            clipbot[x] = things_clip_at(bot, x)
+                        }
+                    }
+                } elif silhouette == THINGS_SIL_TOP {
+                    let top: ptr<void> = BSP_ds_sprtopclip(ds)
+                    for x in r1 to (r2 + 1) {
+                        if (cliptop[x] as i32) == 0 - 2 {
+                            cliptop[x] = things_clip_at(top, x)
+                        }
+                    }
+                } elif silhouette == THINGS_SIL_BOTH {
+                    let bot2: ptr<void> = BSP_ds_sprbottomclip(ds)
+                    let top2: ptr<void> = BSP_ds_sprtopclip(ds)
+                    for x in r1 to (r2 + 1) {
+                        if (clipbot[x] as i32) == 0 - 2 {
+                            clipbot[x] = things_clip_at(bot2, x)
+                        }
+                        if (cliptop[x] as i32) == 0 - 2 {
+                            cliptop[x] = things_clip_at(top2, x)
+                        }
+                    }
+                }
+                di = di - 1
+            }
+        }
+    }
+
+    for x in spr[0].x1 to (spr[0].x2 + 1) {
+        if (clipbot[x] as i32) == 0 - 2 {
+            clipbot[x] = DRAW_viewheight() as i16
+        }
+        if (cliptop[x] as i32) == 0 - 2 {
+            cliptop[x] = (0 - 1) as i16
+        }
+    }
+
+    THINGS_set_mfloorclip((&clipbot) as ptr<void>)
+    THINGS_set_mceilingclip((&cliptop) as ptr<void>)
+    R_DrawVisSprite(spr, spr[0].x1, spr[0].x2)
+}
+
+# ---- R_DrawMasked -----------------------------------------------------
+
+@flow_api
+function R_DrawMasked() -> void {
+    R_SortVisSprites()
+
+    if (vissprite_p as i64) > (vissprites as i64) {
+        let head: ptr<VisSprite> = &vsprsortedhead
+        let mut spr: ptr<VisSprite> = head[0].next
+        while (spr as i64) != (head as i64) {
+            R_DrawSprite(spr)
+            spr = spr[0].next
+        }
+    }
+
+    let mut di: i32 = BSP_ds_count() - 1
+    while di >= 0 {
+        let ds: ptr<void> = BSP_drawseg(di)
+        if (BSP_ds_maskedtexturecol(ds) as i64) != 0 {
+            R_RenderMaskedSegRange(ds, BSP_ds_x1(ds), BSP_ds_x2(ds))
+        }
+        di = di - 1
+    }
+
+    if RMAIN_viewangleoffset() == 0 {
+        R_DrawPlayerSprites()
+    }
+}

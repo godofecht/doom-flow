@@ -1,0 +1,929 @@
+# Player/item interaction, ported from p_inter.c to Flow.
+#
+# maxammo[] / clipammo[] live here; C shims read them via INFO_maxammo.
+# player_t / mobj_t stay C-owned; player fields use PLAYER_*, weaponinfo
+# uses WEAPONINFO_* (pspr.flow).
+#
+# FEATURE_DEHACKED is off — deh_* values are hardcoded defaults, and
+# DEH_String is identity (plain string literals).
+
+# ---- externs: fixed-point / engine ------------------------------------
+
+extern { function FixedMul(a: i32, b: i32) -> i32 }
+extern { function P_Random() -> i32 }
+extern { function I_Error(msg: string) -> void }
+extern { function I_Tactile(left: i32, right: i32, tics: i32) -> void }
+extern { function S_StartSound(origin: ptr<void>, sound_id: i32) -> void }
+extern { function AM_Stop() -> void }
+extern { function P_RemoveMobj(mobj: ptr<void>) -> void }
+extern { function P_SpawnMobj(x: i32, y: i32, z: i32, typ: i32) -> ptr<void> }
+extern { function P_SetMobjState(mobj: ptr<void>, state: i32) -> i32 }
+extern { function P_DropWeapon(player: ptr<void>) -> void }
+extern { function R_PointToAngle2(x1: i32, y1: i32, x2: i32, y2: i32) -> u32 }
+extern { function TABLES_finesine(idx: i32) -> i32 }
+extern { function TABLES_finecosine(idx: i32) -> i32 }
+
+extern { function STAT_gameskill() -> i32 }
+
+extern { function STAT_automapactive() -> i32 }
+extern { function WEAPONINFO_ammo(w: i32) -> i32 }
+
+extern { function PLAYER_index(p: ptr<void>) -> i32 }
+extern { function PLAYER_inc_frag(p: ptr<void>, idx: i32) -> void }
+
+extern { function MOBJ_x(m: ptr<void>) -> i32 }
+extern { function MOBJ_y(m: ptr<void>) -> i32 }
+extern { function MOBJ_z(m: ptr<void>) -> i32 }
+extern { function MOBJ_height(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_height(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_health(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_health(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_type(m: ptr<void>) -> i32 }
+extern { function MOBJ_sprite(m: ptr<void>) -> i32 }
+extern { function MOBJ_flags(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_flags(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_momx(m: ptr<void>) -> i32 }
+extern { function MOBJ_momy(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_momx(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_momy(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_momz(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_tics(m: ptr<void>) -> i32 }
+extern { function MOBJ_set_tics(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_player(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_set_target(m: ptr<void>, t: ptr<void>) -> void }
+extern { function MOBJ_state(m: ptr<void>) -> ptr<void> }
+extern { function MOBJ_sector(m: ptr<void>) -> ptr<void> }
+
+extern { function MOBJ_info_mass(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_spawnhealth(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_deathstate(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_xdeathstate(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_painchance(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_painstate(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_spawnstate(m: ptr<void>) -> i32 }
+extern { function MOBJ_info_seestate(m: ptr<void>) -> i32 }
+extern { function STATE_at(i: i32) -> ptr<void> }
+extern { function GEOM_sector_special(sec: ptr<void>) -> i32 }
+extern { function MOBJ_set_reactiontime(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_set_threshold(m: ptr<void>, v: i32) -> void }
+extern { function MOBJ_threshold(m: ptr<void>) -> i32 }
+extern { function PLAYER_at(i: i32) -> ptr<void> }
+extern { function PLAYER_ammo(p: ptr<void>, a: i32) -> i32 }
+extern { function PLAYER_armorpoints(p: ptr<void>) -> i32 }
+extern { function PLAYER_armortype(p: ptr<void>) -> i32 }
+extern { function PLAYER_backpack(p: ptr<void>) -> i32 }
+extern { function PLAYER_bonuscount(p: ptr<void>) -> i32 }
+extern { function PLAYER_card(p: ptr<void>, c: i32) -> i32 }
+extern { function PLAYER_cheats(p: ptr<void>) -> i32 }
+extern { function PLAYER_damagecount(p: ptr<void>) -> i32 }
+extern { function PLAYER_health(p: ptr<void>) -> i32 }
+extern { function PLAYER_itemcount(p: ptr<void>) -> i32 }
+extern { function PLAYER_killcount(p: ptr<void>) -> i32 }
+extern { function PLAYER_maxammo(p: ptr<void>, a: i32) -> i32 }
+extern { function PLAYER_mo(p: ptr<void>) -> ptr<void> }
+extern { function PLAYER_power(p: ptr<void>, pw: i32) -> i32 }
+extern { function PLAYER_readyweapon(p: ptr<void>) -> i32 }
+extern { function PLAYER_set_ammo(p: ptr<void>, a: i32, v: i32) -> void }
+extern { function PLAYER_set_armorpoints(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_armortype(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_attacker(p: ptr<void>, a: ptr<void>) -> void }
+extern { function PLAYER_set_backpack(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_bonuscount(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_card(p: ptr<void>, c: i32, v: i32) -> void }
+extern { function PLAYER_set_damagecount(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_health(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_itemcount(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_killcount(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_maxammo(p: ptr<void>, a: i32, v: i32) -> void }
+extern { function PLAYER_set_message(p: ptr<void>, msg: string) -> void }
+extern { function PLAYER_set_pendingweapon(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_playerstate(p: ptr<void>, v: i32) -> void }
+extern { function PLAYER_set_power(p: ptr<void>, pw: i32, v: i32) -> void }
+extern { function PLAYER_set_weaponowned(p: ptr<void>, w: i32, v: i32) -> void }
+extern { function PLAYER_weaponowned(p: ptr<void>, w: i32) -> i32 }
+
+# ---- constants --------------------------------------------------------
+
+# Shared doomstat-style globals (game.flow / tick.flow)
+extern { function STAT_gamemode() -> i32 }
+extern { function STAT_gameversion() -> i32 }
+extern { function STAT_deathmatch() -> i32 }
+extern { function STAT_netgame() -> i32 }
+extern { function STAT_consoleplayer() -> i32 }
+
+const INTER_BONUSADD: i32 = 6
+const INTER_NUMAMMO: i32 = 4
+const INTER_AM_NOAMMO: i32 = 5
+const INTER_MAXHEALTH: i32 = 100
+const INTER_FRACUNIT: i32 = 65536
+const INTER_FRACUNIT8: i32 = 524288           # 8*FRACUNIT
+const INTER_ONFLOORZ: i32 = 0 - 2147483648
+const INTER_BASETHRESHOLD: i32 = 100
+const INTER_ANGLETOFINESHIFT: u32 = 19
+const INTER_ANG180: u32 = 2147483648
+
+# deh_misc.h defaults (FEATURE_DEHACKED off)
+const INTER_DEH_GREEN_ARMOR: i32 = 1
+const INTER_DEH_BLUE_ARMOR: i32 = 2
+const INTER_DEH_MAX_HEALTH: i32 = 200
+const INTER_DEH_MAX_ARMOR: i32 = 200
+const INTER_DEH_MAX_SOUL: i32 = 200
+const INTER_DEH_SOUL_HEALTH: i32 = 100
+const INTER_DEH_MEGA_HEALTH: i32 = 200
+
+# doomdef.h
+const INTER_SK_BABY: i32 = 0
+const INTER_SK_NIGHTMARE: i32 = 4
+const INTER_SHAREWARE: i32 = 0
+const INTER_COMMERCIAL: i32 = 2
+const INTER_EXE_CHEX: i32 = 9
+const INTER_PST_DEAD: i32 = 1
+const INTER_CF_GODMODE: i32 = 2
+const INTER_WP_FIST: i32 = 0
+const INTER_WP_PISTOL: i32 = 1
+const INTER_WP_SHOTGUN: i32 = 2
+const INTER_WP_CHAINGUN: i32 = 3
+const INTER_WP_MISSILE: i32 = 4
+const INTER_WP_PLASMA: i32 = 5
+const INTER_WP_BFG: i32 = 6
+const INTER_WP_CHAINSAW: i32 = 7
+const INTER_WP_SUPERSHOTGUN: i32 = 8
+const INTER_AM_CLIP: i32 = 0
+const INTER_AM_SHELL: i32 = 1
+const INTER_AM_CELL: i32 = 2
+const INTER_AM_MISL: i32 = 3
+const INTER_PW_INVULNERABILITY: i32 = 0
+const INTER_PW_STRENGTH: i32 = 1
+const INTER_PW_INVISIBILITY: i32 = 2
+const INTER_PW_IRONFEET: i32 = 3
+const INTER_PW_ALLMAP: i32 = 4
+const INTER_PW_INFRARED: i32 = 5
+const INTER_INVULNTICS: i32 = 1050
+const INTER_INVISTICS: i32 = 2100
+const INTER_INFRATICS: i32 = 4200
+const INTER_IRONTICS: i32 = 2100
+const INTER_IT_BLUECARD: i32 = 0
+const INTER_IT_YELLOWCARD: i32 = 1
+const INTER_IT_REDCARD: i32 = 2
+const INTER_IT_BLUESKULL: i32 = 3
+const INTER_IT_YELLOWSKULL: i32 = 4
+const INTER_IT_REDSKULL: i32 = 5
+
+# info.h spritenum_t / mobjtype_t / S_NULL
+const INTER_SPR_ARM1: i32 = 55
+const INTER_SPR_ARM2: i32 = 56
+const INTER_SPR_BON1: i32 = 60
+const INTER_SPR_BON2: i32 = 61
+const INTER_SPR_BKEY: i32 = 62
+const INTER_SPR_RKEY: i32 = 63
+const INTER_SPR_YKEY: i32 = 64
+const INTER_SPR_BSKU: i32 = 65
+const INTER_SPR_RSKU: i32 = 66
+const INTER_SPR_YSKU: i32 = 67
+const INTER_SPR_STIM: i32 = 68
+const INTER_SPR_MEDI: i32 = 69
+const INTER_SPR_SOUL: i32 = 70
+const INTER_SPR_PINV: i32 = 71
+const INTER_SPR_PSTR: i32 = 72
+const INTER_SPR_PINS: i32 = 73
+const INTER_SPR_MEGA: i32 = 74
+const INTER_SPR_SUIT: i32 = 75
+const INTER_SPR_PMAP: i32 = 76
+const INTER_SPR_PVIS: i32 = 77
+const INTER_SPR_CLIP: i32 = 78
+const INTER_SPR_AMMO: i32 = 79
+const INTER_SPR_ROCK: i32 = 80
+const INTER_SPR_BROK: i32 = 81
+const INTER_SPR_CELL: i32 = 82
+const INTER_SPR_CELP: i32 = 83
+const INTER_SPR_SHEL: i32 = 84
+const INTER_SPR_SBOX: i32 = 85
+const INTER_SPR_BPAK: i32 = 86
+const INTER_SPR_BFUG: i32 = 87
+const INTER_SPR_MGUN: i32 = 88
+const INTER_SPR_CSAW: i32 = 89
+const INTER_SPR_LAUN: i32 = 90
+const INTER_SPR_PLAS: i32 = 91
+const INTER_SPR_SHOT: i32 = 92
+const INTER_SPR_SGN2: i32 = 93
+const INTER_S_NULL: i32 = 0
+const INTER_MT_POSSESSED: i32 = 1
+const INTER_MT_SHOTGUY: i32 = 2
+const INTER_MT_VILE: i32 = 3
+const INTER_MT_CHAINGUY: i32 = 10
+const INTER_MT_SKULL: i32 = 18
+const INTER_MT_WOLFSS: i32 = 23
+const INTER_MT_CLIP: i32 = 63
+const INTER_MT_CHAINGUN: i32 = 73
+const INTER_MT_SHOTGUN: i32 = 77
+
+# sounds.h
+const INTER_SFX_ITEMUP: i32 = 32
+const INTER_SFX_WPNUP: i32 = 33
+const INTER_SFX_GETPOW: i32 = 93
+
+# p_mobj.h flags
+const INTER_MF_SOLID: i32 = 2
+const INTER_MF_SHOOTABLE: i32 = 4
+const INTER_MF_JUSTHIT: i32 = 64
+const INTER_MF_NOGRAVITY: i32 = 512
+const INTER_MF_DROPOFF: i32 = 1024
+const INTER_MF_NOCLIP: i32 = 4096
+const INTER_MF_FLOAT: i32 = 16384
+const INTER_MF_DROPPED: i32 = 131072
+const INTER_MF_SHADOW: i32 = 262144
+const INTER_MF_CORPSE: i32 = 1048576
+const INTER_MF_COUNTKILL: i32 = 4194304
+const INTER_MF_COUNTITEM: i32 = 8388608
+const INTER_MF_SKULLFLY: i32 = 16777216
+
+# Shared ammo-table defaults (were in p_inter.c / inter_shim.c).
+let mut maxammo: array<i32, 4> = [200, 50, 300, 50]
+let mut clipammo: array<i32, 4> = [10, 4, 20, 1]
+
+@flow_api
+function INFO_maxammo(i: i32) -> i32 { return maxammo[i] }
+@flow_api
+function INFO_clipammo(i: i32) -> i32 { return clipammo[i] }
+
+function inter_is_consoleplayer(p: ptr<void>) -> i32 {
+    return (p as i64) == (PLAYER_at(STAT_consoleplayer()) as i64)
+}
+
+# ---- P_GiveAmmo -------------------------------------------------------
+
+# Num is clip loads (0 = 1/2 clip). Returns 0 if ammo can't be picked up.
+function P_GiveAmmo(player: ptr<void>, ammo: i32, num_in: i32) -> i32 {
+    if ammo == INTER_AM_NOAMMO {
+        return 0
+    }
+    if ammo > INTER_NUMAMMO {
+        I_Error("P_GiveAmmo: bad type")
+    }
+    if PLAYER_ammo(player, ammo) == PLAYER_maxammo(player, ammo) {
+        return 0
+    }
+
+    let mut num: i32 = num_in
+    if num != 0 {
+        num = num * INFO_clipammo(ammo)
+    } else {
+        num = INFO_clipammo(ammo) / 2
+    }
+
+    if STAT_gameskill() == INTER_SK_BABY or STAT_gameskill() == INTER_SK_NIGHTMARE {
+        num = num << 1
+    }
+
+    let oldammo: i32 = PLAYER_ammo(player, ammo)
+    PLAYER_set_ammo(player, ammo, oldammo + num)
+    if PLAYER_ammo(player, ammo) > PLAYER_maxammo(player, ammo) {
+        PLAYER_set_ammo(player, ammo, PLAYER_maxammo(player, ammo))
+    }
+
+    # If non-zero ammo, don't change weapons — player was lower on purpose.
+    if oldammo != 0 {
+        return 1
+    }
+
+    # Preferences are not user selectable.
+    if ammo == INTER_AM_CLIP {
+        if PLAYER_readyweapon(player) == INTER_WP_FIST {
+            if PLAYER_weaponowned(player, INTER_WP_CHAINGUN) != 0 {
+                PLAYER_set_pendingweapon(player, INTER_WP_CHAINGUN)
+            } else {
+                PLAYER_set_pendingweapon(player, INTER_WP_PISTOL)
+            }
+        }
+    } elif ammo == INTER_AM_SHELL {
+        if PLAYER_readyweapon(player) == INTER_WP_FIST
+            or PLAYER_readyweapon(player) == INTER_WP_PISTOL {
+            if PLAYER_weaponowned(player, INTER_WP_SHOTGUN) != 0 {
+                PLAYER_set_pendingweapon(player, INTER_WP_SHOTGUN)
+            }
+        }
+    } elif ammo == INTER_AM_CELL {
+        if PLAYER_readyweapon(player) == INTER_WP_FIST
+            or PLAYER_readyweapon(player) == INTER_WP_PISTOL {
+            if PLAYER_weaponowned(player, INTER_WP_PLASMA) != 0 {
+                PLAYER_set_pendingweapon(player, INTER_WP_PLASMA)
+            }
+        }
+    } elif ammo == INTER_AM_MISL {
+        if PLAYER_readyweapon(player) == INTER_WP_FIST {
+            if PLAYER_weaponowned(player, INTER_WP_MISSILE) != 0 {
+                PLAYER_set_pendingweapon(player, INTER_WP_MISSILE)
+            }
+        }
+    }
+
+    return 1
+}
+
+# ---- P_GiveWeapon -----------------------------------------------------
+
+@flow_api
+function P_GiveWeapon(player: ptr<void>, weapon: i32, dropped: i32) -> i32 {
+    let mut gaveammo: i32 = 0
+    let mut gaveweapon: i32 = 0
+
+    if STAT_netgame() != 0 and STAT_deathmatch() != 2 and dropped == 0 {
+        # leave placed weapons forever on net games
+        if PLAYER_weaponowned(player, weapon) != 0 {
+            return 0
+        }
+        PLAYER_set_bonuscount(player, PLAYER_bonuscount(player) + INTER_BONUSADD)
+        PLAYER_set_weaponowned(player, weapon, 1)
+        if STAT_deathmatch() != 0 {
+            P_GiveAmmo(player, WEAPONINFO_ammo(weapon), 5)
+        } else {
+            P_GiveAmmo(player, WEAPONINFO_ammo(weapon), 2)
+        }
+        PLAYER_set_pendingweapon(player, weapon)
+        if inter_is_consoleplayer(player) != 0 {
+            S_StartSound(null, INTER_SFX_WPNUP)
+        }
+        return 0
+    }
+
+    if WEAPONINFO_ammo(weapon) != INTER_AM_NOAMMO {
+        if dropped != 0 {
+            gaveammo = P_GiveAmmo(player, WEAPONINFO_ammo(weapon), 1)
+        } else {
+            gaveammo = P_GiveAmmo(player, WEAPONINFO_ammo(weapon), 2)
+        }
+    } else {
+        gaveammo = 0
+    }
+
+    if PLAYER_weaponowned(player, weapon) != 0 {
+        gaveweapon = 0
+    } else {
+        gaveweapon = 1
+        PLAYER_set_weaponowned(player, weapon, 1)
+        PLAYER_set_pendingweapon(player, weapon)
+    }
+
+    if gaveweapon != 0 or gaveammo != 0 {
+        return 1
+    }
+    return 0
+}
+
+# ---- P_GiveBody -------------------------------------------------------
+
+@flow_api
+function P_GiveBody(player: ptr<void>, num: i32) -> i32 {
+    if PLAYER_health(player) >= INTER_MAXHEALTH {
+        return 0
+    }
+    PLAYER_set_health(player, PLAYER_health(player) + num)
+    if PLAYER_health(player) > INTER_MAXHEALTH {
+        PLAYER_set_health(player, INTER_MAXHEALTH)
+    }
+    MOBJ_set_health(PLAYER_mo(player), PLAYER_health(player))
+    return 1
+}
+
+# ---- P_GiveArmor ------------------------------------------------------
+
+@flow_api
+function P_GiveArmor(player: ptr<void>, armortype: i32) -> i32 {
+    let hits: i32 = armortype * 100
+    if PLAYER_armorpoints(player) >= hits {
+        return 0
+    }
+    PLAYER_set_armortype(player, armortype)
+    PLAYER_set_armorpoints(player, hits)
+    return 1
+}
+
+# ---- P_GiveCard -------------------------------------------------------
+
+@flow_api
+function P_GiveCard(player: ptr<void>, card: i32) -> void {
+    if PLAYER_card(player, card) != 0 {
+        return
+    }
+    PLAYER_set_bonuscount(player, INTER_BONUSADD)
+    PLAYER_set_card(player, card, 1)
+}
+
+# ---- P_GivePower ------------------------------------------------------
+
+@flow_api
+function P_GivePower(player: ptr<void>, power: i32) -> i32 {
+    if power == INTER_PW_INVULNERABILITY {
+        PLAYER_set_power(player, power, INTER_INVULNTICS)
+        return 1
+    }
+    if power == INTER_PW_INVISIBILITY {
+        PLAYER_set_power(player, power, INTER_INVISTICS)
+        let mo: ptr<void> = PLAYER_mo(player)
+        MOBJ_set_flags(mo, MOBJ_flags(mo) | INTER_MF_SHADOW)
+        return 1
+    }
+    if power == INTER_PW_INFRARED {
+        PLAYER_set_power(player, power, INTER_INFRATICS)
+        return 1
+    }
+    if power == INTER_PW_IRONFEET {
+        PLAYER_set_power(player, power, INTER_IRONTICS)
+        return 1
+    }
+    if power == INTER_PW_STRENGTH {
+        P_GiveBody(player, 100)
+        PLAYER_set_power(player, power, 1)
+        return 1
+    }
+    if PLAYER_power(player, power) != 0 {
+        return 0
+    }
+    PLAYER_set_power(player, power, 1)
+    return 1
+}
+
+# ---- P_TouchSpecialThing ----------------------------------------------
+
+@flow_api
+function P_TouchSpecialThing(special: ptr<void>, toucher: ptr<void>) -> void {
+    let delta: i32 = MOBJ_z(special) - MOBJ_z(toucher)
+    if delta > MOBJ_height(toucher) or delta < (0 - INTER_FRACUNIT8) {
+        return
+    }
+
+    let mut sound: i32 = INTER_SFX_ITEMUP
+    let player: ptr<void> = MOBJ_player(toucher)
+
+    # Dead thing touching (sliding player corpse).
+    if MOBJ_health(toucher) <= 0 {
+        return
+    }
+
+    let spr: i32 = MOBJ_sprite(special)
+
+    if spr == INTER_SPR_ARM1 {
+        if P_GiveArmor(player, INTER_DEH_GREEN_ARMOR) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "Picked up the armor.")
+    } elif spr == INTER_SPR_ARM2 {
+        if P_GiveArmor(player, INTER_DEH_BLUE_ARMOR) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "Picked up the MegaArmor!")
+    } elif spr == INTER_SPR_BON1 {
+        PLAYER_set_health(player, PLAYER_health(player) + 1)
+        if PLAYER_health(player) > INTER_DEH_MAX_HEALTH {
+            PLAYER_set_health(player, INTER_DEH_MAX_HEALTH)
+        }
+        MOBJ_set_health(PLAYER_mo(player), PLAYER_health(player))
+        PLAYER_set_message(player, "Picked up a health bonus.")
+    } elif spr == INTER_SPR_BON2 {
+        PLAYER_set_armorpoints(player, PLAYER_armorpoints(player) + 1)
+        if PLAYER_armorpoints(player) > INTER_DEH_MAX_ARMOR {
+            PLAYER_set_armorpoints(player, INTER_DEH_MAX_ARMOR)
+        }
+        if PLAYER_armortype(player) == 0 {
+            PLAYER_set_armortype(player, 1)
+        }
+        PLAYER_set_message(player, "Picked up an armor bonus.")
+    } elif spr == INTER_SPR_SOUL {
+        PLAYER_set_health(player, PLAYER_health(player) + INTER_DEH_SOUL_HEALTH)
+        if PLAYER_health(player) > INTER_DEH_MAX_SOUL {
+            PLAYER_set_health(player, INTER_DEH_MAX_SOUL)
+        }
+        MOBJ_set_health(PLAYER_mo(player), PLAYER_health(player))
+        PLAYER_set_message(player, "Supercharge!")
+        sound = INTER_SFX_GETPOW
+    } elif spr == INTER_SPR_MEGA {
+        if STAT_gamemode() != INTER_COMMERCIAL {
+            return
+        }
+        PLAYER_set_health(player, INTER_DEH_MEGA_HEALTH)
+        MOBJ_set_health(PLAYER_mo(player), PLAYER_health(player))
+        P_GiveArmor(player, 2)
+        PLAYER_set_message(player, "MegaSphere!")
+        sound = INTER_SFX_GETPOW
+    } elif spr == INTER_SPR_BKEY {
+        if PLAYER_card(player, INTER_IT_BLUECARD) == 0 {
+            PLAYER_set_message(player, "Picked up a blue keycard.")
+        }
+        P_GiveCard(player, INTER_IT_BLUECARD)
+        if STAT_netgame() == 0 {
+            # fall through to remove
+        } else {
+            return
+        }
+    } elif spr == INTER_SPR_YKEY {
+        if PLAYER_card(player, INTER_IT_YELLOWCARD) == 0 {
+            PLAYER_set_message(player, "Picked up a yellow keycard.")
+        }
+        P_GiveCard(player, INTER_IT_YELLOWCARD)
+        if STAT_netgame() != 0 {
+            return
+        }
+    } elif spr == INTER_SPR_RKEY {
+        if PLAYER_card(player, INTER_IT_REDCARD) == 0 {
+            PLAYER_set_message(player, "Picked up a red keycard.")
+        }
+        P_GiveCard(player, INTER_IT_REDCARD)
+        if STAT_netgame() != 0 {
+            return
+        }
+    } elif spr == INTER_SPR_BSKU {
+        if PLAYER_card(player, INTER_IT_BLUESKULL) == 0 {
+            PLAYER_set_message(player, "Picked up a blue skull key.")
+        }
+        P_GiveCard(player, INTER_IT_BLUESKULL)
+        if STAT_netgame() != 0 {
+            return
+        }
+    } elif spr == INTER_SPR_YSKU {
+        if PLAYER_card(player, INTER_IT_YELLOWSKULL) == 0 {
+            PLAYER_set_message(player, "Picked up a yellow skull key.")
+        }
+        P_GiveCard(player, INTER_IT_YELLOWSKULL)
+        if STAT_netgame() != 0 {
+            return
+        }
+    } elif spr == INTER_SPR_RSKU {
+        if PLAYER_card(player, INTER_IT_REDSKULL) == 0 {
+            PLAYER_set_message(player, "Picked up a red skull key.")
+        }
+        P_GiveCard(player, INTER_IT_REDSKULL)
+        if STAT_netgame() != 0 {
+            return
+        }
+    } elif spr == INTER_SPR_STIM {
+        if P_GiveBody(player, 10) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "Picked up a stimpack.")
+    } elif spr == INTER_SPR_MEDI {
+        if P_GiveBody(player, 25) == 0 {
+            return
+        }
+        # Vanilla quirk: health checked AFTER heal, so GOTMEDINEED is dead.
+        if PLAYER_health(player) < 25 {
+            PLAYER_set_message(player, "Picked up a medikit that you REALLY need!")
+        } else {
+            PLAYER_set_message(player, "Picked up a medikit.")
+        }
+    } elif spr == INTER_SPR_PINV {
+        if P_GivePower(player, INTER_PW_INVULNERABILITY) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "Invulnerability!")
+        sound = INTER_SFX_GETPOW
+    } elif spr == INTER_SPR_PSTR {
+        if P_GivePower(player, INTER_PW_STRENGTH) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "Berserk!")
+        if PLAYER_readyweapon(player) != INTER_WP_FIST {
+            PLAYER_set_pendingweapon(player, INTER_WP_FIST)
+        }
+        sound = INTER_SFX_GETPOW
+    } elif spr == INTER_SPR_PINS {
+        if P_GivePower(player, INTER_PW_INVISIBILITY) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "Partial Invisibility")
+        sound = INTER_SFX_GETPOW
+    } elif spr == INTER_SPR_SUIT {
+        if P_GivePower(player, INTER_PW_IRONFEET) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "Radiation Shielding Suit")
+        sound = INTER_SFX_GETPOW
+    } elif spr == INTER_SPR_PMAP {
+        if P_GivePower(player, INTER_PW_ALLMAP) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "Computer Area Map")
+        sound = INTER_SFX_GETPOW
+    } elif spr == INTER_SPR_PVIS {
+        if P_GivePower(player, INTER_PW_INFRARED) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "Light Amplification Visor")
+        sound = INTER_SFX_GETPOW
+    } elif spr == INTER_SPR_CLIP {
+        if (MOBJ_flags(special) & INTER_MF_DROPPED) != 0 {
+            if P_GiveAmmo(player, INTER_AM_CLIP, 0) == 0 {
+                return
+            }
+        } else {
+            if P_GiveAmmo(player, INTER_AM_CLIP, 1) == 0 {
+                return
+            }
+        }
+        PLAYER_set_message(player, "Picked up a clip.")
+    } elif spr == INTER_SPR_AMMO {
+        if P_GiveAmmo(player, INTER_AM_CLIP, 5) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "Picked up a box of bullets.")
+    } elif spr == INTER_SPR_ROCK {
+        if P_GiveAmmo(player, INTER_AM_MISL, 1) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "Picked up a rocket.")
+    } elif spr == INTER_SPR_BROK {
+        if P_GiveAmmo(player, INTER_AM_MISL, 5) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "Picked up a box of rockets.")
+    } elif spr == INTER_SPR_CELL {
+        if P_GiveAmmo(player, INTER_AM_CELL, 1) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "Picked up an energy cell.")
+    } elif spr == INTER_SPR_CELP {
+        if P_GiveAmmo(player, INTER_AM_CELL, 5) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "Picked up an energy cell pack.")
+    } elif spr == INTER_SPR_SHEL {
+        if P_GiveAmmo(player, INTER_AM_SHELL, 1) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "Picked up 4 shotgun shells.")
+    } elif spr == INTER_SPR_SBOX {
+        if P_GiveAmmo(player, INTER_AM_SHELL, 5) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "Picked up a box of shotgun shells.")
+    } elif spr == INTER_SPR_BPAK {
+        if PLAYER_backpack(player) == 0 {
+            for i in 0 to INTER_NUMAMMO {
+                PLAYER_set_maxammo(player, i, PLAYER_maxammo(player, i) * 2)
+            }
+            PLAYER_set_backpack(player, 1)
+        }
+        for i in 0 to INTER_NUMAMMO {
+            P_GiveAmmo(player, i, 1)
+        }
+        PLAYER_set_message(player, "Picked up a backpack full of ammo!")
+    } elif spr == INTER_SPR_BFUG {
+        if P_GiveWeapon(player, INTER_WP_BFG, 0) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "You got the BFG9000!  Oh, yes.")
+        sound = INTER_SFX_WPNUP
+    } elif spr == INTER_SPR_MGUN {
+        let dropped: i32 = 0
+        if (MOBJ_flags(special) & INTER_MF_DROPPED) != 0 {
+            dropped = 1
+        }
+        if P_GiveWeapon(player, INTER_WP_CHAINGUN, dropped) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "You got the chaingun!")
+        sound = INTER_SFX_WPNUP
+    } elif spr == INTER_SPR_CSAW {
+        if P_GiveWeapon(player, INTER_WP_CHAINSAW, 0) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "A chainsaw!  Find some meat!")
+        sound = INTER_SFX_WPNUP
+    } elif spr == INTER_SPR_LAUN {
+        if P_GiveWeapon(player, INTER_WP_MISSILE, 0) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "You got the rocket launcher!")
+        sound = INTER_SFX_WPNUP
+    } elif spr == INTER_SPR_PLAS {
+        if P_GiveWeapon(player, INTER_WP_PLASMA, 0) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "You got the plasma gun!")
+        sound = INTER_SFX_WPNUP
+    } elif spr == INTER_SPR_SHOT {
+        let dropped2: i32 = 0
+        if (MOBJ_flags(special) & INTER_MF_DROPPED) != 0 {
+            dropped2 = 1
+        }
+        if P_GiveWeapon(player, INTER_WP_SHOTGUN, dropped2) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "You got the shotgun!")
+        sound = INTER_SFX_WPNUP
+    } elif spr == INTER_SPR_SGN2 {
+        let dropped3: i32 = 0
+        if (MOBJ_flags(special) & INTER_MF_DROPPED) != 0 {
+            dropped3 = 1
+        }
+        if P_GiveWeapon(player, INTER_WP_SUPERSHOTGUN, dropped3) == 0 {
+            return
+        }
+        PLAYER_set_message(player, "You got the super shotgun!")
+        sound = INTER_SFX_WPNUP
+    } else {
+        I_Error("P_SpecialThing: Unknown gettable thing")
+    }
+
+    if (MOBJ_flags(special) & INTER_MF_COUNTITEM) != 0 {
+        PLAYER_set_itemcount(player, PLAYER_itemcount(player) + 1)
+    }
+    P_RemoveMobj(special)
+    PLAYER_set_bonuscount(player, PLAYER_bonuscount(player) + INTER_BONUSADD)
+    if inter_is_consoleplayer(player) != 0 {
+        S_StartSound(null, sound)
+    }
+}
+
+# ---- P_KillMobj -------------------------------------------------------
+
+@flow_api
+function P_KillMobj(source: ptr<void>, target: ptr<void>) -> void {
+    let mut flags: i32 = MOBJ_flags(target)
+    flags = flags & (0 - 1 - (INTER_MF_SHOOTABLE | INTER_MF_FLOAT | INTER_MF_SKULLFLY))
+    if MOBJ_type(target) != INTER_MT_SKULL {
+        flags = flags & (0 - 1 - INTER_MF_NOGRAVITY)
+    }
+    flags = flags | INTER_MF_CORPSE | INTER_MF_DROPOFF
+    MOBJ_set_flags(target, flags)
+    MOBJ_set_height(target, MOBJ_height(target) >> 2)
+
+    if (source as i64) != 0 and (MOBJ_player(source) as i64) != 0 {
+        let sp: ptr<void> = MOBJ_player(source)
+        if (MOBJ_flags(target) & INTER_MF_COUNTKILL) != 0 {
+            PLAYER_set_killcount(sp, PLAYER_killcount(sp) + 1)
+        }
+        let tp: ptr<void> = MOBJ_player(target)
+        if (tp as i64) != 0 {
+            PLAYER_inc_frag(sp, PLAYER_index(tp))
+        }
+    } elif STAT_netgame() == 0 and (MOBJ_flags(target) & INTER_MF_COUNTKILL) != 0 {
+        let p0: ptr<void> = PLAYER_at(0)
+        PLAYER_set_killcount(p0, PLAYER_killcount(p0) + 1)
+    }
+
+    let tplayer: ptr<void> = MOBJ_player(target)
+    if (tplayer as i64) != 0 {
+        if (source as i64) == 0 {
+            PLAYER_inc_frag(tplayer, PLAYER_index(tplayer))
+        }
+        MOBJ_set_flags(target, MOBJ_flags(target) & (0 - 1 - INTER_MF_SOLID))
+        PLAYER_set_playerstate(tplayer, INTER_PST_DEAD)
+        P_DropWeapon(tplayer)
+        if inter_is_consoleplayer(tplayer) != 0 and STAT_automapactive() != 0 {
+            AM_Stop()
+        }
+    }
+
+    if MOBJ_health(target) < (0 - MOBJ_info_spawnhealth(target))
+        and MOBJ_info_xdeathstate(target) != 0 {
+        P_SetMobjState(target, MOBJ_info_xdeathstate(target))
+    } else {
+        P_SetMobjState(target, MOBJ_info_deathstate(target))
+    }
+
+    MOBJ_set_tics(target, MOBJ_tics(target) - (P_Random() & 3))
+    if MOBJ_tics(target) < 1 {
+        MOBJ_set_tics(target, 1)
+    }
+
+    # Chex Quest: monsters don't drop items.
+    if STAT_gameversion() == INTER_EXE_CHEX {
+        return
+    }
+
+    let mut item: i32 = -1
+    let typ: i32 = MOBJ_type(target)
+    if typ == INTER_MT_WOLFSS or typ == INTER_MT_POSSESSED {
+        item = INTER_MT_CLIP
+    } elif typ == INTER_MT_SHOTGUY {
+        item = INTER_MT_SHOTGUN
+    } elif typ == INTER_MT_CHAINGUY {
+        item = INTER_MT_CHAINGUN
+    } else {
+        return
+    }
+
+    let mo: ptr<void> = P_SpawnMobj(
+        MOBJ_x(target), MOBJ_y(target), INTER_ONFLOORZ, item)
+    MOBJ_set_flags(mo, MOBJ_flags(mo) | INTER_MF_DROPPED)
+}
+
+# ---- P_DamageMobj -----------------------------------------------------
+
+@flow_api
+function P_DamageMobj(target: ptr<void>, inflictor: ptr<void>, source: ptr<void>, damage_in: i32) -> void {
+    if (MOBJ_flags(target) & INTER_MF_SHOOTABLE) == 0 {
+        return
+    }
+    if MOBJ_health(target) <= 0 {
+        return
+    }
+
+    if (MOBJ_flags(target) & INTER_MF_SKULLFLY) != 0 {
+        MOBJ_set_momx(target, 0)
+        MOBJ_set_momy(target, 0)
+        MOBJ_set_momz(target, 0)
+    }
+
+    let mut damage: i32 = damage_in
+    let player: ptr<void> = MOBJ_player(target)
+    if (player as i64) != 0 and STAT_gameskill() == INTER_SK_BABY {
+        damage = damage >> 1
+    }
+
+    # Close-combat weapons should not always inflict thrust (except chainsaw).
+    if (inflictor as i64) != 0
+        and (MOBJ_flags(target) & INTER_MF_NOCLIP) == 0
+        and ((source as i64) == 0
+            or (MOBJ_player(source) as i64) == 0
+            or PLAYER_readyweapon(MOBJ_player(source)) != INTER_WP_CHAINSAW) {
+        let mut ang: u32 = R_PointToAngle2(
+            MOBJ_x(inflictor), MOBJ_y(inflictor),
+            MOBJ_x(target), MOBJ_y(target))
+        let mut thrust: i32 = damage * (INTER_FRACUNIT >> 3) * 100 / MOBJ_info_mass(target)
+
+        if damage < 40 and damage > MOBJ_health(target)
+            and MOBJ_z(target) - MOBJ_z(inflictor) > 64 * INTER_FRACUNIT
+            and (P_Random() & 1) != 0 {
+            ang = ang + INTER_ANG180
+            thrust = thrust * 4
+        }
+
+        let a: u32 = ang >> INTER_ANGLETOFINESHIFT
+        MOBJ_set_momx(target, MOBJ_momx(target) + FixedMul(thrust, TABLES_finecosine(a as i32)))
+        MOBJ_set_momy(target, MOBJ_momy(target) + FixedMul(thrust, TABLES_finesine(a as i32)))
+    }
+
+    if (player as i64) != 0 {
+        # end of game hell hack
+        if GEOM_sector_special(MOBJ_sector(target)) == 11
+            and damage >= MOBJ_health(target) {
+            damage = MOBJ_health(target) - 1
+        }
+
+        if damage < 1000
+            and ((PLAYER_cheats(player) & INTER_CF_GODMODE) != 0
+                or PLAYER_power(player, INTER_PW_INVULNERABILITY) != 0) {
+            return
+        }
+
+        if PLAYER_armortype(player) != 0 {
+            let mut saved: i32 = 0
+            if PLAYER_armortype(player) == 1 {
+                saved = damage / 3
+            } else {
+                saved = damage / 2
+            }
+            if PLAYER_armorpoints(player) <= saved {
+                saved = PLAYER_armorpoints(player)
+                PLAYER_set_armortype(player, 0)
+            }
+            PLAYER_set_armorpoints(player, PLAYER_armorpoints(player) - saved)
+            damage = damage - saved
+        }
+
+        PLAYER_set_health(player, PLAYER_health(player) - damage)
+        if PLAYER_health(player) < 0 {
+            PLAYER_set_health(player, 0)
+        }
+        PLAYER_set_attacker(player, source)
+        PLAYER_set_damagecount(player, PLAYER_damagecount(player) + damage)
+        if PLAYER_damagecount(player) > 100 {
+            PLAYER_set_damagecount(player, 100)
+        }
+
+        let mut temp: i32 = damage
+        if temp >= 100 {
+            temp = 100
+        }
+        if inter_is_consoleplayer(player) != 0 {
+            I_Tactile(40, 10, 40 + temp * 2)
+        }
+    }
+
+    MOBJ_set_health(target, MOBJ_health(target) - damage)
+    if MOBJ_health(target) <= 0 {
+        P_KillMobj(source, target)
+        return
+    }
+
+    if P_Random() < MOBJ_info_painchance(target)
+        and (MOBJ_flags(target) & INTER_MF_SKULLFLY) == 0 {
+        MOBJ_set_flags(target, MOBJ_flags(target) | INTER_MF_JUSTHIT)
+        P_SetMobjState(target, MOBJ_info_painstate(target))
+    }
+
+    MOBJ_set_reactiontime(target, 0)
+
+    if (MOBJ_threshold(target) == 0 or MOBJ_type(target) == INTER_MT_VILE)
+        and (source as i64) != 0
+        and (source as i64) != (target as i64)
+        and MOBJ_type(source) != INTER_MT_VILE {
+        MOBJ_set_target(target, source)
+        MOBJ_set_threshold(target, INTER_BASETHRESHOLD)
+        if (MOBJ_state(target) as i64) == (STATE_at(MOBJ_info_spawnstate(target)) as i64)
+            and MOBJ_info_seestate(target) != INTER_S_NULL {
+            P_SetMobjState(target, MOBJ_info_seestate(target))
+        }
+    }
+}

@@ -1,0 +1,11 @@
+/build/
+/.savegame/
+/.default.cfg
+*.o
+*.record
+*.record.c
+/frames/
+/frames_*/
+*.ppm
+.DS_Store
+/*.cfg

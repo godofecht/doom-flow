@@ -1,0 +1,228 @@
+# Screen wipe / melt, ported from f_wipe.c to Flow.
+#
+# All state (go, wipe_scr_*, melt column offsets) is private to this
+# module in C, so it stays as Flow statics. The public ABI is the three
+# wipe_* entry points in f_wipe.h; the ColorXForm / Melt helpers are
+# internal. The C function-pointer table is replaced by a plain switch
+# on wipeno (wipe_ColorXForm=0, wipe_Melt=1).
+
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function Z_Free(p: ptr<void>) -> void }
+extern { function M_Random() -> i32 }
+extern { function V_MarkRect(x: i32, y: i32, width: i32, height: i32) -> void }
+extern { function V_DrawBlock(x: i32, y: i32, width: i32, height: i32, src: ptr<u8>) -> void }
+extern { function I_ReadScreen(scr: ptr<u8>) -> void }
+extern { function VIDEO_buffer() -> ptr<u8> }
+
+# i_video.h / doomdef.h (prefixed: one Flow TU, const names must be unique)
+const WIPE_SCREENWIDTH: i32 = 320
+const WIPE_SCREENHEIGHT: i32 = 200
+
+# z_zone.h
+const WIPE_PU_STATIC: i32 = 1
+
+# f_wipe.h enum
+const WIPE_COLOR_XFORM: i32 = 0
+const WIPE_MELT: i32 = 1
+
+# when zero, stop the wipe
+let mut wipe_go: i32 = 0
+
+let mut wipe_scr_start: ptr<u8> = null
+let mut wipe_scr_end: ptr<u8> = null
+let mut wipe_scr: ptr<u8> = null
+
+# melt column y offsets (was static int *y in f_wipe.c)
+let mut melt_y: ptr<i32> = null
+
+function wipe_shittyColMajorXform(array: ptr<i16>, width: i32, height: i32) -> void {
+    let dest: ptr<i16> = Z_Malloc(width * height * 2, WIPE_PU_STATIC, null) as ptr<i16>
+    for y in 0 to height {
+        for x in 0 to width {
+            dest[x * height + y] = array[y * width + x]
+        }
+    }
+    memcpy(array as ptr<void>, dest as ptr<void>, (width * height * 2) as i64)
+    Z_Free(dest as ptr<void>)
+}
+
+function wipe_initColorXForm(width: i32, height: i32, ticks: i32) -> i32 {
+    memcpy(wipe_scr as ptr<void>, wipe_scr_start as ptr<void>, (width * height) as i64)
+    return 0
+}
+
+function wipe_doColorXForm(width: i32, height: i32, ticks: i32) -> i32 {
+    let mut changed: i32 = 0
+    let n: i32 = width * height
+    for i in 0 to n {
+        let w: i32 = wipe_scr[i] as i32
+        let e: i32 = wipe_scr_end[i] as i32
+        if w > e {
+            let newval: i32 = w - ticks
+            if newval < e {
+                wipe_scr[i] = e as u8
+            } else {
+                wipe_scr[i] = newval as u8
+            }
+            changed = 1
+        } elif w < e {
+            let newval2: i32 = w + ticks
+            if newval2 > e {
+                wipe_scr[i] = e as u8
+            } else {
+                wipe_scr[i] = newval2 as u8
+            }
+            changed = 1
+        }
+    }
+    if changed == 0 {
+        return 1
+    }
+    return 0
+}
+
+function wipe_exitColorXForm(width: i32, height: i32, ticks: i32) -> i32 {
+    return 0
+}
+
+function wipe_initMelt(width: i32, height: i32, ticks: i32) -> i32 {
+    # copy start screen to main screen
+    memcpy(wipe_scr as ptr<void>, wipe_scr_start as ptr<void>, (width * height) as i64)
+
+    # makes this wipe faster (in theory) to have stuff in column-major format
+    wipe_shittyColMajorXform(wipe_scr_start as ptr<i16>, width / 2, height)
+    wipe_shittyColMajorXform(wipe_scr_end as ptr<i16>, width / 2, height)
+
+    # setup initial column positions (y<0 => not ready to scroll yet)
+    melt_y = Z_Malloc(width * 4, WIPE_PU_STATIC, null) as ptr<i32>
+    melt_y[0] = 0 - (M_Random() % 16)
+    for i in 1 to width {
+        let r: i32 = (M_Random() % 3) - 1
+        melt_y[i] = melt_y[i - 1] + r
+        if melt_y[i] > 0 {
+            melt_y[i] = 0
+        } elif melt_y[i] == 0 - 16 {
+            melt_y[i] = 0 - 15
+        }
+    }
+    return 0
+}
+
+function wipe_doMelt(width_in: i32, height: i32, ticks_in: i32) -> i32 {
+    let mut width: i32 = width_in / 2
+    let mut ticks: i32 = ticks_in
+    let mut done: i32 = 1
+
+    let end_s: ptr<i16> = wipe_scr_end as ptr<i16>
+    let start_s: ptr<i16> = wipe_scr_start as ptr<i16>
+    let scr_s: ptr<i16> = wipe_scr as ptr<i16>
+
+    while ticks > 0 {
+        ticks = ticks - 1
+        for i in 0 to width {
+            if melt_y[i] < 0 {
+                melt_y[i] = melt_y[i] + 1
+                done = 0
+            } elif melt_y[i] < height {
+                let mut dy: i32 = 8
+                if melt_y[i] < 16 {
+                    dy = melt_y[i] + 1
+                }
+                if melt_y[i] + dy >= height {
+                    dy = height - melt_y[i]
+                }
+
+                let mut s_idx: i32 = i * height + melt_y[i]
+                let mut d_idx: i32 = melt_y[i] * width + i
+                for _j in 0 to dy {
+                    scr_s[d_idx] = end_s[s_idx]
+                    s_idx = s_idx + 1
+                    d_idx = d_idx + width
+                }
+
+                melt_y[i] = melt_y[i] + dy
+
+                s_idx = i * height
+                d_idx = melt_y[i] * width + i
+                let remain: i32 = height - melt_y[i]
+                for _k in 0 to remain {
+                    scr_s[d_idx] = start_s[s_idx]
+                    s_idx = s_idx + 1
+                    d_idx = d_idx + width
+                }
+                done = 0
+            }
+        }
+    }
+    return done
+}
+
+function wipe_exitMelt(width: i32, height: i32, ticks: i32) -> i32 {
+    Z_Free(melt_y as ptr<void>)
+    Z_Free(wipe_scr_start as ptr<void>)
+    Z_Free(wipe_scr_end as ptr<void>)
+    return 0
+}
+
+function wipe_dispatch_init(wipeno: i32, width: i32, height: i32, ticks: i32) -> i32 {
+    if wipeno == WIPE_COLOR_XFORM {
+        return wipe_initColorXForm(width, height, ticks)
+    }
+    return wipe_initMelt(width, height, ticks)
+}
+
+function wipe_dispatch_do(wipeno: i32, width: i32, height: i32, ticks: i32) -> i32 {
+    if wipeno == WIPE_COLOR_XFORM {
+        return wipe_doColorXForm(width, height, ticks)
+    }
+    return wipe_doMelt(width, height, ticks)
+}
+
+function wipe_dispatch_exit(wipeno: i32, width: i32, height: i32, ticks: i32) -> i32 {
+    if wipeno == WIPE_COLOR_XFORM {
+        return wipe_exitColorXForm(width, height, ticks)
+    }
+    return wipe_exitMelt(width, height, ticks)
+}
+
+@flow_api
+function wipe_StartScreen(x: i32, y: i32, width: i32, height: i32) -> i32 {
+    wipe_scr_start = Z_Malloc(WIPE_SCREENWIDTH * WIPE_SCREENHEIGHT, WIPE_PU_STATIC, null) as ptr<u8>
+    I_ReadScreen(wipe_scr_start)
+    return 0
+}
+
+@flow_api
+function wipe_EndScreen(x: i32, y: i32, width: i32, height: i32) -> i32 {
+    wipe_scr_end = Z_Malloc(WIPE_SCREENWIDTH * WIPE_SCREENHEIGHT, WIPE_PU_STATIC, null) as ptr<u8>
+    I_ReadScreen(wipe_scr_end)
+    V_DrawBlock(x, y, width, height, wipe_scr_start)
+    return 0
+}
+
+@flow_api
+function wipe_ScreenWipe(wipeno: i32, x: i32, y: i32, width: i32, height: i32, ticks: i32) -> i32 {
+    # initial stuff
+    if wipe_go == 0 {
+        wipe_go = 1
+        wipe_scr = VIDEO_buffer()
+        wipe_dispatch_init(wipeno, width, height, ticks)
+    }
+
+    # do a piece of wipe-in
+    V_MarkRect(0, 0, width, height)
+    let rc: i32 = wipe_dispatch_do(wipeno, width, height, ticks)
+
+    # final stuff
+    if rc != 0 {
+        wipe_go = 0
+        wipe_dispatch_exit(wipeno, width, height, ticks)
+    }
+
+    if wipe_go == 0 {
+        return 1
+    }
+    return 0
+}

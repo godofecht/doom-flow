@@ -1,0 +1,361 @@
+# Line-of-sight / visibility checks, ported from p_sight.c to Flow.
+#
+# Uses the REJECT table for trivial rejection, then walks the BSP with
+# a 2D trace from t1's eyes to t2, tightening topslope/bottomslope at
+# two-sided openings.
+#
+# Engine structs stay C-owned; map geometry via setupshim_* / GEOM_*.
+# topslope / bottomslope are Flow-owned module state (shared with map.flow
+# through SIGHT_* @flow_api getters/setters).
+#
+# LP64 offsetof tables (verified with offsetof against doomgeneric headers):
+#
+#   mobj_t (sizeof 224)
+#     thinker 0, x 24, y 28, z 32, snext 40, sprev 48, angle 56,
+#     sprite 60, frame 64, bnext 72, bprev 80, subsector 88,
+#     floorz 96, ceilingz 100, radius 104, height 108,
+#     momx 112, momy 116, momz 120, validcount 124, type 128,
+#     info 136, tics 144, state 152, flags 160, health 164,
+#     movedir 168, movecount 172, target 176, reactiontime 184,
+#     threshold 188, player 192, lastlook 200, spawnpoint 204,
+#     tracer 216
+#
+#   sector_t (sizeof 128)
+#     floorheight 0, ceilingheight 4, floorpic 8, ceilingpic 10,
+#     lightlevel 12, special 14, tag 16, soundtraversed 20,
+#     soundtarget 24, blockbox 32, soundorg 48, validcount 88,
+#     thinglist 96, specialdata 104, linecount 112, lines 120
+#
+#   subsector_t (sizeof 16)
+#     sector 0, numlines 8, firstline 10
+#
+#   seg_t (sizeof 56)
+#     v1 0, v2 8, offset 16, angle 20, sidedef 24, linedef 32,
+#     frontsector 40, backsector 48
+#
+#   line_t (sizeof 88)
+#     v1 0, v2 8, dx 16, dy 20, flags 24, special 26, tag 28,
+#     sidenum 30, bbox 36, slopetype 52, frontsector 56,
+#     backsector 64, validcount 72, specialdata 80
+#
+#   node_t (sizeof 52)
+#     x 0, y 4, dx 8, dy 12, bbox 16, children 48
+#
+#   vertex_t (sizeof 8): x 0, y 4
+#   divline_t (sizeof 16): x 0, y 4, dx 8, dy 12
+
+# ---- externs: fixed-point (fixp.flow, exact C names) ------------------
+
+extern { function FixedMul(a: i32, b: i32) -> i32 }
+extern { function FixedDiv(a: i32, b: i32) -> i32 }
+
+# ---- externs: setup (reject matrix, subsector/seg lookup) -------------
+
+extern { function GEOM_rejectmatrix() -> ptr<void> }
+extern { function GEOM_subsector(num: i32) -> ptr<void> }
+extern { function GEOM_seg(i: i32) -> ptr<void> }
+
+function sight_reject_byte(bytenum: i32) -> i32 {
+    let mat: ptr<u8> = GEOM_rejectmatrix() as ptr<u8>
+    return mat[bytenum] as i32
+}
+extern { function GEOM_seg_linedef(seg: ptr<void>) -> ptr<void> }
+extern { function GEOM_seg_frontsector(seg: ptr<void>) -> ptr<void> }
+extern { function GEOM_seg_backsector(seg: ptr<void>) -> ptr<void> }
+
+extern { function GEOM_numsectors() -> i32 }
+extern { function GEOM_numnodes() -> i32 }
+extern { function RMAIN_validcount() -> i32 }
+extern { function RMAIN_set_validcount(v: i32) -> void }
+extern { function GEOM_sector_index(sec: ptr<void>) -> i32 }
+
+extern { function MOBJ_x(m: ptr<void>) -> i32 }
+extern { function MOBJ_y(m: ptr<void>) -> i32 }
+extern { function MOBJ_z(m: ptr<void>) -> i32 }
+extern { function MOBJ_height(m: ptr<void>) -> i32 }
+extern { function MOBJ_subsector(m: ptr<void>) -> ptr<void> }
+
+extern { function GEOM_subsector_sector(ss: ptr<void>) -> ptr<void> }
+extern { function GEOM_subsector_numlines(ss: ptr<void>) -> i32 }
+extern { function GEOM_subsector_firstline(ss: ptr<void>) -> i32 }
+
+extern { function GEOM_sector_floorheight(s: ptr<void>) -> i32 }
+extern { function GEOM_sector_ceilingheight(s: ptr<void>) -> i32 }
+
+extern { function GEOM_node_i_x(i: i32) -> i32 }
+extern { function GEOM_node_i_y(i: i32) -> i32 }
+extern { function GEOM_node_i_dx(i: i32) -> i32 }
+extern { function GEOM_node_i_dy(i: i32) -> i32 }
+extern { function GEOM_node_i_child(i: i32, side: i32) -> i32 }
+extern { function GEOM_line_backsector(ld: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_flags(ld: ptr<void>) -> i32 }
+extern { function GEOM_line_v1(ld: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_v2(ld: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_set_validcount(ld: ptr<void>, v: i32) -> void }
+extern { function GEOM_line_validcount(ld: ptr<void>) -> i32 }
+extern { function GEOM_vertex_x(v: ptr<void>) -> i32 }
+extern { function GEOM_vertex_y(v: ptr<void>) -> i32 }
+
+# ---- constants (doomdata.h / m_fixed.h) --------------------------------
+
+const SIGHT_FRACBITS: i32 = 16
+const SIGHT_ML_TWOSIDED: i32 = 4       # doomdata.h ML_TWOSIDED
+const SIGHT_NF_SUBSECTOR: i32 = 32768  # doomdata.h NF_SUBSECTOR 0x8000
+
+# ---- private module state (was file-static in p_sight.c) --------------
+
+let mut sightzstart: i32 = 0
+let mut strace_x: i32 = 0
+let mut strace_y: i32 = 0
+let mut strace_dx: i32 = 0
+let mut strace_dy: i32 = 0
+let mut t2x: i32 = 0
+let mut t2y: i32 = 0
+let mut sightcounts0: i32 = 0
+let mut sightcounts1: i32 = 0
+
+let mut topslope: i32 = 0
+let mut bottomslope: i32 = 0
+
+@flow_api
+function SIGHT_topslope() -> i32 { return topslope }
+@flow_api
+function SIGHT_set_topslope(v: i32) -> void { topslope = v }
+@flow_api
+function SIGHT_bottomslope() -> i32 { return bottomslope }
+@flow_api
+function SIGHT_set_bottomslope(v: i32) -> void { bottomslope = v }
+
+# ---- P_DivlineSide ----------------------------------------------------
+# Returns side 0 (front), 1 (back), or 2 (on).
+# Preserves the vanilla quirk: when node.dy==0, the on-line test compares
+# x==node.y (not y==node.y).
+
+function P_DivlineSide(x: i32, y: i32, nx: i32, ny: i32, ndx: i32, ndy: i32) -> i32 {
+    if ndx == 0 {
+        if x == nx {
+            return 2
+        }
+        if x <= nx {
+            if ndy > 0 {
+                return 1
+            }
+            return 0
+        }
+        if ndy < 0 {
+            return 1
+        }
+        return 0
+    }
+
+    if ndy == 0 {
+        # Vanilla bug preserved: compares x to node->y.
+        if x == ny {
+            return 2
+        }
+        if y <= ny {
+            if ndx < 0 {
+                return 1
+            }
+            return 0
+        }
+        if ndx > 0 {
+            return 1
+        }
+        return 0
+    }
+
+    let dx: i32 = x - nx
+    let dy: i32 = y - ny
+    let left: i32 = (ndy >> SIGHT_FRACBITS) * (dx >> SIGHT_FRACBITS)
+    let right: i32 = (dy >> SIGHT_FRACBITS) * (ndx >> SIGHT_FRACBITS)
+
+    if right < left {
+        return 0
+    }
+    if left == right {
+        return 2
+    }
+    return 1
+}
+
+# ---- P_InterceptVector2 -----------------------------------------------
+
+function P_InterceptVector2(v2x: i32, v2y: i32, v2dx: i32, v2dy: i32,
+                            v1x: i32, v1y: i32, v1dx: i32, v1dy: i32) -> i32 {
+    let den: i32 = FixedMul(v1dy >> 8, v2dx) - FixedMul(v1dx >> 8, v2dy)
+    if den == 0 {
+        return 0
+    }
+    let num: i32 = FixedMul((v1x - v2x) >> 8, v1dy) + FixedMul((v2y - v1y) >> 8, v1dx)
+    return FixedDiv(num, den)
+}
+
+# ---- P_CrossSubsector -------------------------------------------------
+
+function P_CrossSubsector(num: i32) -> i32 {
+    let sub: ptr<void> = GEOM_subsector(num)
+    let mut count: i32 = GEOM_subsector_numlines(sub)
+    let mut segi: i32 = GEOM_subsector_firstline(sub)
+
+    while count != 0 {
+        let seg: ptr<void> = GEOM_seg(segi)
+        let line: ptr<void> = GEOM_seg_linedef(seg)
+
+        if GEOM_line_validcount(line) != RMAIN_validcount() {
+            GEOM_line_set_validcount(line, RMAIN_validcount())
+
+            let v1: ptr<void> = GEOM_line_v1(line)
+            let v2: ptr<void> = GEOM_line_v2(line)
+            let v1x: i32 = GEOM_vertex_x(v1)
+            let v1y: i32 = GEOM_vertex_y(v1)
+            let v2x: i32 = GEOM_vertex_x(v2)
+            let v2y: i32 = GEOM_vertex_y(v2)
+
+            let mut s1: i32 = P_DivlineSide(v1x, v1y, strace_x, strace_y, strace_dx, strace_dy)
+            let mut s2: i32 = P_DivlineSide(v2x, v2y, strace_x, strace_y, strace_dx, strace_dy)
+
+            if s1 != s2 {
+                let divl_x: i32 = v1x
+                let divl_y: i32 = v1y
+                let divl_dx: i32 = v2x - v1x
+                let divl_dy: i32 = v2y - v1y
+                s1 = P_DivlineSide(strace_x, strace_y, divl_x, divl_y, divl_dx, divl_dy)
+                s2 = P_DivlineSide(t2x, t2y, divl_x, divl_y, divl_dx, divl_dy)
+
+                if s1 != s2 {
+                    if (GEOM_line_backsector(line) as i64) == 0 {
+                        return 0
+                    }
+
+                    if (GEOM_line_flags(line) & SIGHT_ML_TWOSIDED) == 0 {
+                        return 0
+                    }
+
+                    let front: ptr<void> = GEOM_seg_frontsector(seg)
+                    let back: ptr<void> = GEOM_seg_backsector(seg)
+                    let ff: i32 = GEOM_sector_floorheight(front)
+                    let bf: i32 = GEOM_sector_floorheight(back)
+                    let fc: i32 = GEOM_sector_ceilingheight(front)
+                    let bc: i32 = GEOM_sector_ceilingheight(back)
+
+                    if ff != bf or fc != bc {
+                        let mut opentop: i32 = 0
+                        let mut openbottom: i32 = 0
+
+                        if fc < bc {
+                            opentop = fc
+                        } else {
+                            opentop = bc
+                        }
+
+                        if ff > bf {
+                            openbottom = ff
+                        } else {
+                            openbottom = bf
+                        }
+
+                        if openbottom >= opentop {
+                            return 0
+                        }
+
+                        let frac: i32 = P_InterceptVector2(
+                            strace_x, strace_y, strace_dx, strace_dy,
+                            divl_x, divl_y, divl_dx, divl_dy)
+
+                        if ff != bf {
+                            let slope: i32 = FixedDiv(openbottom - sightzstart, frac)
+                            if slope > SIGHT_bottomslope() {
+                                SIGHT_set_bottomslope(slope)
+                            }
+                        }
+
+                        if fc != bc {
+                            let slope2: i32 = FixedDiv(opentop - sightzstart, frac)
+                            if slope2 < SIGHT_topslope() {
+                                SIGHT_set_topslope(slope2)
+                            }
+                        }
+
+                        if SIGHT_topslope() <= SIGHT_bottomslope() {
+                            return 0
+                        }
+                    }
+                }
+            }
+        }
+
+        segi = segi + 1
+        count = count - 1
+    }
+
+    return 1
+}
+
+# ---- P_CrossBSPNode ---------------------------------------------------
+
+function P_CrossBSPNode(bspnum: i32) -> i32 {
+    if (bspnum & SIGHT_NF_SUBSECTOR) != 0 {
+        if bspnum == 0 - 1 {
+            return P_CrossSubsector(0)
+        }
+        return P_CrossSubsector(bspnum & (0 - 1 - SIGHT_NF_SUBSECTOR))
+    }
+
+    let nx: i32 = GEOM_node_i_x(bspnum)
+    let ny: i32 = GEOM_node_i_y(bspnum)
+    let ndx: i32 = GEOM_node_i_dx(bspnum)
+    let ndy: i32 = GEOM_node_i_dy(bspnum)
+
+    let mut side: i32 = P_DivlineSide(strace_x, strace_y, nx, ny, ndx, ndy)
+    if side == 2 {
+        side = 0
+    }
+
+    if P_CrossBSPNode(GEOM_node_i_child(bspnum, side)) == 0 {
+        return 0
+    }
+
+    if side == P_DivlineSide(t2x, t2y, nx, ny, ndx, ndy) {
+        return 1
+    }
+
+    return P_CrossBSPNode(GEOM_node_i_child(bspnum, side ^ 1))
+}
+
+# ---- P_CheckSight -----------------------------------------------------
+# Returns 1 if a straight line between t1 and t2 is unobstructed.
+
+@flow_api
+function P_CheckSight(t1: ptr<void>, t2: ptr<void>) -> i32 {
+    let ss1: ptr<void> = MOBJ_subsector(t1)
+    let ss2: ptr<void> = MOBJ_subsector(t2)
+    let s1: i32 = GEOM_sector_index(GEOM_subsector_sector(ss1))
+    let s2: i32 = GEOM_sector_index(GEOM_subsector_sector(ss2))
+    let pnum: i32 = s1 * GEOM_numsectors() + s2
+    let bytenum: i32 = pnum >> 3
+    let bitnum: i32 = 1 << (pnum & 7)
+
+    if (sight_reject_byte(bytenum) & bitnum) != 0 {
+        sightcounts0 = sightcounts0 + 1
+        return 0
+    }
+
+    sightcounts1 = sightcounts1 + 1
+    RMAIN_set_validcount(RMAIN_validcount() + 1)
+
+    let h1: i32 = MOBJ_height(t1)
+    sightzstart = MOBJ_z(t1) + h1 - (h1 >> 2)
+
+    SIGHT_set_topslope((MOBJ_z(t2) + MOBJ_height(t2)) - sightzstart)
+    SIGHT_set_bottomslope(MOBJ_z(t2) - sightzstart)
+
+    strace_x = MOBJ_x(t1)
+    strace_y = MOBJ_y(t1)
+    t2x = MOBJ_x(t2)
+    t2y = MOBJ_y(t2)
+    strace_dx = t2x - strace_x
+    strace_dy = t2y - strace_y
+
+    return P_CrossBSPNode(GEOM_numnodes() - 1)
+}

@@ -1,0 +1,63 @@
+# Hexen CD-audio interface, ported from i_cdmus.c to Flow.
+#
+# ORIGCODE (SDL CD-ROM) is off in this build, so every entry point is a
+# stub that returns success (0). cd_Error was extern in i_cdmus.h; with
+# no remaining C readers it lives here.
+
+let mut cd_Error: i32 = 0
+
+# i_cdmus.h error codes (unused by stubs; kept for header fidelity).
+const CDMUS_CDERR_NOTINSTALLED: i32 = 10
+const CDMUS_CDERR_NOAUDIOSUPPORT: i32 = 11
+const CDMUS_CDERR_NOAUDIOTRACKS: i32 = 12
+const CDMUS_CDERR_BADDRIVE: i32 = 20
+const CDMUS_CDERR_BADTRACK: i32 = 21
+const CDMUS_CDERR_IOCTLBUFFMEM: i32 = 22
+const CDMUS_CDERR_DEVREQBASE: i32 = 100
+
+@flow_api
+function I_CDMusInit() -> i32 {
+    return 0
+}
+
+@flow_api
+function I_CDMusPrintStartup() -> void {
+    return
+}
+
+@flow_api
+function I_CDMusPlay(track: i32) -> i32 {
+    return 0
+}
+
+@flow_api
+function I_CDMusStop() -> i32 {
+    return 0
+}
+
+@flow_api
+function I_CDMusResume() -> i32 {
+    return 0
+}
+
+@flow_api
+function I_CDMusSetVolume(volume: i32) -> i32 {
+    # Stub path still clears cd_Error (see i_cdmus.c without ORIGCODE).
+    cd_Error = 0
+    return 0
+}
+
+@flow_api
+function I_CDMusFirstTrack() -> i32 {
+    return 0
+}
+
+@flow_api
+function I_CDMusLastTrack() -> i32 {
+    return 0
+}
+
+@flow_api
+function I_CDMusTrackLength(track: i32) -> i32 {
+    return 0
+}

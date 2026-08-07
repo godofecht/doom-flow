@@ -1,0 +1,285 @@
+# DOOM ported to Flow.
+#
+# The doomgeneric engine core is fully Flow. Host ABI glue (C fnptr
+# call-through, errno, error popup) lives in Flow's runtime; this file
+# owns the window, main loop, keyboard edge detection / doomkey
+# translation, and framebuffer conversion from the engine's 32-bit XRGB
+# to packed RGB8 for gfx_blit_rgb.
+#
+# Controls:
+#   Arrows      turn / move
+#   W/A/S/D     move forward/back, strafe
+#   X or F      fire
+#   Space or E  use (doors, switches)
+#   1-7         weapons
+#   Tab         automap
+#   Esc         menu (quit through the menu, or close the window)
+#   Y/N, Enter  menu confirm / cancel
+#   F1-F10      help, save, load, quit
+
+import "stdlib/gfx.flow"
+import "platform.flow"
+import "wad.flow"
+import "fixp.flow"
+import "tables.flow"
+import "zone.flow"
+import "argv.flow"
+import "cheat.flow"
+import "timer.flow"
+import "event.flow"
+import "mode.flow"
+import "automap.flow"
+import "stbar.flow"
+import "video.flow"
+import "hud.flow"
+import "wipe.flow"
+import "sha1.flow"
+import "checksum.flow"
+import "memio.flow"
+import "controls.flow"
+import "sky.flow"
+import "statdump.flow"
+import "endoom.flow"
+import "cdmus.flow"
+import "dummy.flow"
+import "wmain.flow"
+import "items.flow"
+import "tick.flow"
+import "telept.flow"
+import "net.flow"
+import "finale.flow"
+import "sight.flow"
+import "game_state.flow"
+import "user.flow"
+import "lights.flow"
+import "plats.flow"
+import "ceiling.flow"
+import "doors.flow"
+import "floor.flow"
+import "switch.flow"
+import "sound.flow"
+import "misc.flow"
+import "maputl.flow"
+import "system.flow"
+import "joystick.flow"
+import "input.flow"
+import "isound.flow"
+import "iwad.flow"
+import "loop.flow"
+import "config.flow"
+import "inter.flow"
+import "pspr.flow"
+import "map.flow"
+import "rmain.flow"
+import "menu.flow"
+import "mobj.flow"
+import "enemy.flow"
+import "draw.flow"
+import "plane.flow"
+import "bsp.flow"
+import "segs.flow"
+import "things.flow"
+import "setup.flow"
+import "saveg.flow"
+import "wistuff.flow"
+import "ivideo.flow"
+import "rdata.flow"
+import "info.flow"
+import "spec.flow"
+import "dmain.flow"
+import "game.flow"
+
+extern { function dg_screen() -> ptr<u8> }
+extern { function dg_push_key(pressed: i32, key: i32) -> void }
+extern { function dg_resx() -> i32 }
+extern { function dg_resy() -> i32 }
+extern { function calloc(nmemb: i64, size: i64) -> ptr<void> }
+extern { function malloc(n: i64) -> ptr<void> }
+extern { function getenv(name: string) -> ptr<u8> }
+extern { function strlen(s: string) -> i64 }
+extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
+
+extern { function argvflow_set_args(argc: i32, argv: ptr<i64>) -> void }
+extern { function M_FindResponseFile() -> void }
+extern { function D_DoomMain() -> void }
+extern { function doomgeneric_Tick() -> void }
+
+# Bootstrap: was doomgeneric_Create/dg_create in dg_shim.c. Builds argv
+# ("doomflow" "-iwad" <wad> + DOOMFLOW_ARGS tokens split on spaces), same
+# as the C bootstrap, then hands off to M_FindResponseFile/D_DoomMain.
+function doom_bootstrap(wad: string) -> void {
+    let argv_buf: ptr<i64> = calloc(32, 8) as ptr<i64>
+    let mut argc: i32 = 0
+    argv_buf[argc] = "doomflow" as ptr<u8> as i64
+    argc = argc + 1
+    argv_buf[argc] = "-iwad" as ptr<u8> as i64
+    argc = argc + 1
+    argv_buf[argc] = wad as ptr<u8> as i64
+    argc = argc + 1
+
+    let extra: ptr<u8> = getenv("DOOMFLOW_ARGS")
+    if (extra as i64) != 0 and extra[0] as i32 != 0 {
+        let len: i64 = strlen(extra as string)
+        let buf: ptr<u8> = malloc(len + 1) as ptr<u8>
+        memcpy(buf as ptr<void>, extra as ptr<void>, len + 1)
+
+        let mut k: i64 = 0
+        while k < len and argc < 31 {
+            while k < len and buf[k] as i32 == 32 {
+                k = k + 1
+            }
+            if k < len {
+                argv_buf[argc] = (buf as i64) + k
+                argc = argc + 1
+                while k < len and buf[k] as i32 != 32 {
+                    k = k + 1
+                }
+                if k < len {
+                    buf[k] = 0 as u8
+                    k = k + 1
+                }
+            }
+        }
+    }
+    argv_buf[argc] = 0
+
+    argvflow_set_args(argc, argv_buf)
+    M_FindResponseFile()
+    D_DoomMain()
+}
+
+const NKEYS: i32 = 54
+
+# macOS NSEvent keyCodes, one per mapped key.
+let mut key_mac: array<i32, 54> = [
+    123, 124, 126, 125,
+    13, 1, 0, 2,
+    53, 36, 48, 49, 51,
+    7, 3, 14,
+    16, 45,
+    18, 19, 20, 21, 23, 22, 26,
+    27, 24,
+    122, 120, 99, 118, 96, 97, 98, 100, 101, 109,
+    12, 6, 8, 9, 11, 46, 17, 15, 5, 4, 34, 31, 35, 32, 38, 40, 37
+]
+
+# The doomkeys.h code each of those sends to the engine.
+let mut key_doom: array<i32, 54> = [
+    172, 174, 173, 175,
+    173, 175, 160, 161,
+    27, 13, 9, 162, 127,
+    163, 163, 162,
+    121, 110,
+    49, 50, 51, 52, 53, 54, 55,
+    45, 61,
+    187, 188, 189, 190, 191, 192, 193, 194, 195, 196,
+    113, 122, 99, 118, 98, 109, 116, 114, 103, 104, 105, 111, 112, 117, 106, 107, 108
+]
+
+# Previous frame's held state, for edge detection.
+let mut key_prev: array<i32, 54> = [
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 0, 0,
+    0, 0, 0,
+    0, 0,
+    0, 0, 0, 0, 0, 0, 0,
+    0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+# Scripted key injection for automated testing. DOOMFLOW_KEYSCRIPT is a
+# comma-separated list of frame:doomkey:updown triples, e.g.
+# "120:9:1,125:9:0" presses and releases Tab around frame 120.
+let mut keyscript: ptr<u8> = null
+let mut keyscript_pos: i32 = 0
+
+function keyscript_num(end_ch: i32) -> i32 {
+    let mut v: i32 = 0
+    while keyscript[keyscript_pos] as i32 >= 48 and keyscript[keyscript_pos] as i32 <= 57 {
+        v = v * 10 + (keyscript[keyscript_pos] as i32 - 48)
+        keyscript_pos = keyscript_pos + 1
+    }
+    if keyscript[keyscript_pos] as i32 == end_ch {
+        keyscript_pos = keyscript_pos + 1
+    }
+    return v
+}
+
+function pump_keyscript(frame: i32) -> void {
+    if (keyscript as i64) == 0 {
+        return
+    }
+    while keyscript[keyscript_pos] as i32 != 0 {
+        let save: i32 = keyscript_pos
+        let f: i32 = keyscript_num(58)
+        if f > frame {
+            keyscript_pos = save
+            return
+        }
+        let k: i32 = keyscript_num(58)
+        let d: i32 = keyscript_num(44)
+        dg_push_key(d, k)
+    }
+}
+
+# Push key transitions to the engine's queue. Only edges are sent, so a
+# held key stays down engine-side until its release arrives.
+function pump_keys(g: Gfx) -> void {
+    let mut i: i32 = 0
+    while i < NKEYS {
+        let mut now: i32 = 0
+        if gfx_key_down(g, key_mac[i]) {
+            now = 1
+        }
+        if now != key_prev[i] {
+            dg_push_key(now, key_doom[i])
+            key_prev[i] = now
+        }
+        i = i + 1
+    }
+}
+
+# Engine framebuffer is 32-bit XRGB (little-endian memory order B, G, R, X).
+# gfx_blit_rgb wants packed RGB8.
+function convert_frame(src: ptr<u8>, dst: ptr<u8>, npix: i32) -> void {
+    let mut i: i32 = 0
+    while i < npix {
+        let s: i32 = i * 4
+        let d: i32 = i * 3
+        dst[d] = src[s + 2]
+        dst[d + 1] = src[s + 1]
+        dst[d + 2] = src[s]
+        i = i + 1
+    }
+}
+
+function main() -> i32 {
+    let w: i32 = dg_resx()
+    let h: i32 = dg_resy()
+    let g: Gfx = gfx_open(w, h, "DOOM (Flow)")
+
+    doom_bootstrap("doom1.wad")
+
+    let npix: i32 = w * h
+    let fb: ptr<u8> = calloc((npix * 3) as i64, 1) as ptr<u8>
+    let src: ptr<u8> = dg_screen()
+
+    keyscript = getenv("DOOMFLOW_KEYSCRIPT")
+    let mut frame: i32 = 0
+
+    while !gfx_should_close(g) {
+        gfx_poll(g)
+        pump_keys(g)
+        pump_keyscript(frame)
+        frame = frame + 1
+        doomgeneric_Tick()
+        convert_frame(src, fb, npix)
+        gfx_blit_rgb(g, 0, 0, w, h, fb)
+        gfx_present(g)
+    }
+
+    gfx_close(g)
+    return 0
+}

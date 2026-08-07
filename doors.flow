@@ -1,0 +1,496 @@
+# Vertical doors, ported from p_doors.c to Flow.
+#
+# vldoor_t layout on LP64 (verified with offsetof):
+#
+#   thinker_t thinker;       offset  0   (sizeof 24: prev, next, function)
+#   vldoor_e  type;          offset 24
+#   (4 bytes padding)               28
+#   sector_t *sector;        offset 32
+#   fixed_t   topheight;     offset 40
+#   fixed_t   speed;         offset 44
+#   int       direction;     offset 48
+#   int       topwait;       offset 52
+#   int       topcountdown;  offset 56
+#                       sizeof = 64
+#
+# thinker.function.acp1 lives at thinker+16. Engine structs (sector_t,
+# line_t, mobj_t, player_t, plat_t) use GEOM_*/MOBJ_*/PLAT_* APIs.
+# Sliding-door code is #if 0 in the C original and is omitted.
+
+extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
+extern { function P_AddThinker(thinker: ptr<void>) -> void }
+extern { function P_RemoveThinker(thinker: ptr<void>) -> void }
+extern { function P_FindSectorFromLineTag(line: ptr<void>, start: i32) -> i32 }
+extern { function P_FindLowestCeilingSurrounding(sec: ptr<void>) -> i32 }
+extern { function T_MovePlane(sector: ptr<void>, speed: i32, dest: i32, crush: i32, floorOrCeiling: i32, direction: i32) -> i32 }
+extern { function S_StartSound(origin: ptr<void>, sound_id: i32) -> void }
+
+extern { function GEOM_sector(secnum: i32) -> ptr<void> }
+extern { function GEOM_sector_floorheight(sec: ptr<void>) -> i32 }
+extern { function GEOM_sector_ceilingheight(sec: ptr<void>) -> i32 }
+extern { function GEOM_sector_specialdata(sec: ptr<void>) -> ptr<void> }
+extern { function GEOM_sector_set_specialdata(sec: ptr<void>, p: ptr<void>) -> void }
+extern { function GEOM_sector_set_special(sec: ptr<void>, v: i32) -> void }
+extern { function GEOM_sector_soundorg(sec: ptr<void>) -> ptr<void> }
+extern { function GEOM_line_sidenum(ld: ptr<void>, side: i32) -> i32 }
+extern { function GEOM_side_i_sector(i: i32) -> ptr<void> }
+extern { function MOBJ_player(thing: ptr<void>) -> ptr<void> }
+extern { function PLAYER_card(p: ptr<void>, c: i32) -> i32 }
+extern { function THINKER_set_vertical_door(door: ptr<void>) -> void }
+extern { function THINKER_is_vertical_door(th: ptr<void>) -> i32 }
+extern { function THINKER_is_plat_raise(th: ptr<void>) -> i32 }
+extern { function PLAT_set_wait(obj: ptr<void>, v: i32) -> void }
+extern { function specshim_stderr_msg(msg: string) -> void }
+extern { function GEOM_line_set_special(ld: ptr<void>, v: i32) -> void }
+extern { function GEOM_line_special(ld: ptr<void>) -> i32 }
+extern { function PLAYER_set_message(p: ptr<void>, msg: string) -> void }
+
+# Constants from p_spec.h / m_fixed.h / i_timer.h / z_zone.h / sounds.h /
+# doomdef.h / dstrings.h (d_englsh.h). Prefixed DOOR_ per porting rule.
+const DOOR_SIZEOF_VLDOOR: i32 = 64
+const DOOR_PU_LEVSPEC: i32 = 6
+const DOOR_FRACUNIT: i32 = 65536
+const DOOR_TICRATE: i32 = 35
+const DOOR_VDOORSPEED: i32 = 131072       # FRACUNIT*2
+const DOOR_VDOORWAIT: i32 = 150
+
+# vldoor_e
+const DOOR_VLD_NORMAL: i32 = 0
+const DOOR_VLD_CLOSE30THENOPEN: i32 = 1
+const DOOR_VLD_CLOSE: i32 = 2
+const DOOR_VLD_OPEN: i32 = 3
+const DOOR_VLD_RAISEIN5MINS: i32 = 4
+const DOOR_VLD_BLAZERAISE: i32 = 5
+const DOOR_VLD_BLAZEOPEN: i32 = 6
+const DOOR_VLD_BLAZECLOSE: i32 = 7
+
+# result_e (from T_MovePlane)
+const DOOR_RES_OK: i32 = 0
+const DOOR_RES_CRUSHED: i32 = 1
+const DOOR_RES_PASTDEST: i32 = 2
+
+# card_t
+const DOOR_IT_BLUECARD: i32 = 0
+const DOOR_IT_YELLOWCARD: i32 = 1
+const DOOR_IT_REDCARD: i32 = 2
+const DOOR_IT_BLUESKULL: i32 = 3
+const DOOR_IT_YELLOWSKULL: i32 = 4
+const DOOR_IT_REDSKULL: i32 = 5
+
+# sfxenum_t
+const DOOR_SFX_DOROPN: i32 = 20
+const DOOR_SFX_DORCLS: i32 = 21
+const DOOR_SFX_OOF: i32 = 34
+const DOOR_SFX_BDOPN: i32 = 88
+const DOOR_SFX_BDCLS: i32 = 89
+
+# ---- vldoor_t field access by explicit layout -------------------------
+
+function door_type(d: ptr<u8>) -> i32 {
+    let p: ptr<i32> = ((d as i64) + 24) as ptr<i32>
+    return p[0]
+}
+
+function door_set_type(d: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((d as i64) + 24) as ptr<i32>
+    p[0] = v
+}
+
+function door_sector(d: ptr<u8>) -> ptr<void> {
+    let p: ptr<i64> = ((d as i64) + 32) as ptr<i64>
+    return p[0] as ptr<void>
+}
+
+function door_set_sector(d: ptr<u8>, sec: ptr<void>) -> void {
+    let p: ptr<i64> = ((d as i64) + 32) as ptr<i64>
+    p[0] = sec as i64
+}
+
+function door_topheight(d: ptr<u8>) -> i32 {
+    let p: ptr<i32> = ((d as i64) + 40) as ptr<i32>
+    return p[0]
+}
+
+function door_set_topheight(d: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((d as i64) + 40) as ptr<i32>
+    p[0] = v
+}
+
+function door_speed(d: ptr<u8>) -> i32 {
+    let p: ptr<i32> = ((d as i64) + 44) as ptr<i32>
+    return p[0]
+}
+
+function door_set_speed(d: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((d as i64) + 44) as ptr<i32>
+    p[0] = v
+}
+
+function door_direction(d: ptr<u8>) -> i32 {
+    let p: ptr<i32> = ((d as i64) + 48) as ptr<i32>
+    return p[0]
+}
+
+function door_set_direction(d: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((d as i64) + 48) as ptr<i32>
+    p[0] = v
+}
+
+function door_topwait(d: ptr<u8>) -> i32 {
+    let p: ptr<i32> = ((d as i64) + 52) as ptr<i32>
+    return p[0]
+}
+
+function door_set_topwait(d: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((d as i64) + 52) as ptr<i32>
+    p[0] = v
+}
+
+function door_topcountdown(d: ptr<u8>) -> i32 {
+    let p: ptr<i32> = ((d as i64) + 56) as ptr<i32>
+    return p[0]
+}
+
+function door_set_topcountdown(d: ptr<u8>, v: i32) -> void {
+    let p: ptr<i32> = ((d as i64) + 56) as ptr<i32>
+    p[0] = v
+}
+
+# ---- T_VerticalDoor ---------------------------------------------------
+
+@flow_api
+function T_VerticalDoor(door: ptr<void>) -> void {
+    let d: ptr<u8> = door as ptr<u8>
+    let sec: ptr<void> = door_sector(d)
+    let dir: i32 = door_direction(d)
+    let typ: i32 = door_type(d)
+    let mut res: i32 = DOOR_RES_OK
+
+    if dir == 0 {
+        # WAITING
+        door_set_topcountdown(d, door_topcountdown(d) - 1)
+        if door_topcountdown(d) == 0 {
+            if typ == DOOR_VLD_BLAZERAISE {
+                door_set_direction(d, 0 - 1)
+                S_StartSound(GEOM_sector_soundorg(sec), DOOR_SFX_BDCLS)
+            } else {
+                if typ == DOOR_VLD_NORMAL {
+                    door_set_direction(d, 0 - 1)
+                    S_StartSound(GEOM_sector_soundorg(sec), DOOR_SFX_DORCLS)
+                } else {
+                    if typ == DOOR_VLD_CLOSE30THENOPEN {
+                        door_set_direction(d, 1)
+                        S_StartSound(GEOM_sector_soundorg(sec), DOOR_SFX_DOROPN)
+                    }
+                }
+            }
+        }
+    } else {
+        if dir == 2 {
+            # INITIAL WAIT
+            door_set_topcountdown(d, door_topcountdown(d) - 1)
+            if door_topcountdown(d) == 0 {
+                if typ == DOOR_VLD_RAISEIN5MINS {
+                    door_set_direction(d, 1)
+                    door_set_type(d, DOOR_VLD_NORMAL)
+                    S_StartSound(GEOM_sector_soundorg(sec), DOOR_SFX_DOROPN)
+                }
+            }
+        } else {
+            if dir == 0 - 1 {
+                # DOWN
+                res = T_MovePlane(sec, door_speed(d), GEOM_sector_floorheight(sec), 0, 1, dir)
+                if res == DOOR_RES_PASTDEST {
+                    if typ == DOOR_VLD_BLAZERAISE or typ == DOOR_VLD_BLAZECLOSE {
+                        GEOM_sector_set_specialdata(sec, null)
+                        P_RemoveThinker(door)
+                        S_StartSound(GEOM_sector_soundorg(sec), DOOR_SFX_BDCLS)
+                    } else {
+                        if typ == DOOR_VLD_NORMAL or typ == DOOR_VLD_CLOSE {
+                            GEOM_sector_set_specialdata(sec, null)
+                            P_RemoveThinker(door)
+                        } else {
+                            if typ == DOOR_VLD_CLOSE30THENOPEN {
+                                door_set_direction(d, 0)
+                                door_set_topcountdown(d, DOOR_TICRATE * 30)
+                            }
+                        }
+                    }
+                } else {
+                    if res == DOOR_RES_CRUSHED {
+                        # blazeClose / close: DO NOT GO BACK UP
+                        if !(typ == DOOR_VLD_BLAZECLOSE or typ == DOOR_VLD_CLOSE) {
+                            door_set_direction(d, 1)
+                            S_StartSound(GEOM_sector_soundorg(sec), DOOR_SFX_DOROPN)
+                        }
+                    }
+                }
+            } else {
+                if dir == 1 {
+                    # UP
+                    res = T_MovePlane(sec, door_speed(d), door_topheight(d), 0, 1, dir)
+                    if res == DOOR_RES_PASTDEST {
+                        if typ == DOOR_VLD_BLAZERAISE or typ == DOOR_VLD_NORMAL {
+                            door_set_direction(d, 0)
+                            door_set_topcountdown(d, door_topwait(d))
+                        } else {
+                            if typ == DOOR_VLD_CLOSE30THENOPEN or typ == DOOR_VLD_BLAZEOPEN or typ == DOOR_VLD_OPEN {
+                                GEOM_sector_set_specialdata(sec, null)
+                                P_RemoveThinker(door)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+# ---- EV_DoDoor --------------------------------------------------------
+
+@flow_api
+function EV_DoDoor(line: ptr<void>, doortype: i32) -> i32 {
+    let mut secnum: i32 = 0 - 1
+    let mut rtn: i32 = 0
+
+    secnum = P_FindSectorFromLineTag(line, secnum)
+    while secnum >= 0 {
+        let sec: ptr<void> = GEOM_sector(secnum)
+        if (GEOM_sector_specialdata(sec) as i64) == 0 {
+            rtn = 1
+            let door: ptr<void> = Z_Malloc(DOOR_SIZEOF_VLDOOR, DOOR_PU_LEVSPEC, null)
+            let d: ptr<u8> = door as ptr<u8>
+            P_AddThinker(door)
+            GEOM_sector_set_specialdata(sec, door)
+            THINKER_set_vertical_door(door)
+            door_set_sector(d, sec)
+            door_set_type(d, doortype)
+            door_set_topwait(d, DOOR_VDOORWAIT)
+            door_set_speed(d, DOOR_VDOORSPEED)
+
+            if doortype == DOOR_VLD_BLAZECLOSE {
+                door_set_topheight(d, P_FindLowestCeilingSurrounding(sec) - 4 * DOOR_FRACUNIT)
+                door_set_direction(d, 0 - 1)
+                door_set_speed(d, DOOR_VDOORSPEED * 4)
+                S_StartSound(GEOM_sector_soundorg(sec), DOOR_SFX_BDCLS)
+            } else {
+                if doortype == DOOR_VLD_CLOSE {
+                    door_set_topheight(d, P_FindLowestCeilingSurrounding(sec) - 4 * DOOR_FRACUNIT)
+                    door_set_direction(d, 0 - 1)
+                    S_StartSound(GEOM_sector_soundorg(sec), DOOR_SFX_DORCLS)
+                } else {
+                    if doortype == DOOR_VLD_CLOSE30THENOPEN {
+                        door_set_topheight(d, GEOM_sector_ceilingheight(sec))
+                        door_set_direction(d, 0 - 1)
+                        S_StartSound(GEOM_sector_soundorg(sec), DOOR_SFX_DORCLS)
+                    } else {
+                        if doortype == DOOR_VLD_BLAZERAISE or doortype == DOOR_VLD_BLAZEOPEN {
+                            door_set_direction(d, 1)
+                            door_set_topheight(d, P_FindLowestCeilingSurrounding(sec) - 4 * DOOR_FRACUNIT)
+                            door_set_speed(d, DOOR_VDOORSPEED * 4)
+                            if door_topheight(d) != GEOM_sector_ceilingheight(sec) {
+                                S_StartSound(GEOM_sector_soundorg(sec), DOOR_SFX_BDOPN)
+                            }
+                        } else {
+                            if doortype == DOOR_VLD_NORMAL or doortype == DOOR_VLD_OPEN {
+                                door_set_direction(d, 1)
+                                door_set_topheight(d, P_FindLowestCeilingSurrounding(sec) - 4 * DOOR_FRACUNIT)
+                                if door_topheight(d) != GEOM_sector_ceilingheight(sec) {
+                                    S_StartSound(GEOM_sector_soundorg(sec), DOOR_SFX_DOROPN)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        secnum = P_FindSectorFromLineTag(line, secnum)
+    }
+    return rtn
+}
+
+# ---- EV_DoLockedDoor --------------------------------------------------
+
+@flow_api
+function EV_DoLockedDoor(line: ptr<void>, doortype: i32, thing: ptr<void>) -> i32 {
+    let p: ptr<void> = MOBJ_player(thing)
+    if (p as i64) == 0 {
+        return 0
+    }
+
+    let special: i32 = GEOM_line_special(line)
+
+    if special == 99 or special == 133 {
+        if PLAYER_card(p, DOOR_IT_BLUECARD) == 0 and PLAYER_card(p, DOOR_IT_BLUESKULL) == 0 {
+            PLAYER_set_message(p, "You need a blue key to activate this object")
+            S_StartSound(null, DOOR_SFX_OOF)
+            return 0
+        }
+    } else {
+        if special == 134 or special == 135 {
+            if PLAYER_card(p, DOOR_IT_REDCARD) == 0 and PLAYER_card(p, DOOR_IT_REDSKULL) == 0 {
+                PLAYER_set_message(p, "You need a red key to activate this object")
+                S_StartSound(null, DOOR_SFX_OOF)
+                return 0
+            }
+        } else {
+            if special == 136 or special == 137 {
+                if PLAYER_card(p, DOOR_IT_YELLOWCARD) == 0 and PLAYER_card(p, DOOR_IT_YELLOWSKULL) == 0 {
+                    PLAYER_set_message(p, "You need a yellow key to activate this object")
+                    S_StartSound(null, DOOR_SFX_OOF)
+                    return 0
+                }
+            }
+        }
+    }
+
+    return EV_DoDoor(line, doortype)
+}
+
+# ---- EV_VerticalDoor --------------------------------------------------
+
+@flow_api
+function EV_VerticalDoor(line: ptr<void>, thing: ptr<void>) -> void {
+    let side: i32 = 0
+    let player: ptr<void> = MOBJ_player(thing)
+    let special: i32 = GEOM_line_special(line)
+
+    # Check for locks
+    if special == 26 or special == 32 {
+        if (player as i64) == 0 {
+            return
+        }
+        if PLAYER_card(player, DOOR_IT_BLUECARD) == 0 and PLAYER_card(player, DOOR_IT_BLUESKULL) == 0 {
+            PLAYER_set_message(player, "You need a blue key to open this door")
+            S_StartSound(null, DOOR_SFX_OOF)
+            return
+        }
+    } else {
+        if special == 27 or special == 34 {
+            if (player as i64) == 0 {
+                return
+            }
+            if PLAYER_card(player, DOOR_IT_YELLOWCARD) == 0 and PLAYER_card(player, DOOR_IT_YELLOWSKULL) == 0 {
+                PLAYER_set_message(player, "You need a yellow key to open this door")
+                S_StartSound(null, DOOR_SFX_OOF)
+                return
+            }
+        } else {
+            if special == 28 or special == 33 {
+                if (player as i64) == 0 {
+                    return
+                }
+                if PLAYER_card(player, DOOR_IT_REDCARD) == 0 and PLAYER_card(player, DOOR_IT_REDSKULL) == 0 {
+                    PLAYER_set_message(player, "You need a red key to open this door")
+                    S_StartSound(null, DOOR_SFX_OOF)
+                    return
+                }
+            }
+        }
+    }
+
+    let sec: ptr<void> = GEOM_side_i_sector(GEOM_line_sidenum(line, side ^ 1))
+    let sd: ptr<void> = GEOM_sector_specialdata(sec)
+
+    if (sd as i64) != 0 {
+        let d: ptr<u8> = sd as ptr<u8>
+        if special == 1 or special == 26 or special == 27 or special == 28 or special == 117 {
+            if door_direction(d) == 0 - 1 {
+                door_set_direction(d, 1)
+            } else {
+                if (MOBJ_player(thing) as i64) == 0 {
+                    return
+                }
+                if THINKER_is_vertical_door(sd) != 0 {
+                    door_set_direction(d, 0 - 1)
+                } else {
+                    if THINKER_is_plat_raise(sd) != 0 {
+                        PLAT_set_wait(sd, 0 - 1)
+                    } else {
+                        specshim_stderr_msg("EV_VerticalDoor: Tried to close something that wasn't a door.\n")
+                        door_set_direction(d, 0 - 1)
+                    }
+                }
+            }
+            return
+        }
+    }
+
+    # for proper sound
+    if special == 117 or special == 118 {
+        S_StartSound(GEOM_sector_soundorg(sec), DOOR_SFX_BDOPN)
+    } else {
+        if special == 1 or special == 31 {
+            S_StartSound(GEOM_sector_soundorg(sec), DOOR_SFX_DOROPN)
+        } else {
+            S_StartSound(GEOM_sector_soundorg(sec), DOOR_SFX_DOROPN)
+        }
+    }
+
+    # new door thinker
+    let door: ptr<void> = Z_Malloc(DOOR_SIZEOF_VLDOOR, DOOR_PU_LEVSPEC, null)
+    let d2: ptr<u8> = door as ptr<u8>
+    P_AddThinker(door)
+    GEOM_sector_set_specialdata(sec, door)
+    THINKER_set_vertical_door(door)
+    door_set_sector(d2, sec)
+    door_set_direction(d2, 1)
+    door_set_speed(d2, DOOR_VDOORSPEED)
+    door_set_topwait(d2, DOOR_VDOORWAIT)
+
+    if special == 1 or special == 26 or special == 27 or special == 28 {
+        door_set_type(d2, DOOR_VLD_NORMAL)
+    } else {
+        if special == 31 or special == 32 or special == 33 or special == 34 {
+            door_set_type(d2, DOOR_VLD_OPEN)
+            GEOM_line_set_special(line, 0)
+        } else {
+            if special == 117 {
+                door_set_type(d2, DOOR_VLD_BLAZERAISE)
+                door_set_speed(d2, DOOR_VDOORSPEED * 4)
+            } else {
+                if special == 118 {
+                    door_set_type(d2, DOOR_VLD_BLAZEOPEN)
+                    GEOM_line_set_special(line, 0)
+                    door_set_speed(d2, DOOR_VDOORSPEED * 4)
+                }
+            }
+        }
+    }
+
+    door_set_topheight(d2, P_FindLowestCeilingSurrounding(sec) - 4 * DOOR_FRACUNIT)
+}
+
+# ---- spawn helpers ----------------------------------------------------
+
+@flow_api
+function P_SpawnDoorCloseIn30(sec: ptr<void>) -> void {
+    let door: ptr<void> = Z_Malloc(DOOR_SIZEOF_VLDOOR, DOOR_PU_LEVSPEC, null)
+    let d: ptr<u8> = door as ptr<u8>
+    P_AddThinker(door)
+    GEOM_sector_set_specialdata(sec, door)
+    GEOM_sector_set_special(sec, 0)
+    THINKER_set_vertical_door(door)
+    door_set_sector(d, sec)
+    door_set_direction(d, 0)
+    door_set_type(d, DOOR_VLD_NORMAL)
+    door_set_speed(d, DOOR_VDOORSPEED)
+    door_set_topcountdown(d, 30 * DOOR_TICRATE)
+}
+
+@flow_api
+function P_SpawnDoorRaiseIn5Mins(sec: ptr<void>, secnum: i32) -> void {
+    let door: ptr<void> = Z_Malloc(DOOR_SIZEOF_VLDOOR, DOOR_PU_LEVSPEC, null)
+    let d: ptr<u8> = door as ptr<u8>
+    P_AddThinker(door)
+    GEOM_sector_set_specialdata(sec, door)
+    GEOM_sector_set_special(sec, 0)
+    THINKER_set_vertical_door(door)
+    door_set_sector(d, sec)
+    door_set_direction(d, 2)
+    door_set_type(d, DOOR_VLD_RAISEIN5MINS)
+    door_set_speed(d, DOOR_VDOORSPEED)
+    door_set_topheight(d, P_FindLowestCeilingSurrounding(sec) - 4 * DOOR_FRACUNIT)
+    door_set_topwait(d, DOOR_VDOORWAIT)
+    door_set_topcountdown(d, 5 * 60 * DOOR_TICRATE)
+}

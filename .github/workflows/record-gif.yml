@@ -1,0 +1,44 @@
+name: Record gameplay GIF
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gif:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout doom-flow
+        uses: actions/checkout@v4
+
+      - name: Checkout Flow
+        uses: actions/checkout@v4
+        with:
+          repository: flooooooooooow/flow
+          path: flow
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang python3
+
+      - name: Record GIF via Flow gfx-record
+        env:
+          FLOW_DIR: ${{ github.workspace }}/flow
+        run: |
+          chmod +x scripts/record_gif.sh
+          ./scripts/record_gif.sh --frames 120 --skip 2 --fps 15 --width 320 \
+            --out media/doom.gif \
+            --args "-timedemo demo1"
+
+      - name: Upload gameplay GIF
+        uses: actions/upload-artifact@v4
+        with:
+          name: doom-flow-gameplay-gif
+          path: media/doom.gif
+          if-no-files-found: error
