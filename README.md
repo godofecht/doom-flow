@@ -6,9 +6,9 @@
 **Play:** [godofecht.github.io/doom-flow](https://godofecht.github.io/doom-flow/)
 
 Doom, rewritten in [Flow](https://github.com/flooooooooooow/flow).
-Native build and the browser demo both use Flow’s **C backend** today
-(`flow.transpiler --c` → clang / emcc). An **MLIR → LLVM → WASM** path is
-tracked upstream — not wired here yet (see below).
+Native build uses Flow’s **C backend**. The browser demo can build with
+**C → emcc** (default, what Pages ships) or **MLIR → LLVM → emcc**
+(`BACKEND=mlir`) once Flow tip includes epic [#221](https://github.com/flooooooooooow/flow/issues/221).
 
 ![Doom timedemo gameplay (CI GIF)](media/doom.gif)
 
@@ -23,8 +23,9 @@ tracked upstream — not wired here yet (see below).
 
 ```
 *.flow  ──flow.transpiler──►  C  ──clang──►  native (macOS gfx)
-                              │
-                              └──emcc + gfx_wasm.c──►  .wasm (GitHub Pages)
+         │
+         ├── --c ──────────►  emcc + gfx_wasm.c ──►  .wasm (Pages default)
+         └── --mlir --llvm ►  emcc + gfx_wasm.c ──►  .wasm (BACKEND=mlir)
 ```
 
 CI records the GIF with Flow’s headless gfx-record path
@@ -44,33 +45,32 @@ DOOMFLOW_ARGS="-timedemo demo1" ./build/doom   # must print: timed 5026 gametics
 ## Browser / WASM
 
 ```bash
-FLOW_DIR=~/flow ./scripts/build_wasm.sh
+FLOW_DIR=~/flow ./scripts/build_wasm.sh                 # C backend (Pages)
+FLOW_DIR=~/flow BACKEND=mlir ./scripts/build_wasm.sh    # MLIR → LLVM → emcc
 python3 -m http.server 8000 --directory site
 ```
 
 Pages modes: **Play**, **Watch AI** (`DOOMFLOW_AI` pilot), **RL Arena**.
 
-**Known quirks (C → emcc path):**
+**Known quirks (browser path):**
 - IWAD is preloaded (`doom.data` → `/doom1.wad`); TITLEPIC/HUD load.
 - **Audio is silent** — `FEATURE_SOUND` is off in this port.
 - Light tables must use native pointer width (wasm32 ≠ LP64); a hardcoded
   `* 8` row stride used to blank walls/sprites in dim areas.
 
-## MLIR WASM (upstream)
+Stock Flow (post-[#221](https://github.com/flooooooooooow/flow/issues/221)) can also build
+snake-class gfx + preload without this script:
 
-Goal: same `*.flow` → `./flow wasm --backend=mlir` with gfx + WAD preload,
-instead of the custom C/`emcc` script. Flow epic and blockers:
+```bash
+~/flow/flow wasm examples/games/snake_gfx.flow --backend=mlir
+~/flow/flow wasm prog.flow --backend=mlir \
+  --preload DOOM1.WAD@/doom1.wad \
+  --link runtime/flow_rt_support.c \
+  --initial-memory=64MB --asyncify-stack-size=65536
+```
 
-| | |
-| --- | --- |
-| Epic | [flow#221](https://github.com/flooooooooooow/flow/issues/221) |
-| `uN` → `iN` | [flow#222](https://github.com/flooooooooooow/flow/issues/222) |
-| null → `llvm.mlir.zero` | [flow#223](https://github.com/flooooooooooow/flow/issues/223) |
-| memref vs GEP | [flow#224](https://github.com/flooooooooooow/flow/issues/224) |
-| `--preload` / `--link` | [flow#225](https://github.com/flooooooooooow/flow/issues/225) |
-| Gallery roadmap | [discussion #226](https://github.com/flooooooooooow/flow/discussions/226) |
-
-Once snake-class gfx + preload pass on MLIR, dual-build here and A/B the Pages bundle.
+Doom itself still uses `scripts/build_wasm.sh` for the extra exported AI
+symbols (`_doomflow_set_ai` / `_doomflow_get_ai`) and `-DNORMALUNIX`.
 
 ## Record a GIF
 

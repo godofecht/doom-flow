@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # Build doom-flow (and the Q-DOOM watch agent) to WebAssembly for GitHub Pages.
 #
-# Flow's browser path today is:
-#   doom.flow  --(flow.transpiler --c)-->  build/wasm/*.c  --(emcc)-->  .wasm/.js
+# Flow browser path (selectable CPU backend):
+#   BACKEND=c    (default): doom.flow → C → emcc
+#   BACKEND=mlir           : doom.flow → MLIR → LLVM IR → emcc
 #
-# The .c is a throwaway intermediate (same as `./flow wasm` / `flow build-native`).
-# Source of truth stays the *.flow files. Intermediate C never ships in site/.
+# Both paths link gfx_wasm.c + flow_rt_support.c, preload DOOM1.WAD, and use
+# doom-scale ASYNCIFY / INITIAL_MEMORY. Intermediate .c / .ll never ships in site/.
 #
 # Requires: emcc on PATH, Flow checkout at FLOW_DIR (default ../flow).
+# Flow tip should include epic #221 / PR #229 (preload, link, MLIR gfx).
 #
 #   FLOW_DIR=~/flow ./scripts/build_wasm.sh
+#   FLOW_DIR=~/flow BACKEND=mlir ./scripts/build_wasm.sh --doom-only
 #   FLOW_DIR=~/flow ./scripts/build_wasm.sh --ai-only
-#   FLOW_DIR=~/flow ./scripts/build_wasm.sh --doom-only
 
 set -euo pipefail
 
@@ -22,14 +24,23 @@ OUT_AI="$ROOT/site/wasm/ai"
 TMP="$ROOT/build/wasm"
 DO_DOOM=1
 DO_AI=1
+BACKEND="${BACKEND:-c}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --ai-only) DO_DOOM=0; shift ;;
     --doom-only) DO_AI=0; shift ;;
+    --backend=*) BACKEND="${1#--backend=}"; shift ;;
+    --backend) shift; BACKEND="${1:-c}"; shift ;;
     *) echo "unknown flag: $1" >&2; exit 1 ;;
   esac
 done
+
+BACKEND="$(printf '%s' "$BACKEND" | tr '[:upper:]' '[:lower:]')"
+if [ "$BACKEND" != "c" ] && [ "$BACKEND" != "mlir" ]; then
+  echo "BACKEND must be c or mlir (got $BACKEND)" >&2
+  exit 1
+fi
 
 if [ ! -d "$FLOW_DIR/src" ] || [ ! -f "$FLOW_DIR/runtime/gfx_wasm.c" ]; then
   echo "FLOW_DIR=$FLOW_DIR does not look like a Flow checkout" >&2
@@ -73,17 +84,46 @@ emcc_common=(
   -lm
 )
 
+# Lower .flow → intermediate for emcc. Echoes the path on stdout.
+flow_lower() {
+  local src="$1"
+  local stem="$2"
+  if [ "$BACKEND" = "mlir" ]; then
+    local ll="$TMP/${stem}.ll"
+    if ! python3 -m "$FLOWC" "$src" --mlir --llvm --lenient -o "$ll"; then
+      echo "Flow→MLIR→LLVM failed for $src" >&2
+      exit 1
+    fi
+    if [ ! -s "$ll" ]; then
+      echo "empty LLVM IR written to $ll" >&2
+      exit 1
+    fi
+    echo "$ll"
+  else
+    local c="$TMP/${stem}.c"
+    if ! python3 -m "$FLOWC" "$src" --c --lenient -o "$c"; then
+      echo "Flow→C failed for $src" >&2
+      exit 1
+    fi
+    if [ ! -s "$c" ]; then
+      echo "empty C written to $c" >&2
+      exit 1
+    fi
+    echo "$c"
+  fi
+}
+
 build_doom() {
-  echo "==> doom.flow → C (scratch) → WASM"
+  echo "==> doom.flow → ${BACKEND} → WASM"
   mkdir -p "$OUT_DOOM"
-  local c="$TMP/doom.c"
   local wad="$ROOT/DOOM1.WAD"
   if [ ! -f "$wad" ]; then
     echo "missing $wad" >&2
     exit 1
   fi
-  python3 -m "$FLOWC" "$ROOT/doom.flow" --c --lenient -o "$c"
-  emcc "$c" \
+  local ir
+  ir="$(flow_lower "$ROOT/doom.flow" doom)"
+  emcc "$ir" \
     "$FLOW_DIR/runtime/gfx_wasm.c" \
     "$FLOW_DIR/runtime/flow_rt_support.c" \
     "${emcc_common[@]}" \
@@ -91,22 +131,22 @@ build_doom() {
     --preload-file "$wad@/doom1.wad" \
     -DNORMALUNIX -DSNDSERV -D_DEFAULT_SOURCE \
     -o "$OUT_DOOM/doom.js"
-  rm -f "$c"
+  rm -f "$ir"
   ls -lh "$OUT_DOOM"/doom.{js,wasm,data}
 }
 
 build_ai() {
-  echo "==> q_doom_watch.flow → C (scratch) → WASM"
+  echo "==> q_doom_watch.flow → ${BACKEND} → WASM"
   mkdir -p "$OUT_AI"
-  local c="$TMP/ai.c"
-  python3 -m "$FLOWC" "$ROOT/site/ai/q_doom_watch.flow" --c --lenient -o "$c"
-  emcc "$c" \
+  local ir
+  ir="$(flow_lower "$ROOT/site/ai/q_doom_watch.flow" ai)"
+  emcc "$ir" \
     "$FLOW_DIR/runtime/gfx_wasm.c" \
     "$FLOW_DIR/runtime/flow_rt_support.c" \
     "${emcc_common[@]}" \
     -sINITIAL_MEMORY=32MB \
     -o "$OUT_AI/ai.js"
-  rm -f "$c"
+  rm -f "$ir"
   ls -lh "$OUT_AI"/ai.{js,wasm}
 }
 
@@ -114,4 +154,4 @@ build_ai() {
 [ "$DO_AI" = 1 ] && build_ai
 
 touch "$ROOT/site/.nojekyll"
-echo "done → $ROOT/site/wasm  (no .c shipped; scratch under build/wasm/)"
+echo "done → $ROOT/site/wasm  (backend=$BACKEND; scratch under build/wasm/)"
