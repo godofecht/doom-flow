@@ -527,7 +527,9 @@ function game_weapon_selectable(weapon: i32) -> i32 {
     return 1
 }
 
-function game_next_weapon(direction: i32) -> i32 {
+# Named distinctly from the gameshim static `game_next_weapon` (i32) so MLIR
+# symbol tables do not collapse the call with the module global.
+function game_find_next_weapon(direction: i32) -> i32 {
     let pl: ptr<void> = PLAYER_at(STAT_consoleplayer())
     let mut weapon: i32 = 0
     if PLAYER_pendingweapon(pl) == GAME_WP_NOCHANGE {
@@ -1048,7 +1050,7 @@ function G_BuildTiccmd(cmd: ptr<void>, maketic: i32) -> void {
     }
 
     if STAT_gamestate() == GAME_GS_LEVEL and gameshim_next_weapon() != 0 {
-        let i: i32 = game_next_weapon(gameshim_next_weapon())
+        let i: i32 = game_find_next_weapon(gameshim_next_weapon())
         CMD_or_buttons(cmd, GAME_BT_CHANGE)
         CMD_or_buttons(cmd, i << GAME_BT_WEAPONSHIFT)
     } else {
