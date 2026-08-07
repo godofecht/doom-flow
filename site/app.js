@@ -215,7 +215,9 @@
   if (!MODES[initial]) initial = "play";
   applyMode(initial);
 
-  if (location.search.indexOf("autostart=1") >= 0) {
+  var params = new URLSearchParams(location.search);
+  // Explicit ?mode=play (or autostart=1) boots immediately; bare / still shows the overlay.
+  if (params.get("autostart") === "1" || params.get("mode") === "play") {
     boot();
   }
 })();
