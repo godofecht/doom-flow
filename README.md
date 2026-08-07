@@ -1,6 +1,10 @@
 # doom-flow
 
 [![Record gameplay GIF](https://github.com/godofecht/doom-flow/actions/workflows/record-gif.yml/badge.svg)](https://github.com/godofecht/doom-flow/actions/workflows/record-gif.yml)
+[![Deploy GitHub Pages](https://github.com/godofecht/doom-flow/actions/workflows/pages.yml/badge.svg)](https://github.com/godofecht/doom-flow/actions/workflows/pages.yml)
+
+**Play in the browser:** [godofecht.github.io/doom-flow](https://godofecht.github.io/doom-flow/)
+(Flow → WebAssembly — Play, Watch AI, or RL Arena)
 
 Doom, ported to the [Flow](https://github.com/flooooooooooow/flow) programming
 language. Started from the doomgeneric C core (same spirit as
@@ -37,7 +41,18 @@ included.
 ./build/doom
 ```
 
-## Record a GIF (Flow syntax)
+## Play on the web
+
+```bash
+FLOW_DIR=~/flow ./scripts/build_wasm.sh
+python3 -m http.server 8000 --directory site
+# open http://127.0.0.1:8000/
+```
+
+GitHub Pages serves the same `site/` tree. Modes: **Play**, **Watch AI**
+(`DOOMFLOW_AI` pilot in the full engine), and **RL Arena** (Q-learning viz
+from the sister trainer).
+
 
 ```bash
 FLOW_DIR=~/flow ./scripts/record_gif.sh

@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DOOM.FLOW — play Doom in the browser, or watch an AI</title>
+  <meta name="description" content="Doom ported to the Flow language, compiled to WebAssembly. Play it yourself, or watch a Flow agent take the controls." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="noise" aria-hidden="true"></div>
+
+  <header class="top">
+    <a class="brand" href="./">DOOM<span>.FLOW</span></a>
+    <nav class="modes" role="tablist" aria-label="Play mode">
+      <button type="button" class="mode is-active" data-mode="play" role="tab" aria-selected="true">Play</button>
+      <button type="button" class="mode" data-mode="ai" role="tab" aria-selected="false">Watch AI</button>
+      <button type="button" class="mode" data-mode="arena" role="tab" aria-selected="false">RL Arena</button>
+    </nav>
+    <a class="gh" href="https://github.com/godofecht/doom-flow" rel="noopener">GitHub</a>
+  </header>
+
+  <main class="hero">
+    <div class="bezel">
+      <div class="bezel-label">
+        <span id="mode-label">PLAY</span>
+        <span class="sep">/</span>
+        <span id="status">ready</span>
+      </div>
+      <div class="stage">
+        <canvas id="canvas" width="640" height="400"></canvas>
+        <div class="overlay" id="overlay">
+          <p class="overlay-brand">DOOM</p>
+          <p class="overlay-copy" id="overlay-copy">Flow → C → WebAssembly. Click to load the shareware episode.</p>
+          <button type="button" id="start">Start</button>
+        </div>
+      </div>
+      <div class="bezel-foot">
+        <p id="hint">Arrows / WASD move · X fire · E use · Esc menu</p>
+        <button type="button" id="stop" disabled>Stop</button>
+      </div>
+    </div>
+  </main>
+
+  <section class="about">
+    <h1>Doom, rewritten in Flow, running in your browser.</h1>
+    <p>
+      The engine is Flow source at the repo root. This page is that same program
+      compiled with Flow’s WASM gfx backend (<code>gfx_wasm.c</code> + ASYNCIFY)
+      and the shareware IWAD preloaded into the virtual filesystem.
+    </p>
+    <ul>
+      <li><strong>Play</strong> — you take the controls.</li>
+      <li><strong>Watch AI</strong> — a Flow pilot boots a new game and drives the engine.</li>
+      <li><strong>RL Arena</strong> — tabular Q-learning from <a href="https://github.com/godofecht/doom-flow-rl">doom-flow-rl</a> trains, then plays live on a grid.</li>
+    </ul>
+  </section>
+
+  <footer class="foot">
+    <span>Port of doomgeneric · GPL-2.0 · shareware <code>doom1.wad</code></span>
+    <span><a href="https://github.com/flooooooooooow/flow">Flow</a> · <a href="https://github.com/godofecht/doom-flow-rl">RL sister repo</a></span>
+  </footer>
+
+  <pre id="out" class="log" hidden></pre>
+
+  <script src="app.js"></script>
+</body>
+</html>

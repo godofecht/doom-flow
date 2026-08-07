@@ -9,3 +9,4 @@
 *.ppm
 .DS_Store
 /*.cfg
+/assets/

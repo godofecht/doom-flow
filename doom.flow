@@ -195,6 +195,13 @@ let mut key_prev: array<i32, 54> = [
 let mut keyscript: ptr<u8> = null
 let mut keyscript_pos: i32 = 0
 
+# When DOOMFLOW_AI is set, a small open-loop pilot drives the engine after a
+# menu keyscript boots a new game. Used by the GitHub Pages "Watch AI" mode.
+let mut ai_pilot: i32 = 0
+let mut ai_fwd: i32 = 0
+let mut ai_turn: i32 = 0
+let mut ai_fire: i32 = 0
+
 function keyscript_num(end_ch: i32) -> i32 {
     let mut v: i32 = 0
     while keyscript[keyscript_pos] as i32 >= 48 and keyscript[keyscript_pos] as i32 <= 57 {
@@ -221,6 +228,48 @@ function pump_keyscript(frame: i32) -> void {
         let k: i32 = keyscript_num(58)
         let d: i32 = keyscript_num(44)
         dg_push_key(d, k)
+    }
+}
+
+# Doomkey codes: 173 forward, 172 turn left, 174 turn right, 163 fire, 13 enter.
+function pump_ai(frame: i32) -> void {
+    if ai_pilot == 0 {
+        return
+    }
+    if frame < 220 {
+        return
+    }
+    if ai_fwd == 0 {
+        dg_push_key(1, 173)
+        ai_fwd = 1
+    }
+    let phase: i32 = frame % 120
+    if phase == 0 {
+        if ai_turn != 0 {
+            dg_push_key(0, ai_turn)
+        }
+        if (frame / 120) % 2 == 0 {
+            ai_turn = 174
+        } else {
+            ai_turn = 172
+        }
+        dg_push_key(1, ai_turn)
+    }
+    if phase == 28 {
+        if ai_turn != 0 {
+            dg_push_key(0, ai_turn)
+            ai_turn = 0
+        }
+    }
+    if phase == 40 or phase == 70 {
+        dg_push_key(1, 163)
+        ai_fire = 1
+    }
+    if phase == 48 or phase == 78 {
+        if ai_fire != 0 {
+            dg_push_key(0, 163)
+            ai_fire = 0
+        }
     }
 }
 
@@ -267,12 +316,21 @@ function main() -> i32 {
     let src: ptr<u8> = dg_screen()
 
     keyscript = getenv("DOOMFLOW_KEYSCRIPT")
+    let ai_env: ptr<u8> = getenv("DOOMFLOW_AI")
+    if (ai_env as i64) != 0 and ai_env[0] as i32 != 0 {
+        ai_pilot = 1
+        # Boot a new game from the title/menu, then the pilot takes over.
+        if (keyscript as i64) == 0 {
+            keyscript = "80:13:1,88:13:0,130:13:1,138:13:0,170:13:1,178:13:0,200:13:1,208:13:0" as ptr<u8>
+        }
+    }
     let mut frame: i32 = 0
 
     while !gfx_should_close(g) {
         gfx_poll(g)
         pump_keys(g)
         pump_keyscript(frame)
+        pump_ai(frame)
         frame = frame + 1
         doomgeneric_Tick()
         convert_frame(src, fb, npix)
