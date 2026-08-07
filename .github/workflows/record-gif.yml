@@ -25,11 +25,13 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang python3
+          sudo apt-get install -y clang python3 python3-pip python3-venv
+          python3 -m pip install --user -r flow/requirements.txt
 
       - name: Record GIF via Flow gfx-record
         env:
           FLOW_DIR: ${{ github.workspace }}/flow
+          FLOW_HOST: python
         run: |
           chmod +x scripts/record_gif.sh
           ./scripts/record_gif.sh --frames 120 --skip 2 --fps 15 --width 320 \
