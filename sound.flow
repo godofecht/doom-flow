@@ -37,6 +37,7 @@ extern { function I_StopSong() -> void }
 extern { function I_MusicIsPlaying() -> i32 }
 
 extern { function W_GetNumForName(name: string) -> i32 }
+extern { function W_CheckNumForName(name: string) -> i32 }
 extern { function W_CacheLumpNum(lump: i32, tag: i32) -> ptr<void> }
 extern { function W_LumpLength(lump: u32) -> i32 }
 extern { function W_ReleaseLumpNum(lump: i32) -> void }
@@ -71,11 +72,12 @@ function sound_stat_musicvolume() -> i32 { return musicVolume }
 @flow_api
 function sound_set_stat_musicvolume(v: i32) -> void { musicVolume = v }
 
-# ---- sfxinfo_t / musicinfo_t (i_sound.h, LP64) ------------------------
-# sizeof(sfxinfo_t) = 64, sizeof(musicinfo_t) = 32
+# ---- sfxinfo_t / musicinfo_t ------------------------------------------
+# SFX blob is hand-laid out at LP64 offsets (self-consistent on any arch).
+# Music uses a real Flow MusicInfo array — access via struct fields so
+# wasm32 (4-byte pointers) and LP64 both work.
 
 const SOUND_SIZEOF_SFXINFO: i32 = 64
-const SOUND_SIZEOF_MUSICINFO: i32 = 32
 
 const SFX_OFF_NAME: i32 = 8
 const SFX_OFF_PRIORITY: i32 = 20
@@ -86,10 +88,12 @@ const SFX_OFF_USEFULNESS: i32 = 40
 const SFX_OFF_LUMPNUM: i32 = 44
 const SFX_OFF_NUMCHANNELS: i32 = 48
 
-const MUSIC_OFF_NAME: i32 = 0
-const MUSIC_OFF_LUMPNUM: i32 = 8
-const MUSIC_OFF_DATA: i32 = 16
-const MUSIC_OFF_HANDLE: i32 = 24
+struct MusicInfo {
+    name: string,
+    lumpnum: i32,
+    data: ptr<void>,
+    song: ptr<void>
+}
 
 function sound_addr(base: ptr<u8>, off: i32) -> ptr<u8> {
     return ((base as i64) + off as i64) as ptr<u8>
@@ -104,9 +108,8 @@ function sound_sfx(id: i32) -> ptr<u8> {
     return ((base as i64) + (id * SOUND_SIZEOF_SFXINFO) as i64) as ptr<u8>
 }
 
-function sound_music(id: i32) -> ptr<u8> {
-    let base: ptr<u8> = sound_data_music() as ptr<u8>
-    return ((base as i64) + (id * SOUND_SIZEOF_MUSICINFO) as i64) as ptr<u8>
+function sound_music(id: i32) -> ptr<MusicInfo> {
+    return &S_music_tab[id]
 }
 
 function sfx_priority(s: ptr<u8>) -> i32 {
@@ -142,41 +145,6 @@ function sfx_lumpnum(s: ptr<u8>) -> i32 {
 function sfx_set_lumpnum(s: ptr<u8>, v: i32) -> void {
     let p: ptr<i32> = sound_addr(s, SFX_OFF_LUMPNUM) as ptr<i32>
     p[0] = v
-}
-
-function music_name(m: ptr<u8>) -> ptr<u8> {
-    let p: ptr<i64> = sound_addr(m, MUSIC_OFF_NAME) as ptr<i64>
-    return p[0] as ptr<u8>
-}
-
-function music_lumpnum(m: ptr<u8>) -> i32 {
-    let p: ptr<i32> = sound_addr(m, MUSIC_OFF_LUMPNUM) as ptr<i32>
-    return p[0]
-}
-
-function music_set_lumpnum(m: ptr<u8>, v: i32) -> void {
-    let p: ptr<i32> = sound_addr(m, MUSIC_OFF_LUMPNUM) as ptr<i32>
-    p[0] = v
-}
-
-function music_data(m: ptr<u8>) -> ptr<u8> {
-    let p: ptr<i64> = sound_addr(m, MUSIC_OFF_DATA) as ptr<i64>
-    return p[0] as ptr<u8>
-}
-
-function music_set_data(m: ptr<u8>, v: ptr<u8>) -> void {
-    let p: ptr<i64> = sound_addr(m, MUSIC_OFF_DATA) as ptr<i64>
-    p[0] = v as i64
-}
-
-function music_song(m: ptr<u8>) -> ptr<u8> {
-    let p: ptr<i64> = sound_addr(m, MUSIC_OFF_HANDLE) as ptr<i64>
-    return p[0] as ptr<u8>
-}
-
-function music_set_song(m: ptr<u8>, v: ptr<u8>) -> void {
-    let p: ptr<i64> = sound_addr(m, MUSIC_OFF_HANDLE) as ptr<i64>
-    p[0] = v as i64
 }
 
 extern { function MOBJ_x(m: ptr<void>) -> i32 }
@@ -233,15 +201,7 @@ const SOUND_MUS_INTROA: i32 = 32
 const SOUND_MUS_RUNNIN: i32 = 33
 
 # ---- S_sfx[] / S_music[] (was sounds_data.c) -----------------------
-# sizeof(sfxinfo_t)=64, sizeof(musicinfo_t)=32 on LP64.
-# Sfx rows are built on first use; chgun link = &S_sfx[sfx_pistol].
-
-struct MusicInfo {
-    name: string,
-    lumpnum: i32,
-    data: ptr<void>,
-    song: ptr<void>
-}
+# sizeof(sfxinfo_t)=64 on LP64 layout blob. MusicInfo is a Flow struct.
 
 const SOUND_SFX_PISTOL: i32 = 1
 const SOUND_SFX_CHGUN: i32 = 86
@@ -798,7 +758,7 @@ function S_ChangeMusic(musicnum: i32, looping: i32) -> void {
         I_Error("Bad music number")
     }
 
-    let music: ptr<u8> = sound_music(mnum)
+    let music: ptr<MusicInfo> = sound_music(mnum)
 
     if (mus_playing as i64) == (music as i64) {
         return
@@ -809,18 +769,23 @@ function S_ChangeMusic(musicnum: i32, looping: i32) -> void {
 
     # get lumpnum if neccessary
     # DEH_String is identity without FEATURE_DEHACKED
-    if music_lumpnum(music) == 0 {
+    if music[0].lumpnum == 0 {
         let mut namebuf: array<u8, 9> = [0, 0, 0, 0, 0, 0, 0, 0, 0]
-        snprintf(namebuf as string, 9, "d_%s", music_name(music) as string)
-        music_set_lumpnum(music, W_GetNumForName(namebuf as string))
+        snprintf(namebuf as string, 9, "d_%s", music[0].name)
+        let lump: i32 = W_CheckNumForName(namebuf as string)
+        if lump < 0 {
+            # Shareware / missing track — skip rather than hard-error.
+            return
+        }
+        music[0].lumpnum = lump
     }
 
-    music_set_data(music, W_CacheLumpNum(music_lumpnum(music), SOUND_PU_STATIC) as ptr<u8>)
+    music[0].data = W_CacheLumpNum(music[0].lumpnum, SOUND_PU_STATIC)
 
     let song: ptr<void> = I_RegisterSong(
-        music_data(music) as ptr<void>,
-        W_LumpLength(music_lumpnum(music)))
-    music_set_song(music, song as ptr<u8>)
+        music[0].data,
+        W_LumpLength(music[0].lumpnum as u32))
+    music[0].song = song
     I_PlaySong(song, looping)
 
     mus_playing = music as ptr<void>
@@ -838,10 +803,11 @@ function S_StopMusic() -> void {
             I_ResumeSong()
         }
 
+        let music: ptr<MusicInfo> = mus_playing as ptr<MusicInfo>
         I_StopSong()
-        I_UnRegisterSong(music_song(mus_playing as ptr<u8>) as ptr<void>)
-        W_ReleaseLumpNum(music_lumpnum(mus_playing as ptr<u8>))
-        music_set_data(mus_playing as ptr<u8>, null)
+        I_UnRegisterSong(music[0].song)
+        W_ReleaseLumpNum(music[0].lumpnum)
+        music[0].data = null
         mus_playing = null
     }
 }
