@@ -28,6 +28,9 @@ extern { function free(p: ptr<void>) -> void }
 extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
 extern { function strlen(s: string) -> i64 }
 extern { function printf(fmt: string, s: string) -> i32 }
+extern { function printf(fmt: string, a: i32) -> i32 }
+extern { function printf(fmt: string, a: i32, b: i32) -> i32 }
+extern { function printf(fmt: string, a: i32, b: i32, c: i32) -> i32 }
 
 extern { function I_Error(msg: string) -> void }
 extern { function I_BeginRead() -> void }
@@ -113,12 +116,18 @@ function lump_set_next(i: i32, v: i64) -> void {
 
 # ---- wad_file handles -------------------------------------------------
 #
-# Opaque outside this module; w_checksum.c only compares the pointers
-# for identity. Layout: FILE* at 0, file length at 8.
+# Opaque outside this module; checksum code only compares the pointers
+# for identity. Layout: in-memory bytes* at 0, file length at 8.
+#
+# IWAD bytes are slurped at open and the FILE is closed immediately.
+# Keeping a long-lived FILE* across later malloc traffic is unreliable
+# on the MLIR→wasm path (fseek starts failing while the pointer value
+# is unchanged), which then reads from a stale offset and corrupts lump
+# data (e.g. PNAMES).
 
-function wadfile_stream(wf: i64) -> ptr<void> {
+function wadfile_data(wf: i64) -> ptr<u8> {
     let words: ptr<i64> = wf as ptr<i64>
-    return words[0] as ptr<void>
+    return words[0] as ptr<u8>
 }
 
 function wadfile_length(wf: i64) -> i64 {
@@ -133,16 +142,47 @@ function wad_open(path: string) -> i64 {
     }
     fseek(f, 0, 2)
     let len: i64 = ftell(f)
+    if len <= 0 {
+        fclose(f)
+        return 0
+    }
+    fseek(f, 0, 0)
+    let data: ptr<u8> = malloc(len) as ptr<u8>
+    if (data as i64) == 0 {
+        fclose(f)
+        return 0
+    }
+    let n: i32 = fread(data as ptr<void>, 1, len, f) as i32
+    fclose(f)
+    if (n as i64) < len {
+        free(data as ptr<void>)
+        return 0
+    }
     let wf: ptr<i64> = calloc(2, 8) as ptr<i64>
-    wf[0] = f as i64
+    wf[0] = data as i64
     wf[1] = len
     return wf as i64
 }
 
 function wad_read(wf: i64, offset: i32, dest: ptr<void>, len: i32) -> i32 {
-    let f: ptr<void> = wadfile_stream(wf)
-    fseek(f, offset as i64, 0)
-    return fread(dest, 1, len as i64, f) as i32
+    let data: ptr<u8> = wadfile_data(wf)
+    let total: i64 = wadfile_length(wf)
+    if offset < 0 or len < 0 {
+        return 0
+    }
+    if (offset as i64) + (len as i64) > total {
+        return 0
+    }
+    # Hand-rolled copy: libc memcpy traps under MLIR→wasm+ASYNCIFY for some
+    # lump reads even with valid pointers; a while-loop does not.
+    let d: ptr<u8> = dest as ptr<u8>
+    let s: ptr<u8> = ((data as i64) + (offset as i64)) as ptr<u8>
+    let mut i: i32 = 0
+    while i < len {
+        d[i] = s[i]
+        i = i + 1
+    }
+    return len
 }
 
 # ---- name handling ----------------------------------------------------
@@ -157,8 +197,9 @@ function upper(c: i32) -> i32 {
 function names_equal(a: ptr<u8>, b: ptr<u8>) -> bool {
     let mut j: i32 = 0
     while j < 8 {
-        let ca: i32 = upper(a[j] as i32)
-        let cb: i32 = upper(b[j] as i32)
+        # Mask: MLIR sign-extends `u8 as i32`.
+        let ca: i32 = upper((a[j] as i32) & 255)
+        let cb: i32 = upper((b[j] as i32) & 255)
         if ca != cb {
             return false
         }
@@ -176,7 +217,7 @@ function W_LumpNameHash(s: ptr<u8>) -> u32 {
     let mut result: u32 = 5381
     let mut i: i32 = 0
     while i < 8 {
-        let c: i32 = s[i] as i32
+        let c: i32 = (s[i] as i32) & 255
         if c == 0 {
             return result
         }
@@ -316,22 +357,31 @@ function W_CheckNumForName(name: string) -> i32 {
     if (wad_lumphash as i64) != 0 {
         let hash: u32 = W_LumpNameHash(np) % wnumlumps
         let mut idx: i64 = wad_lumphash[hash as i32]
+        let mut guard: i32 = 0
         while idx != 0 {
             let i: i32 = (idx - 1) as i32
+            if i < 0 or (i as u32) >= wnumlumps {
+                break
+            }
             if names_equal(lump_name_ptr(i), np) {
                 return i
             }
             idx = lump_next(i)
-        }
-    } else {
-        # No hash table yet: scan backwards so patch lumps take precedence.
-        let mut i: i32 = (wnumlumps as i32) - 1
-        while i >= 0 {
-            if names_equal(lump_name_ptr(i), np) {
-                return i
+            guard = guard + 1
+            if (guard as u32) > wnumlumps {
+                break
             }
-            i = i - 1
         }
+    }
+
+    # Linear scan when there is no hash table, or the chain looked broken.
+    # Backwards so later patch lumps take precedence (w_wad.c).
+    let mut i: i32 = (wnumlumps as i32) - 1
+    while i >= 0 {
+        if names_equal(lump_name_ptr(i), np) {
+            return i
+        }
+        i = i - 1
     }
 
     return 0 - 1
@@ -379,9 +429,18 @@ function W_CacheLumpNum(lumpnum: i32, tag: i32) -> ptr<void> {
         # Already cached: just switch the zone tag.
         Z_ChangeTag2(lump_cache(lumpnum) as ptr<void>, tag, "wad.flow", 0)
     } else {
-        let p: ptr<void> = Z_Malloc(lump_size(lumpnum), tag, lump_cache_addr(lumpnum))
+        let sz: i32 = lump_size(lumpnum)
+        let pos: i32 = lump_position(lumpnum)
+        if sz == 9234 or sz == 2804 {
+            printf("W_CacheLumpNum lump=%d pos=%d sz=%d\n", lumpnum, pos, sz)
+        }
+        let p: ptr<void> = Z_Malloc(sz, tag, lump_cache_addr(lumpnum))
         lump_set_cache(lumpnum, p as i64)
         W_ReadLump(lumpnum as u32, p)
+        if sz == 9234 or sz == 2804 {
+            let b: ptr<u8> = p as ptr<u8>
+            printf("W_CacheLumpNum after read b0=%d b1=%d\n", (b[0] as i32) & 255, (b[1] as i32) & 255)
+        }
     }
 
     return lump_cache(lumpnum) as ptr<void>

@@ -16,6 +16,11 @@ extern { function memcpy(dst: ptr<void>, src: ptr<void>, n: i64) -> ptr<void> }
 extern { function memset(dst: ptr<void>, c: i32, n: i64) -> ptr<void> }
 extern { function printf(fmt: string) -> i32 }
 extern { function printf(fmt: string, s: string) -> i32 }
+extern { function printf(fmt: string, a: i32) -> i32 }
+extern { function printf(fmt: string, a: i32, b: i32) -> i32 }
+extern { function printf(fmt: string, a: i32, b: i32, c: i32) -> i32 }
+extern { function printf(fmt: string, a: i32, b: i32, c: i32, d: i32) -> i32 }
+extern { function printf(fmt: string, a: i32, b: i32, c: i32, d: i32, e: i32) -> i32 }
 
 extern { function Z_Malloc(size: i32, tag: i32, user: ptr<void>) -> ptr<void> }
 extern { function Z_Free(p: ptr<void>) -> void }
@@ -217,7 +222,9 @@ function RDATA_spritetopoffset(lump: i32) -> i32 {
 # ---- SHORT() / LONG() on little-endian --------------------------------
 
 function rdata_short_at(p: ptr<u8>, off: i32) -> i32 {
-    let mut v: i32 = (p[off] as i32) | ((p[off + 1] as i32) << 8)
+    # Mask to 0..255: MLIR sign-extends `u8 as i32`, which breaks LE loads
+    # whenever a byte has the high bit set (e.g. TEXTURE1 offset 504).
+    let mut v: i32 = ((p[off] as i32) & 255) | (((p[off + 1] as i32) & 255) << 8)
     if v >= 32768 {
         v = v - 65536
     }
@@ -225,10 +232,10 @@ function rdata_short_at(p: ptr<u8>, off: i32) -> i32 {
 }
 
 function rdata_long_at(p: ptr<u8>, off: i32) -> i32 {
-    return (p[off] as i32)
-        | ((p[off + 1] as i32) << 8)
-        | ((p[off + 2] as i32) << 16)
-        | ((p[off + 3] as i32) << 24)
+    return ((p[off] as i32) & 255)
+        | (((p[off + 1] as i32) & 255) << 8)
+        | (((p[off + 2] as i32) & 255) << 16)
+        | (((p[off + 3] as i32) & 255) << 24)
 }
 
 function rdata_write_i16(p: ptr<u8>, off: i32, v: i32) -> void {
@@ -271,6 +278,15 @@ function rdata_tex_set_index(tex: ptr<u8>, v: i32) -> void {
 
 function rdata_tex_index(tex: ptr<u8>) -> i32 {
     return rdata_long_at(tex, RDATA_TEX_INDEX)
+}
+
+function rdata_tex_hash_key(name: ptr<u8>) -> i32 {
+    # Keep the modulo in u32. MLIR lowers `u32 as i32` then signed `%`,
+    # which can yield a negative bucket and OOB on the hash table.
+    let h: u32 = W_LumpNameHash(name)
+    let n: u32 = rdata_numtextures as u32
+    let k: u32 = h % n
+    return k as i32
 }
 
 function rdata_tex_next(tex: ptr<u8>) -> ptr<u8> {
@@ -357,10 +373,11 @@ function rdata_draw_column_in_cache(
         }
 
         if count > 0 {
-            memcpy(
-                ((cache as i64) + (position as i64)) as ptr<void>,
-                source as ptr<void>,
-                count as i64)
+            # Avoid libc memcpy under MLIR→wasm+ASYNCIFY.
+            let dst: ptr<u8> = ((cache as i64) + (position as i64)) as ptr<u8>
+            for ci in 0 to count {
+                dst[ci] = source[ci]
+            }
         }
 
         col = ((col as i64) + ((col[1] as i32) + 4) as i64) as ptr<u8>
@@ -432,11 +449,18 @@ function rdata_generate_lookup(texnum: i32) -> void {
     let pc: i32 = rdata_tex_patchcount(texture)
 
     let patchcount: ptr<u8> = Z_Malloc(tw, RDATA_PU_STATIC, null) as ptr<u8>
-    memset(patchcount as ptr<void>, 0, tw as i64)
+    # Avoid libc memset — same MLIR→wasm+ASYNCIFY trap class as memcpy.
+    for zi in 0 to tw {
+        patchcount[zi] = 0 as u8
+    }
 
     for i in 0 to pc {
         let tp: ptr<u8> = rdata_tex_patch_ptr(texture, i)
-        let realpatch: ptr<u8> = W_CacheLumpNum(rdata_tp_patch(tp), RDATA_PU_CACHE) as ptr<u8>
+        let plump: i32 = rdata_tp_patch(tp)
+        if plump < 0 {
+            I_Error("R_GenerateLookup: bad patch lump")
+        }
+        let realpatch: ptr<u8> = W_CacheLumpNum(plump, RDATA_PU_CACHE) as ptr<u8>
         let x1: i32 = rdata_tp_originx(tp)
         let mut x2: i32 = x1 + rdata_short_at(realpatch, RDATA_PATCH_WIDTH)
         let mut x: i32 = 0
@@ -507,25 +531,53 @@ function R_GetColumn(tex: i32, col_in: i32) -> ptr<u8> {
 # ---- GenerateTextureHashTable -----------------------------------------
 
 function rdata_generate_texture_hash_table() -> void {
+    printf("R_InitTextures: hash begin n=%d\n", rdata_numtextures)
     rdata_textures_hashtable = Z_Malloc(
         rdata_numtextures * 8, RDATA_PU_STATIC, null) as ptr<i64>
-    memset(rdata_textures_hashtable as ptr<void>, 0, (rdata_numtextures * 8) as i64)
+    # Avoid libc memset under MLIR→wasm+ASYNCIFY.
+    let hb: ptr<u8> = rdata_textures_hashtable as ptr<u8>
+    let hbytes: i32 = rdata_numtextures * 8
+    for zi in 0 to hbytes {
+        hb[zi] = 0 as u8
+    }
+    printf("R_InitTextures: hash table zeroed\n")
 
     for i in 0 to rdata_numtextures {
+        if i < 3 or (i & 31) == 0 {
+            printf("R_InitTextures: hash i=%d\n", i)
+        }
         let tex: ptr<u8> = rdata_tex(i)
+        if (tex as i64) == 0 {
+            printf("R_InitTextures: null tex at %d\n", i)
+            I_Error("R_InitTextures: null texture")
+        }
         rdata_tex_set_index(tex, i)
+        rdata_tex_set_next(tex, null)
 
         # Append at end of chain so earlier array entries win (vanilla).
-        let key: i32 = (W_LumpNameHash(rdata_tex_name_ptr(tex)) % (rdata_numtextures as u32)) as i32
+        let key: i32 = rdata_tex_hash_key(rdata_tex_name_ptr(tex))
+        if i < 3 {
+            printf("R_InitTextures: hash key=%d\n", key)
+        }
+        if key < 0 or key >= rdata_numtextures {
+            printf("R_InitTextures: bad hash key=%d at i=%d\n", key, i)
+            I_Error("R_InitTextures: bad hash key")
+        }
         let mut rover: ptr<i64> = ((rdata_textures_hashtable as i64) + (key as i64) * 8) as ptr<i64>
 
+        let mut hops: i32 = 0
         while rover[0] != 0 {
+            hops = hops + 1
+            if hops > rdata_numtextures + 2 {
+                printf("R_InitTextures: hash cycle at i=%d key=%d\n", i, key)
+                I_Error("R_InitTextures: hash cycle")
+            }
             rover = ((rover[0] + (RDATA_TEX_NEXT as i64)) as ptr<i64>)
         }
 
-        rdata_tex_set_next(tex, null)
         rover[0] = tex as i64
     }
+    printf("R_InitTextures: hash filled\n")
 }
 
 # ---- R_InitTextures ---------------------------------------------------
@@ -540,31 +592,41 @@ function rdata_init_textures() -> void {
 
     rdata_namebuf[8] = 0 as u8
     for i in 0 to nummappatches {
-        M_StringCopy(
-            rdata_namebuf as ptr<u8>,
-            ((name_p as i64) + (i * 8) as i64) as ptr<u8>,
-            9)
+        # Avoid libc memcpy here — it has trapped under MLIR→wasm+ASYNCIFY.
+        let src: ptr<u8> = ((name_p as i64) + (i * 8) as i64) as ptr<u8>
+        for b in 0 to 8 {
+            rdata_namebuf[b] = src[b]
+        }
+        rdata_namebuf[8] = 0 as u8
         patchlookup[i] = W_CheckNumForName(rdata_namebuf as string)
     }
     W_ReleaseLumpName("PNAMES")
 
+    printf("R_InitTextures: TEXTURE1\n")
     let mut maptex: ptr<u8> = W_CacheLumpName("TEXTURE1", RDATA_PU_STATIC) as ptr<u8>
+    printf("R_InitTextures: maptex=%d b0=%d b1=%d b2=%d b3=%d\n",
+           maptex as i32, maptex[0] as i32, maptex[1] as i32, maptex[2] as i32, maptex[3] as i32)
     let numtextures1: i32 = rdata_long_at(maptex, 0)
+    printf("R_InitTextures: numtextures1=%d\n", numtextures1)
     let mut maxoff: i32 = W_LumpLength(W_GetNumForName("TEXTURE1") as u32)
+    printf("R_InitTextures: maxoff=%d\n", maxoff)
     let mut directory: ptr<u8> = ((maptex as i64) + 4) as ptr<u8>
 
     let mut maptex2: ptr<u8> = null
     let mut numtextures2: i32 = 0
     let mut maxoff2: i32 = 0
 
+    printf("R_InitTextures: check TEXTURE2\n")
     if W_CheckNumForName("TEXTURE2") != 0 - 1 {
         maptex2 = W_CacheLumpName("TEXTURE2", RDATA_PU_STATIC) as ptr<u8>
         numtextures2 = rdata_long_at(maptex2, 0)
         maxoff2 = W_LumpLength(W_GetNumForName("TEXTURE2") as u32)
     }
+    printf("R_InitTextures: numtextures2=%d total=%d\n", numtextures2, numtextures1 + numtextures2)
 
     rdata_numtextures = numtextures1 + numtextures2
 
+    printf("R_InitTextures: alloc tables\n")
     rdata_textures = Z_Malloc(rdata_numtextures * 8, RDATA_PU_STATIC, null) as ptr<i64>
     rdata_texturecolumnlump = Z_Malloc(rdata_numtextures * 8, RDATA_PU_STATIC, null) as ptr<i64>
     rdata_texturecolumnofs = Z_Malloc(rdata_numtextures * 8, RDATA_PU_STATIC, null) as ptr<i64>
@@ -572,10 +634,12 @@ function rdata_init_textures() -> void {
     rdata_texturecompositesize = Z_Malloc(rdata_numtextures * 4, RDATA_PU_STATIC, null) as ptr<i32>
     rdata_texturewidthmask = Z_Malloc(rdata_numtextures * 4, RDATA_PU_STATIC, null) as ptr<i32>
     rdata_textureheight = Z_Malloc(rdata_numtextures * 4, RDATA_PU_STATIC, null)
+    printf("R_InitTextures: tables ok\n")
 
     let temp1: i32 = W_GetNumForName("S_START")
     let temp2: i32 = W_GetNumForName("S_END") - 1
     let temp3: i32 = ((temp2 - temp1 + 63) / 64) + ((rdata_numtextures + 63) / 64)
+    printf("R_InitTextures: S_START=%d S_END=%d\n", temp1, temp2 + 1)
 
     # Classic vanilla "filling box" uses backspace. I_ConsoleStdout is always
     # 0 in this port (system.flow), so the branch never runs; omit \b which
@@ -589,10 +653,11 @@ function rdata_init_textures() -> void {
     }
 
     let height_tbl: ptr<i32> = rdata_textureheight as ptr<i32>
+    printf("R_InitTextures: enter tex loop n=%d\n", rdata_numtextures)
 
     for i in 0 to rdata_numtextures {
-        if (i & 63) == 0 {
-            printf(".")
+        if i < 3 or (i & 63) == 0 {
+            printf("R_InitTextures: tex i=%d\n", i)
         }
 
         if i == numtextures1 {
@@ -603,6 +668,9 @@ function rdata_init_textures() -> void {
 
         let offset: i32 = rdata_long_at(directory, 0)
         directory = ((directory as i64) + 4) as ptr<u8>
+        if i < 3 {
+            printf("R_InitTextures: off=%d\n", offset)
+        }
 
         if offset > maxoff {
             I_Error("R_InitTextures: bad texture directory")
@@ -610,6 +678,13 @@ function rdata_init_textures() -> void {
 
         let mtexture: ptr<u8> = ((maptex as i64) + (offset as i64)) as ptr<u8>
         let mpatchcount: i32 = rdata_short_at(mtexture, RDATA_MT_PATCHCOUNT)
+        if i < 3 {
+            printf("R_InitTextures: patches=%d\n", mpatchcount)
+        }
+        if mpatchcount < 1 or mpatchcount > 4096 {
+            printf("R_InitTextures: bad mpatchcount=%d at i=%d\n", mpatchcount, i)
+            I_Error("R_InitTextures: bad mpatchcount")
+        }
         let tex: ptr<u8> = Z_Malloc(
             RDATA_SIZEOF_TEXTURE + RDATA_SIZEOF_TEXPATCH * (mpatchcount - 1),
             RDATA_PU_STATIC, null) as ptr<u8>
@@ -618,7 +693,10 @@ function rdata_init_textures() -> void {
         rdata_write_i16(tex, RDATA_TEX_WIDTH, rdata_short_at(mtexture, RDATA_MT_WIDTH))
         rdata_write_i16(tex, RDATA_TEX_HEIGHT, rdata_short_at(mtexture, RDATA_MT_HEIGHT))
         rdata_write_i16(tex, RDATA_TEX_PATCHCOUNT, mpatchcount)
-        memcpy(tex as ptr<void>, mtexture as ptr<void>, 8)
+        # Avoid libc memcpy — trap under MLIR→wasm for some sizes.
+        for b in 0 to 8 {
+            tex[b] = mtexture[b]
+        }
 
         let mut mpatch: ptr<u8> = ((mtexture as i64) + (RDATA_MT_PATCHES as i64)) as ptr<u8>
         for j in 0 to mpatchcount {
@@ -645,17 +723,28 @@ function rdata_init_textures() -> void {
         }
         rdata_texturewidthmask[i] = jmask - 1
         height_tbl[i] = rdata_tex_height(tex) << RDATA_FRACBITS
+        if i < 3 {
+            printf("R_InitTextures: tex i=%d done tw=%d\n", i, tw)
+        }
     }
+    printf("R_InitTextures: tex defs done\n")
 
     Z_Free(patchlookup as ptr<void>)
+    printf("R_InitTextures: freed patchlookup\n")
     W_ReleaseLumpName("TEXTURE1")
+    printf("R_InitTextures: released TEXTURE1\n")
     if (maptex2 as i64) != 0 {
         W_ReleaseLumpName("TEXTURE2")
     }
 
+    printf("R_InitTextures: generate lookups n=%d\n", rdata_numtextures)
     for i in 0 to rdata_numtextures {
+        if i < 3 or (i & 31) == 0 {
+            printf("R_InitTextures: lookup i=%d\n", i)
+        }
         rdata_generate_lookup(i)
     }
+    printf("R_InitTextures: lookups done\n")
 
     let ttrans: ptr<i32> = Z_Malloc(
         (rdata_numtextures + 1) * 4, RDATA_PU_STATIC, null) as ptr<i32>
@@ -663,8 +752,10 @@ function rdata_init_textures() -> void {
     for i in 0 to rdata_numtextures {
         ttrans[i] = i
     }
+    printf("R_InitTextures: translation ok\n")
 
     rdata_generate_texture_hash_table()
+    printf("R_InitTextures: hash ok\n")
 }
 
 # ---- R_InitFlats ------------------------------------------------------
@@ -753,7 +844,7 @@ function R_CheckTextureNumForName(name: string) -> i32 {
         return 0
     }
 
-    let key: i32 = (W_LumpNameHash(np) % (rdata_numtextures as u32)) as i32
+    let key: i32 = rdata_tex_hash_key(np)
     let mut texture: ptr<u8> = rdata_textures_hashtable[key] as ptr<u8>
 
     while (texture as i64) != 0 {

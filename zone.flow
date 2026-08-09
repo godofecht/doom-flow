@@ -37,7 +37,10 @@
 extern { function malloc(n: i64) -> ptr<void> }
 extern { function free(p: ptr<void>) -> void }
 extern { function strlen(s: string) -> i64 }
+extern { function printf(fmt: string) -> i32 }
 extern { function printf(fmt: string, s: string) -> i32 }
+extern { function printf(fmt: string, a: i32) -> i32 }
+extern { function printf(fmt: string, a: i32, b: i32) -> i32 }
 extern { function fwrite(src: ptr<void>, size: i64, n: i64, f: ptr<void>) -> i64 }
 
 extern { function I_Error(msg: string) -> void }

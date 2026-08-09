@@ -336,8 +336,9 @@ function saveg_write8(value: u8) -> void {
 }
 
 function saveg_read16() -> i32 {
-    let mut result: i32 = saveg_read8() as i32
-    result = result | ((saveg_read8() as i32) << 8)
+    # Mask: MLIR sign-extends `u8 as i32`.
+    let mut result: i32 = (saveg_read8() as i32) & 255
+    result = result | (((saveg_read8() as i32) & 255) << 8)
     return (result as i16) as i32
 }
 
@@ -347,10 +348,11 @@ function saveg_write16(value: i32) -> void {
 }
 
 function saveg_read32() -> i32 {
-    let mut result: i32 = saveg_read8() as i32
-    result = result | ((saveg_read8() as i32) << 8)
-    result = result | ((saveg_read8() as i32) << 16)
-    result = result | ((saveg_read8() as i32) << 24)
+    # Mask: MLIR sign-extends `u8 as i32`.
+    let mut result: i32 = (saveg_read8() as i32) & 255
+    result = result | (((saveg_read8() as i32) & 255) << 8)
+    result = result | (((saveg_read8() as i32) & 255) << 16)
+    result = result | (((saveg_read8() as i32) & 255) << 24)
     return result
 }
 

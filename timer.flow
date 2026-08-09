@@ -17,11 +17,6 @@ function DG_GetTicksMs() -> u32 {
 }
 
 @flow_api
-function DG_SleepMs(ms: u32) -> void {
-    flow_rt_usleep((ms * (1000 as u32)) as i32)
-}
-
-@flow_api
 function I_GetTicks() -> i32 {
     return flow_rt_time_ms() as i32
 }
@@ -49,7 +44,22 @@ function I_GetTimeMS() -> i32 {
 }
 
 @flow_api
+function DG_SleepMs(ms: u32) -> void {
+    # Safe once D_DoomMain has returned: main's loop is the only ASYNCIFY
+    # caller depth we need. usleep → emscripten_sleep under wasm.
+    if ms == 0 {
+        return
+    }
+    flow_rt_usleep((ms * (1000 as u32)) as i32)
+}
+
+@flow_api
 function I_Sleep(ms: i32) -> void {
+    # Prefer real sleep (ASYNCIFY) so the browser clock runs. Do not call
+    # this from inside D_DoomMain — D_DoomLoop returns before the first tick.
+    if ms <= 0 {
+        return
+    }
     flow_rt_usleep(ms * 1000)
 }
 

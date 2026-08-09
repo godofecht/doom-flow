@@ -438,7 +438,10 @@ function TryRunTics() -> void {
         if I_GetTime() / ticdup - entertic > 0 {
             return
         }
-        I_Sleep(1)
+        # Do not I_Sleep here under wasm/ASYNCIFY: sleeping unwinds the whole
+        # MLIR call stack (~16MB) per millisecond and stalls the browser.
+        # main()'s gfx_present already yields a frame; try again next tick.
+        return
     }
 
     let mut remaining: i32 = counts
