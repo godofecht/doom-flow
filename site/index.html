@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>DOOM.FLOW — Doom in Flow, running as WebAssembly</title>
-  <meta name="description" content="Doom rewritten in the Flow language. Flow → MLIR → WebAssembly. Play it, watch an AI pilot, or see Q-learning clear a room." />
+  <meta name="description" content="Doom rewritten in the Flow language. Flow → C → WebAssembly. Play it, watch an AI pilot, or see Q-learning clear a room." />
   <meta name="theme-color" content="#0a0908" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -69,7 +69,7 @@
           <span class="sep">·</span>
           <span id="status">ready</span>
         </p>
-        <p class="bezel-path">Flow → MLIR → WASM</p>
+        <p class="bezel-path">Flow → C → WASM</p>
       </div>
 
       <div class="stage">
@@ -77,7 +77,7 @@
         <div class="scan" aria-hidden="true"></div>
         <div class="overlay" id="overlay">
           <p class="overlay-brand">DOOM</p>
-          <p class="overlay-copy" id="overlay-copy">Flow → MLIR → emcc. IWAD is preloaded; audio is silent in this build. Click to boot.</p>
+          <p class="overlay-copy" id="overlay-copy">Flow → C → emcc. IWAD is preloaded; audio is silent in this build. Click to boot.</p>
           <button type="button" id="start">
             <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M8 5.14v14l11-7-11-7z"/></svg>
             Boot
@@ -107,8 +107,8 @@
         <span class="pipe-ico" aria-hidden="true">
           <svg viewBox="0 0 24 24"><path fill="currentColor" d="M5 3h14a2 2 0 0 1 2 2v14l-4-3H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm2 4v2h10V7H7zm0 4v2h7v-2H7z"/></svg>
         </span>
-        <strong>MLIR</strong>
-        <span><code>flow.transpiler --mlir --llvm</code></span>
+        <strong>C</strong>
+        <span><code>flow.transpiler --c</code></span>
       </li>
       <li class="pipe-arrow" aria-hidden="true">→</li>
       <li>
@@ -128,9 +128,9 @@
       </li>
     </ol>
     <p class="pipeline-note">
-      This page ships via Flow's <strong>MLIR → LLVM → emcc</strong> path
-      (<code>./flow wasm --backend=mlir</code>). The C → emcc path is still used for
-      native macOS builds.
+      Flow also ships an <strong>MLIR → LLVM</strong> path
+      (<code>./flow wasm --backend=mlir</code>). This Doom build still uses C → emcc
+      until gfx + preload land on MLIR —
       <a href="https://github.com/flooooooooooow/flow/issues/221" rel="noopener">epic #221</a>,
       <a href="https://github.com/flooooooooooow/flow/discussions/226" rel="noopener">roadmap discussion</a>.
       <a href="https://flooooooooooow.github.io/flow/" rel="noopener">Flow wiki →</a>
