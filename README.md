@@ -50,11 +50,11 @@ FLOW_DIR=~/flow BACKEND=mlir ./scripts/build_wasm.sh    # MLIR → LLVM → emcc
 python3 -m http.server 8000 --directory site
 ```
 
-**MLIR dual-build status (2026-08-07):** snake-class gfx works on Flow tip.
-Doom MLIR still blocked on CF block-arg typing (`!llvm.ptr` `%arg0` labeled
-`i32` — [flow#232](https://github.com/flooooooooooow/flow/issues/232)); bitwise
-ops need [flow#233](https://github.com/flooooooooooow/flow/pull/233). Pages stays
-on **C** until both land and `BACKEND=mlir` produces a playable bundle.
+**MLIR build status (2026-08-09):** Pages ships via `BACKEND=mlir`. The Flow IR
+is compiled at `-O0` and linked with binaryen `-O1`, because LLVM `-O1+`
+miscompiles string scanning loops in the current MLIR backend
+([flow#256](https://github.com/flooooooooooow/flow/issues/256)). The C backend
+is still used for native macOS builds.
 
 Pages modes: **Play**, **Watch AI** (`DOOMFLOW_AI` pilot), **RL Arena**.
 
