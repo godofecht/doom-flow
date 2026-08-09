@@ -71,11 +71,15 @@ export PYTHONPATH="$FLOW_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 FLOWC=flow.transpiler
 mkdir -p "$TMP"
 
-# MLIR→LLVM IR is not opt-stable yet: -O1+ infers noreturn on D_DoomMain and
-# wasm-ld/binaryen drop most of the game. Stay on -O0 until that is fixed.
+# MLIR→LLVM IR is not opt-stable at -O1+: LLVM miscompiles string scanning
+# loops (IdentifyIWADByName hangs on a null-byte check). Compile the Flow
+# object at -O0 and the C runtime at -O2, then link with -O1 so binaryen
+# can still optimize the final wasm without touching the Flow IR.
 EMCC_OPT=(-O2)
+EMCC_LINK_OPT=()
 if [ "$BACKEND" = "mlir" ]; then
   EMCC_OPT=(-O0)
+  EMCC_LINK_OPT=(-O1)
   # Config string-table globals must be initialized (Flow branch
   # fix/mlir-static-string-arrays). Without this, M_LoadDefaults dies on
   # 'use_mouse' from an undef @config_*_names array.
@@ -166,14 +170,44 @@ build_doom() {
   fi
   local ir
   ir="$(flow_lower "$ROOT/doom.flow" doom)"
-  emcc "$ir" \
-    "$FLOW_DIR/runtime/gfx_wasm.c" \
-    "$FLOW_DIR/runtime/flow_rt_support.c" \
-    "${emcc_common[@]}" \
-    -sFORCE_FILESYSTEM=1 \
-    --preload-file "$wad@/doom1.wad" \
-    -DNORMALUNIX -DSNDSERV -D_DEFAULT_SOURCE \
-    -o "$OUT_DOOM/doom.js"
+
+  if [ "$BACKEND" = "mlir" ]; then
+    # Hybrid: Flow IR at -O0 (LLVM -O1+ miscompiles string loops), C runtime
+    # at -O2, link with -O1 for binaryen passes on the final wasm.
+    emcc -c "$ir" -O0 -o "$TMP/doom.o"
+    emcc -c "$FLOW_DIR/runtime/gfx_wasm.c" -O2 -o "$TMP/gfx_wasm.o"
+    emcc -c "$FLOW_DIR/runtime/flow_rt_support.c" -O2 -o "$TMP/flow_rt.o"
+    emcc "$TMP/doom.o" "$TMP/gfx_wasm.o" "$TMP/flow_rt.o" \
+      "${EMCC_LINK_OPT[@]}" \
+      -sASYNCIFY=1 \
+      -sASYNCIFY_STACK_SIZE=$ASYNCIFY_STACK \
+      -sSTACK_SIZE=$STACK_SIZE \
+      -sINITIAL_MEMORY=$INITIAL_MEMORY \
+      -sALLOW_MEMORY_GROWTH=1 \
+      -sENVIRONMENT=${WASM_ENVIRONMENT} \
+      -sMODULARIZE=1 \
+      -sEXPORT_NAME=createFlowModule \
+      -sINVOKE_RUN=0 \
+      -sEXIT_RUNTIME=0 \
+      -sEXPORTED_RUNTIME_METHODS=callMain,ccall,ENV \
+      -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai \
+      -sSTACK_OVERFLOW_CHECK=0 \
+      -sFORCE_FILESYSTEM=1 \
+      --preload-file "$wad@/doom1.wad" \
+      -DNORMALUNIX -DSNDSERV -D_DEFAULT_SOURCE \
+      -Wno-implicit-function-declaration \
+      -lm \
+      -o "$OUT_DOOM/doom.js"
+  else
+    emcc "$ir" \
+      "$FLOW_DIR/runtime/gfx_wasm.c" \
+      "$FLOW_DIR/runtime/flow_rt_support.c" \
+      "${emcc_common[@]}" \
+      -sFORCE_FILESYSTEM=1 \
+      --preload-file "$wad@/doom1.wad" \
+      -DNORMALUNIX -DSNDSERV -D_DEFAULT_SOURCE \
+      -o "$OUT_DOOM/doom.js"
+  fi
   # Keep MLIR IR for fast ASYNCIFY/emcc iteration (Flow transpile is the slow part).
   if [ "$BACKEND" != "mlir" ]; then
     rm -f "$ir"

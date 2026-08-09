@@ -23,7 +23,7 @@
       assetDir: "wasm/doom/",
       canvasW: 640,
       canvasH: 400,
-      copy: "Flow → C → emcc. IWAD is preloaded; audio is silent in this build. Click to boot.",
+      copy: "Flow → MLIR → LLVM → emcc. IWAD is preloaded; audio is silent in this build. Click to boot.",
       hint: "Arrows / WASD · X fire · E use · Esc menu · silent (no FEATURE_SOUND)",
       env: {}
     },
