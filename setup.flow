@@ -1296,7 +1296,8 @@ function setupshim_texture_num(name8: ptr<void>) -> i32 {
 # ---- SHORT() on little-endian (i_swap.h: signed short cast) -----------
 
 function setup_short_at(p: ptr<u8>, off: i32) -> i32 {
-    let mut v: i32 = (p[off] as i32) | ((p[off + 1] as i32) << 8)
+    # Mask: MLIR sign-extends `u8 as i32`.
+    let mut v: i32 = ((p[off] as i32) & 255) | (((p[off + 1] as i32) & 255) << 8)
     if v >= 32768 {
         v = v - 65536
     }

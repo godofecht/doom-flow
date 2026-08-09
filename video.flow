@@ -106,7 +106,8 @@ function v_addr(base: ptr<u8>, off: i32) -> ptr<u8> {
 
 # Little-endian int16 at byte offset off, sign-extended.
 function v_i16(p: ptr<u8>, off: i32) -> i32 {
-    let mut v: i32 = (p[off] as i32) | ((p[off + 1] as i32) << 8)
+    # Mask: MLIR sign-extends `u8 as i32`.
+    let mut v: i32 = ((p[off] as i32) & 255) | (((p[off + 1] as i32) & 255) << 8)
     if v >= 32768 {
         v = v - 65536
     }

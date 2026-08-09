@@ -10,9 +10,13 @@
 #
 # Requires: emcc on PATH, Flow checkout at FLOW_DIR (default ../flow).
 # Flow tip should include epic #221 / PR #229 (preload, link, MLIR gfx).
+# BACKEND=mlir also needs Flow's static string-array global init
+# (fix/mlir-static-string-arrays). Prefer a dedicated worktree so other
+# checkouts of ~/flow cannot race the build:
+#   git -C ~/flow worktree add ~/flow-mlir-doom fix/mlir-static-string-arrays
 #
 #   FLOW_DIR=~/flow ./scripts/build_wasm.sh
-#   FLOW_DIR=~/flow BACKEND=mlir ./scripts/build_wasm.sh --doom-only
+#   FLOW_DIR=~/flow-mlir-doom BACKEND=mlir ./scripts/build_wasm.sh --doom-only
 #   FLOW_DIR=~/flow ./scripts/build_wasm.sh --ai-only
 
 set -euo pipefail
@@ -25,6 +29,7 @@ TMP="$ROOT/build/wasm"
 DO_DOOM=1
 DO_AI=1
 BACKEND="${BACKEND:-c}"
+WASM_ENVIRONMENT="${WASM_ENVIRONMENT:-web}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -66,14 +71,39 @@ export PYTHONPATH="$FLOW_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 FLOWC=flow.transpiler
 mkdir -p "$TMP"
 
+# MLIR→LLVM IR is not opt-stable yet: -O1+ infers noreturn on D_DoomMain and
+# wasm-ld/binaryen drop most of the game. Stay on -O0 until that is fixed.
+EMCC_OPT=(-O2)
+if [ "$BACKEND" = "mlir" ]; then
+  EMCC_OPT=(-O0)
+  # Config string-table globals must be initialized (Flow branch
+  # fix/mlir-static-string-arrays). Without this, M_LoadDefaults dies on
+  # 'use_mouse' from an undef @config_*_names array.
+  if ! python3 -c "from flow.mlir_generator import MLIRGenerator; import sys; sys.exit(0 if hasattr(MLIRGenerator, '_emit_static_llvm_array_global') else 1)"; then
+    echo "BACKEND=mlir needs Flow with static string-array global init" >&2
+    echo "  (checkout fix/mlir-static-string-arrays in $FLOW_DIR)" >&2
+    exit 1
+  fi
+fi
+
+ASYNCIFY_STACK=65536
+STACK_SIZE=16MB
+INITIAL_MEMORY=64MB
+if [ "$BACKEND" = "mlir" ]; then
+  # MLIR -O0 frames are heavy; title/demo need large wasm + asyncify stacks.
+  ASYNCIFY_STACK=16777216
+  STACK_SIZE=64MB
+  INITIAL_MEMORY=128MB
+fi
+
 emcc_common=(
-  -O2
+  "${EMCC_OPT[@]}"
   -sASYNCIFY=1
-  -sASYNCIFY_STACK_SIZE=65536
-  -sSTACK_SIZE=16MB
-  -sINITIAL_MEMORY=64MB
+  -sASYNCIFY_STACK_SIZE=$ASYNCIFY_STACK
+  -sSTACK_SIZE=$STACK_SIZE
+  -sINITIAL_MEMORY=$INITIAL_MEMORY
   -sALLOW_MEMORY_GROWTH=1
-  -sENVIRONMENT=web
+  -sENVIRONMENT=${WASM_ENVIRONMENT}
   -sMODULARIZE=1
   -sEXPORT_NAME=createFlowModule
   -sINVOKE_RUN=0
@@ -83,6 +113,11 @@ emcc_common=(
   -Wno-implicit-function-declaration
   -lm
 )
+# Cookie at stack_get_end()==0 false-trips after ~title; keep running while
+# we chase real overflow. Remove once stack discipline is solid.
+if [ "$BACKEND" = "mlir" ]; then
+  emcc_common+=(-sSTACK_OVERFLOW_CHECK=0)
+fi
 
 # Lower .flow → intermediate for emcc. Echoes the path on stdout.
 flow_lower() {
@@ -90,7 +125,9 @@ flow_lower() {
   local stem="$2"
   if [ "$BACKEND" = "mlir" ]; then
     local ll="$TMP/${stem}.ll"
-    if ! python3 -m "$FLOWC" "$src" --mlir --llvm --lenient -o "$ll"; then
+    # Flow logs on stdout; keep command substitution returning only the path.
+    # --wasm32: libc size_t/long are i32 (Flow sources annotate them as i64).
+    if ! python3 -m "$FLOWC" "$src" --mlir --llvm --wasm32 --lenient -o "$ll" >&2; then
       echo "Flow→MLIR→LLVM failed for $src" >&2
       exit 1
     fi
@@ -98,10 +135,16 @@ flow_lower() {
       echo "empty LLVM IR written to $ll" >&2
       exit 1
     fi
+    # Catch Flow checkouts that still emit undef string-array globals.
+    if grep -q '^@config_doom_names = .* undef' "$ll" 2>/dev/null; then
+      echo "LLVM IR has undef @config_doom_names — wrong Flow checkout for MLIR" >&2
+      echo "  need fix/mlir-static-string-arrays in $FLOW_DIR" >&2
+      exit 1
+    fi
     echo "$ll"
   else
     local c="$TMP/${stem}.c"
-    if ! python3 -m "$FLOWC" "$src" --c --lenient -o "$c"; then
+    if ! python3 -m "$FLOWC" "$src" --c --lenient -o "$c" >&2; then
       echo "Flow→C failed for $src" >&2
       exit 1
     fi
@@ -131,7 +174,10 @@ build_doom() {
     --preload-file "$wad@/doom1.wad" \
     -DNORMALUNIX -DSNDSERV -D_DEFAULT_SOURCE \
     -o "$OUT_DOOM/doom.js"
-  rm -f "$ir"
+  # Keep MLIR IR for fast ASYNCIFY/emcc iteration (Flow transpile is the slow part).
+  if [ "$BACKEND" != "mlir" ]; then
+    rm -f "$ir"
+  fi
   ls -lh "$OUT_DOOM"/doom.{js,wasm,data}
 }
 

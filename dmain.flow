@@ -898,8 +898,11 @@ function D_Display() -> void {
     }
 
     if STAT_gamestate() != STAT_wipegamestate() {
-        wipe = 1
+        # Melt wipe sleeps via I_Sleep/ASYNCIFY every tic; under MLIR→wasm
+        # that hang/blows the unwind buffer. Skip the effect; still draw.
+        wipe = 0
         wipe_StartScreen(0, 0, DMAIN_SCREENWIDTH, DMAIN_SCREENHEIGHT)
+        STAT_set_wipegamestate(STAT_gamestate())
     } else {
         wipe = 0
     }
@@ -1115,7 +1118,13 @@ function D_DoomLoop() -> void {
         STAT_set_wipegamestate(STAT_gamestate())
     }
 
-    doomgeneric_Tick()
+    # Skip the melt wipe on the first frame. wipe's I_Sleep used to be the
+    # first ASYNCIFY point while D_DoomMain was still on the stack.
+    STAT_set_wipegamestate(STAT_gamestate())
+
+    # Do not tick here: main()'s loop ticks + gfx_present after D_DoomMain
+    # returns, so the first ASYNCIFY unwind is much shallower.
+    printf("D_DoomLoop: graphics ready, returning to main\n")
 }
 
 # ---- DEMO LOOP --------------------------------------------------------
@@ -1455,7 +1464,9 @@ function D_DoomMain() -> void {
 
     I_AtExit(G_CheckDemoStatus, 1)
 
-    W_GenerateHashTable()
+    # Hash chains currently misbehave on the MLIR→wasm path (OOB during
+    # W_CheckNumForName). Linear scan is correct, just slower at boot.
+    # W_GenerateHashTable()
 
     D_SetGameDescription()
 

@@ -165,7 +165,8 @@ function fl_set_newspecial(f: ptr<u8>, v: i32) -> void {
 
 function fl_texture(f: ptr<u8>) -> i32 {
     # short at offset 48, little-endian, sign-extended
-    let mut v: i32 = (f[48] as i32) | ((f[49] as i32) << 8)
+    # Mask: MLIR sign-extends `u8 as i32`.
+    let mut v: i32 = ((f[48] as i32) & 255) | (((f[49] as i32) & 255) << 8)
     if v >= 32768 {
         v = v - 65536
     }

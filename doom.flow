@@ -360,6 +360,9 @@ function main() -> i32 {
         pump_keyscript(frame)
         pump_ai(frame)
         frame = frame + 1
+        if frame == 1 or frame == 400 or (frame & 255) == 0 {
+            printf("main: frame %d\n", frame)
+        }
         doomgeneric_Tick()
         convert_frame(src, fb, npix)
         gfx_blit_rgb(g, 0, 0, w, h, fb)
