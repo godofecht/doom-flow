@@ -111,6 +111,10 @@ struct LoopTicSet {
 let mut ticdata: ptr<u8> = null
 let mut build_cmd_buf: ptr<u8> = null
 let mut maketic: i32 = 0
+
+@flow_api
+function loop_maketic() -> i32 { return maketic }
+
 let mut recvtic: i32 = 0
 let mut localplayer: i32 = 0
 let mut skiptics: i32 = 0
