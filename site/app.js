@@ -146,10 +146,7 @@
         delete envObj.DOOMFLOW_KEYSCRIPT;
       }
     }
-    // Bust HTTP cache so local MLIR/C rebuilds are picked up without a
-    // hard-reload dance (doom.js/.wasm/.data share one build stamp).
-    var bust = String(Date.now());
-    loadScript(cfg.script + "?t=" + bust)
+    loadScript(cfg.script)
       .then(function () {
         if (typeof createFlowModule !== "function") {
           throw new Error("createFlowModule missing from " + cfg.script);
@@ -160,8 +157,7 @@
         return createFlowModule({
           canvas: canvas,
           locateFile: function (path) {
-            var url = assetUrl(cfg.assetDir, path);
-            return url + (url.indexOf("?") >= 0 ? "&" : "?") + "t=" + bust;
+            return assetUrl(cfg.assetDir, path);
           },
           print: function (t) { log(t, false); },
           printErr: function (t) { log(t, true); },
