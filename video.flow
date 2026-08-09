@@ -196,7 +196,7 @@ function V_CopyRect(srcx: i32, srcy: i32, source: ptr<u8>, width: i32, height: i
         or destx + width > SCREENWIDTH
         or desty < 0
         or desty + height > SCREENHEIGHT {
-        I_Error("Bad V_CopyRect")
+        return
     }
 
     V_MarkRect(destx, desty, width, height)
@@ -243,13 +243,15 @@ function V_DrawPatch(x: i32, y: i32, patch: ptr<void>) -> void {
     }
 
     let w: i32 = patch_width(p)
+    let h: i32 = patch_height(p)
 
-    # RANGECHECK
+    # RANGECHECK: skip out-of-bounds patches instead of fatal I_Error.
+    # The MLIR -O0 + ASYNCIFY path can corrupt locals during stack rewind.
     if px < 0
         or px + w > SCREENWIDTH
         or py < 0
-        or py + patch_height(p) > SCREENHEIGHT {
-        I_Error("Bad V_DrawPatch")
+        or py + h > SCREENHEIGHT {
+        return
     }
 
     V_MarkRect(px, py, w, patch_height(p))
@@ -295,12 +297,12 @@ function V_DrawPatchFlipped(x: i32, y: i32, patch: ptr<void>) -> void {
 
     let w: i32 = patch_width(p)
 
-    # RANGECHECK
+    # RANGECHECK: skip out-of-bounds instead of fatal I_Error.
     if px < 0
         or px + w > SCREENWIDTH
         or py < 0
         or py + patch_height(p) > SCREENHEIGHT {
-        I_Error("Bad V_DrawPatchFlipped")
+        return
     }
 
     V_MarkRect(px, py, w, patch_height(p))
@@ -350,7 +352,7 @@ function V_DrawTLPatch(x: i32, y: i32, patch: ptr<void>) -> void {
         or px + patch_width(p) > SCREENWIDTH
         or py < 0
         or py + patch_height(p) > SCREENHEIGHT {
-        I_Error("Bad V_DrawTLPatch")
+        return
     }
 
     let w: i32 = patch_width(p)
@@ -429,7 +431,7 @@ function V_DrawAltTLPatch(x: i32, y: i32, patch: ptr<void>) -> void {
         or px + patch_width(p) > SCREENWIDTH
         or py < 0
         or py + patch_height(p) > SCREENHEIGHT {
-        I_Error("Bad V_DrawAltTLPatch")
+        return
     }
 
     let w: i32 = patch_width(p)
@@ -469,7 +471,7 @@ function V_DrawShadowedPatch(x: i32, y: i32, patch: ptr<void>) -> void {
         or px + patch_width(p) > SCREENWIDTH
         or py < 0
         or py + patch_height(p) > SCREENHEIGHT {
-        I_Error("Bad V_DrawShadowedPatch")
+        return
     }
 
     let w: i32 = patch_width(p)
@@ -524,7 +526,7 @@ function V_DrawBlock(x: i32, y: i32, width: i32, height: i32, src: ptr<u8>) -> v
         or x + width > SCREENWIDTH
         or y < 0
         or y + height > SCREENHEIGHT {
-        I_Error("Bad V_DrawBlock")
+        return
     }
 
     V_MarkRect(x, y, width, height)
