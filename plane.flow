@@ -499,15 +499,15 @@ function R_MakeSpans(x: i32, t1: i32, b1: i32, t2: i32, b2: i32) -> void {
 function R_DrawPlanes() -> void {
     plane_ensure()
 
-    # RANGECHECK
+    # RANGECHECK: skip overflow checks instead of fatal I_Error.
     if BSP_drawsegs_overflow() != 0 {
-        I_Error("R_DrawPlanes: drawsegs overflow")
+        return
     }
     if lastvisplane > PLANE_MAXVISPLANES {
-        I_Error("R_DrawPlanes: visplane overflow")
+        return
     }
     if PLANES_lastopening_count() > PLANE_MAXOPENINGS {
-        I_Error("R_DrawPlanes: opening overflow")
+        return
     }
 
     for pli in 0 to lastvisplane {

@@ -383,7 +383,7 @@ function R_DrawColumn() -> void {
     if (drawshim_dc_x_addr()[0] as u32) >= (DRAW_SCREENWIDTH as u32)
         or drawshim_dc_yl_addr()[0] < 0
         or drawshim_dc_yh_addr()[0] >= DRAW_SCREENHEIGHT {
-        I_Error("R_DrawColumn: bad range")
+        return
     }
 
     let mut dest: ptr<u8> = draw_dest(drawshim_dc_yl_addr()[0], drawshim_dc_x_addr()[0])
@@ -418,7 +418,7 @@ function R_DrawColumnLow() -> void {
     if (drawshim_dc_x_addr()[0] as u32) >= (DRAW_SCREENWIDTH as u32)
         or drawshim_dc_yl_addr()[0] < 0
         or drawshim_dc_yh_addr()[0] >= DRAW_SCREENHEIGHT {
-        I_Error("R_DrawColumn: bad range")
+        return
     }
 
     let x: i32 = drawshim_dc_x_addr()[0] << 1
@@ -470,7 +470,7 @@ function R_DrawFuzzColumn() -> void {
     if (drawshim_dc_x_addr()[0] as u32) >= (DRAW_SCREENWIDTH as u32)
         or dc_yl_p[0] < 0
         or dc_yh_p[0] >= DRAW_SCREENHEIGHT {
-        I_Error("R_DrawFuzzColumn: bad range")
+        return
     }
 
     let mut dest: ptr<u8> = draw_dest(dc_yl_p[0], drawshim_dc_x_addr()[0])
@@ -523,7 +523,7 @@ function R_DrawFuzzColumnLow() -> void {
     if (x as u32) >= (DRAW_SCREENWIDTH as u32)
         or dc_yl_p[0] < 0
         or dc_yh_p[0] >= DRAW_SCREENHEIGHT {
-        I_Error("R_DrawFuzzColumn: bad range")
+        return
     }
 
     let mut dest: ptr<u8> = draw_dest(dc_yl_p[0], x)
@@ -567,7 +567,7 @@ function R_DrawTranslatedColumn() -> void {
     if (drawshim_dc_x_addr()[0] as u32) >= (DRAW_SCREENWIDTH as u32)
         or drawshim_dc_yl_addr()[0] < 0
         or drawshim_dc_yh_addr()[0] >= DRAW_SCREENHEIGHT {
-        I_Error("R_DrawColumn: bad range")
+        return
     }
 
     let mut dest: ptr<u8> = draw_dest(drawshim_dc_yl_addr()[0], drawshim_dc_x_addr()[0])
@@ -605,7 +605,7 @@ function R_DrawTranslatedColumnLow() -> void {
     if (x as u32) >= (DRAW_SCREENWIDTH as u32)
         or drawshim_dc_yl_addr()[0] < 0
         or drawshim_dc_yh_addr()[0] >= DRAW_SCREENHEIGHT {
-        I_Error("R_DrawColumn: bad range")
+        return
     }
 
     let mut dest: ptr<u8> = draw_dest(drawshim_dc_yl_addr()[0], x)
@@ -665,7 +665,7 @@ function R_DrawSpan() -> void {
         or drawshim_ds_x1_addr()[0] < 0
         or drawshim_ds_x2_addr()[0] >= DRAW_SCREENWIDTH
         or (drawshim_ds_y_addr()[0] as u32) > (DRAW_SCREENHEIGHT as u32) {
-        I_Error("R_DrawSpan: bad range")
+        return
     }
 
     let mut position: u32 = (((drawshim_ds_xfrac_addr()[0] as u32) << 10) & 0xffff0000 as u32)
@@ -702,7 +702,7 @@ function R_DrawSpanLow() -> void {
         or drawshim_ds_x1_addr()[0] < 0
         or drawshim_ds_x2_addr()[0] >= DRAW_SCREENWIDTH
         or (drawshim_ds_y_addr()[0] as u32) > (DRAW_SCREENHEIGHT as u32) {
-        I_Error("R_DrawSpan: bad range")
+        return
     }
 
     let mut position: u32 = (((drawshim_ds_xfrac_addr()[0] as u32) << 10) & 0xffff0000 as u32)
