@@ -1314,8 +1314,8 @@ function P_LoadVertexes(lump: i32) -> void {
     let data: ptr<u8> = W_CacheLumpNum(lump, SETUP_PU_STATIC) as ptr<u8>
     for i in 0 to n {
         let off: i32 = i * SETUP_SIZEOF_MAPVERTEX
-        let x: i32 = setup_short_at(data, off) << SETUP_FRACBITS
-        let y: i32 = setup_short_at(data, off + 2) << SETUP_FRACBITS
+        let x: i32 = ((setup_short_at(data, off) as u32) << SETUP_FRACBITS) as i32
+        let y: i32 = ((setup_short_at(data, off + 2) as u32) << SETUP_FRACBITS) as i32
         GEOM_vertex_set_xy(GEOM_vertex(i), x, y)
     }
     W_ReleaseLumpNum(lump)
@@ -1341,8 +1341,8 @@ function P_LoadSegs(lump: i32) -> void {
 
         let ang: i32 = setup_short_at(data, off + 4)
         let ofs: i32 = setup_short_at(data, off + 10)
-        GEOM_seg_set_angle(li, (ang << 16) as u32)
-        GEOM_seg_set_offset(li, ofs << 16)
+        GEOM_seg_set_angle(li, ((ang as u32) << 16) as u32)
+        GEOM_seg_set_offset(li, ((ofs as u32) << 16) as i32)
 
         let linedef: i32 = setup_short_at(data, off + 6)
         let ldef: ptr<void> = GEOM_line(linedef)
@@ -1400,8 +1400,8 @@ function P_LoadSectors(lump: i32) -> void {
     for i in 0 to n {
         let off: i32 = i * SETUP_SIZEOF_MAPSECTOR
         let ss: ptr<void> = GEOM_sector(i)
-        GEOM_sector_set_floorheight(ss, setup_short_at(data, off) << SETUP_FRACBITS)
-        GEOM_sector_set_ceilingheight(ss, setup_short_at(data, off + 2) << SETUP_FRACBITS)
+        GEOM_sector_set_floorheight(ss, ((setup_short_at(data, off) as u32) << SETUP_FRACBITS) as i32)
+        GEOM_sector_set_ceilingheight(ss, ((setup_short_at(data, off + 2) as u32) << SETUP_FRACBITS) as i32)
         # floorpic @4, ceilingpic @12 (char[8] each)
         let floorpic: ptr<void> = ((data as i64) + (off + 4) as i64) as ptr<void>
         let ceilingpic: ptr<void> = ((data as i64) + (off + 12) as i64) as ptr<void>
@@ -1427,11 +1427,11 @@ function P_LoadNodes(lump: i32) -> void {
         let off: i32 = i * SETUP_SIZEOF_MAPNODE
         let no: ptr<void> = GEOM_node(i)
         GEOM_node_set_xy(no,
-            setup_short_at(data, off) << SETUP_FRACBITS,
-            setup_short_at(data, off + 2) << SETUP_FRACBITS)
+            ((setup_short_at(data, off) as u32) << SETUP_FRACBITS) as i32,
+            ((setup_short_at(data, off + 2) as u32) << SETUP_FRACBITS) as i32)
         GEOM_node_set_dxy(no,
-            setup_short_at(data, off + 4) << SETUP_FRACBITS,
-            setup_short_at(data, off + 6) << SETUP_FRACBITS)
+            ((setup_short_at(data, off + 4) as u32) << SETUP_FRACBITS) as i32,
+            ((setup_short_at(data, off + 6) as u32) << SETUP_FRACBITS) as i32)
         # children are unsigned short in C; SHORT() then assign zero-extends
         # into unsigned short. Read as signed short then mask to 16 bits
         # so values like 0x8000 (NF_SUBSECTOR) survive.
@@ -1441,7 +1441,7 @@ function P_LoadNodes(lump: i32) -> void {
             GEOM_node_set_child(no, j, child)
             for k in 0 to 4 {
                 let bbox_off: i32 = off + 8 + (j * 8) + (k * 2)
-                GEOM_node_set_bbox(no, j, k, setup_short_at(data, bbox_off) << SETUP_FRACBITS)
+                GEOM_node_set_bbox(no, j, k, ((setup_short_at(data, bbox_off) as u32) << SETUP_FRACBITS) as i32)
             }
         }
     }
@@ -1568,8 +1568,8 @@ function P_LoadSideDefs(lump: i32) -> void {
     for i in 0 to n {
         let off: i32 = i * SETUP_SIZEOF_MAPSIDEDEF
         let sd: ptr<void> = GEOM_side(i)
-        GEOM_side_set_textureoffset(sd, setup_short_at(data, off) << SETUP_FRACBITS)
-        GEOM_side_set_rowoffset(sd, setup_short_at(data, off + 2) << SETUP_FRACBITS)
+        GEOM_side_set_textureoffset(sd, ((setup_short_at(data, off) as u32) << SETUP_FRACBITS) as i32)
+        GEOM_side_set_rowoffset(sd, ((setup_short_at(data, off + 2) as u32) << SETUP_FRACBITS) as i32)
         let top: ptr<void> = ((data as i64) + (off + 4) as i64) as ptr<void>
         let bottom: ptr<void> = ((data as i64) + (off + 12) as i64) as ptr<void>
         let mid: ptr<void> = ((data as i64) + (off + 20) as i64) as ptr<void>
@@ -1599,8 +1599,8 @@ function P_LoadBlockMap(lump: i32) -> void {
         GEOM_set_blockmaplump_at(i, s)
     }
 
-    GEOM_set_bmaporgx((GEOM_blockmaplump_at(0) as i32) << SETUP_FRACBITS)
-    GEOM_set_bmaporgy((GEOM_blockmaplump_at(1) as i32) << SETUP_FRACBITS)
+    GEOM_set_bmaporgx(((GEOM_blockmaplump_at(0) as u32) << SETUP_FRACBITS) as i32)
+    GEOM_set_bmaporgy(((GEOM_blockmaplump_at(1) as u32) << SETUP_FRACBITS) as i32)
     GEOM_set_bmapwidth(GEOM_blockmaplump_at(2) as i32)
     GEOM_set_bmapheight(GEOM_blockmaplump_at(3) as i32)
 

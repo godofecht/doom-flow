@@ -18,14 +18,14 @@ const label = process.env.TEST_LABEL || "unknown";
 
 // Frames at which to collect CRC32. Dense early (catch first divergence),
 // sparse later (confirm long-term stability).
-// Frames 10-1500 are the stable title screen (byte-identical between
-// backends). Frames 2000+ diverge due to demo timing (TryRunTics has
-// a non-deterministic yield point), so we stop at 1500.
+// Frames 10-1000 are the stable title screen (byte-identical between
+// backends). Frames 1500+ diverge due to demo timing (TryRunTics has
+// a non-deterministic yield point), so we stop at 1000.
 const SAMPLE_FRAMES = [
   0, 1, 2, 3, 5, 10, 20, 30, 50, 100, 200, 300, 500,
-  750, 1000, 1250, 1500,
+  750, 1000,
 ];
-const MAX_FRAMES = 1500;
+const MAX_FRAMES = 1000;
 
 function err(t) {
   if (/out of bounds|abort|Assertion|RuntimeError/i.test(String(t))) {

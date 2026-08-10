@@ -722,7 +722,7 @@ function rdata_init_textures() -> void {
             jmask = jmask << 1
         }
         rdata_texturewidthmask[i] = jmask - 1
-        height_tbl[i] = rdata_tex_height(tex) << RDATA_FRACBITS
+        height_tbl[i] = ((rdata_tex_height(tex) as u32) << RDATA_FRACBITS) as i32
         if i < 3 {
             printf("R_InitTextures: tex i=%d done tw=%d\n", i, tw)
         }
@@ -795,9 +795,9 @@ function rdata_init_sprite_lumps() -> void {
             printf(".")
         }
         let patch: ptr<u8> = W_CacheLumpNum(first + i, RDATA_PU_CACHE) as ptr<u8>
-        sw[i] = rdata_short_at(patch, RDATA_PATCH_WIDTH) << RDATA_FRACBITS
-        so[i] = rdata_short_at(patch, RDATA_PATCH_LEFTOFFSET) << RDATA_FRACBITS
-        st[i] = rdata_short_at(patch, RDATA_PATCH_TOPOFFSET) << RDATA_FRACBITS
+        sw[i] = ((rdata_short_at(patch, RDATA_PATCH_WIDTH) as u32) << RDATA_FRACBITS) as i32
+        so[i] = ((rdata_short_at(patch, RDATA_PATCH_LEFTOFFSET) as u32) << RDATA_FRACBITS) as i32
+        st[i] = ((rdata_short_at(patch, RDATA_PATCH_TOPOFFSET) as u32) << RDATA_FRACBITS) as i32
     }
 }
 

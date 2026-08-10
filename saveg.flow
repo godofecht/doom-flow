@@ -1014,8 +1014,8 @@ function P_UnArchiveWorld() -> void {
     let nsec: i32 = GEOM_numsectors()
     for i in 0 to nsec {
         let sec: i64 = sg_base(GEOM_sector(i))
-        sg_set_i32(sec, 0, saveg_read16() << SAVEG_FRACBITS)
-        sg_set_i32(sec, 4, saveg_read16() << SAVEG_FRACBITS)
+        sg_set_i32(sec, 0, ((saveg_read16() as u32) << SAVEG_FRACBITS) as i32)
+        sg_set_i32(sec, 4, ((saveg_read16() as u32) << SAVEG_FRACBITS) as i32)
         sg_set_i16(sec, 8, saveg_read16())
         sg_set_i16(sec, 10, saveg_read16())
         sg_set_i16(sec, 12, saveg_read16())
@@ -1035,8 +1035,8 @@ function P_UnArchiveWorld() -> void {
             let sidenum: i32 = sg_i16(li, 30 + j * 2)
             if sidenum != 0 - 1 {
                 let si: i64 = sg_base(GEOM_side(sidenum))
-                sg_set_i32(si, 0, saveg_read16() << SAVEG_FRACBITS)
-                sg_set_i32(si, 4, saveg_read16() << SAVEG_FRACBITS)
+                sg_set_i32(si, 0, ((saveg_read16() as u32) << SAVEG_FRACBITS) as i32)
+                sg_set_i32(si, 4, ((saveg_read16() as u32) << SAVEG_FRACBITS) as i32)
                 sg_set_i16(si, 8, saveg_read16())
                 sg_set_i16(si, 10, saveg_read16())
                 sg_set_i16(si, 12, saveg_read16())

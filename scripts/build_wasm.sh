@@ -79,9 +79,9 @@ mkdir -p "$TMP"
 # can still optimize the final wasm without touching the Flow IR.
 EMCC_OPT=(-O2)
 EMCC_LINK_OPT=()
-JS_LIBRARY=()
+JS_LIBRARY=""
 if [ "$TEST_CLOCK" = "1" ]; then
-  JS_LIBRARY=(--js-library "$ROOT/scripts/deterministic_clock.js")
+  JS_LIBRARY="--js-library $ROOT/scripts/deterministic_clock.js"
 fi
 if [ "$BACKEND" = "mlir" ]; then
   EMCC_OPT=(-O0)
@@ -187,7 +187,7 @@ build_doom() {
     emcc -c "$ROOT/scripts/doom_shim.c" -O2 -o "$TMP/doom_shim.o"
     emcc "$TMP/doom.o" "$TMP/gfx_wasm.o" "$TMP/flow_rt.o" "$TMP/doom_shim.o" \
       -O1 \
-      "${JS_LIBRARY[@]}" \
+      $JS_LIBRARY \
       -sSTACK_SIZE=$STACK_SIZE \
       -sINITIAL_MEMORY=$INITIAL_MEMORY \
       -sALLOW_MEMORY_GROWTH=1 \
@@ -211,7 +211,7 @@ build_doom() {
       "$FLOW_DIR/runtime/flow_rt_support.c" \
       "$ROOT/scripts/doom_shim.c" \
       "${emcc_common[@]}" \
-      "${JS_LIBRARY[@]}" \
+      $JS_LIBRARY \
       -sFORCE_FILESYSTEM=1 \
       --preload-file "$wad@/doom1.wad" \
       -DNORMALUNIX -DSNDSERV -D_DEFAULT_SOURCE \

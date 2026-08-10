@@ -840,8 +840,8 @@ function R_ExecuteSetViewSize() -> void {
 
     rmainshim_centery_addr()[0] = viewheight / 2
     rmainshim_centerx_addr()[0] = viewwidth / 2
-    rmainshim_centerxfrac_addr()[0] = rmainshim_centerx_addr()[0] << RMAIN_FRACBITS
-    rmainshim_centeryfrac_addr()[0] = rmainshim_centery_addr()[0] << RMAIN_FRACBITS
+    rmainshim_centerxfrac_addr()[0] = ((rmainshim_centerx_addr()[0] as u32) << RMAIN_FRACBITS) as i32
+    rmainshim_centeryfrac_addr()[0] = ((rmainshim_centery_addr()[0] as u32) << RMAIN_FRACBITS) as i32
     rmainshim_projection_addr()[0] = rmainshim_centerxfrac_addr()[0]
 
     if detailshift == 0 {
@@ -864,10 +864,10 @@ function R_ExecuteSetViewSize() -> void {
 
     # planes
     for i2 in 0 to viewheight {
-        let mut dy: i32 = ((i2 - viewheight / 2) << RMAIN_FRACBITS) + RMAIN_FRACUNIT / 2
+        let mut dy: i32 = ((((i2 - viewheight / 2) as u32) << RMAIN_FRACBITS) as i32) + RMAIN_FRACUNIT / 2
         dy = abs(dy)
         PLANES_set_yslope(i2, FixedDiv(
-            ((viewwidth << detailshift) / 2) * RMAIN_FRACUNIT, dy))
+            (((viewwidth as u32) << detailshift) as i32 / 2) * RMAIN_FRACUNIT, dy))
     }
 
     let xtv: ptr<u32> = rmainshim_xtoviewangle()
