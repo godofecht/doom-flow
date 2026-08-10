@@ -335,9 +335,9 @@ function convert_frame(src: ptr<u8>, dst: ptr<u8>, npix: i32) -> void {
     }
 }
 
-# Module-level game loop state. Keeping these out of main() avoids
-# alloca-based locals that ASYNCIFY corrupts on stack rewind in the
-# MLIR -O0 backend.
+# Module-level game loop state. main() returns after init; the JS host
+# calls doomflow_frame() per requestAnimationFrame. This avoids ASYNCIFY
+# entirely, which was corrupting alloca-based locals on stack rewind.
 let mut loop_g: Gfx = Gfx{ctx: 0 as ptr<void>}
 let mut loop_w: i32 = 0
 let mut loop_h: i32 = 0
@@ -364,7 +364,6 @@ function main() -> i32 {
 
     keyscript = getenv("DOOMFLOW_KEYSCRIPT")
     loop_frame = 0
-    printf("DBG: main init done, returning to JS for rAF loop\n")
 
     # No while-loop: the JS host calls doomflow_frame() per
     # requestAnimationFrame. This avoids ASYNCIFY entirely.
@@ -382,16 +381,8 @@ function doomflow_frame() -> i32 {
     pump_keyscript(loop_frame)
     pump_ai(loop_frame)
     loop_frame = loop_frame + 1
-    if loop_frame == 1 or loop_frame == 400 or (loop_frame & 255) == 0 {
-        printf("main: frame %d\n", loop_frame)
-    }
     doomgeneric_Tick()
     convert_frame(loop_src, loop_fb, loop_npix)
-    if loop_frame == 1 or loop_frame == 2 {
-        printf("DBG: frame %d fb[0..5]=%d %d %d %d %d\n", loop_frame,
-            loop_fb[0] as i32, loop_fb[1] as i32, loop_fb[2] as i32,
-            loop_fb[3] as i32, loop_fb[4] as i32)
-    }
     gfx_blit_rgb(loop_g, 0, 0, loop_w, loop_h, loop_fb)
     # No gfx_present: the JS host calls doomflow_present() after this
     # returns to blit the pixel buffer to canvas. No ASYNCIFY needed.

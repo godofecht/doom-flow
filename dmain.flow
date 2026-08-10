@@ -1080,8 +1080,6 @@ function D_GrabMouseCallback() -> i32 {
 
 # ---- doomgeneric_Tick / D_DoomLoop ------------------------------------
 
-let mut doom_tick_count: i32 = 0
-
 @flow_api
 function doomgeneric_Tick() -> void {
     I_StartFrame()
@@ -1089,12 +1087,6 @@ function doomgeneric_Tick() -> void {
     S_UpdateSounds(PLAYER_mo(PLAYER_at(STAT_consoleplayer())))
     if IVIDEO_screenvisible() != 0 {
         D_Display()
-    }
-    # Debug: print game state every 256 frames
-    let dbgf: i32 = doom_tick_count
-    doom_tick_count = dbgf + 1
-    if dbgf == 0 or (dbgf & 255) == 0 {
-        printf("TICK: f=%d gs=%d gametic=%d maketic=%d\n", dbgf, STAT_gamestate(), STAT_gametic(), loop_maketic())
     }
 }
 
@@ -1131,9 +1123,7 @@ function D_DoomLoop() -> void {
     # first ASYNCIFY point while D_DoomMain was still on the stack.
     STAT_set_wipegamestate(STAT_gamestate())
 
-    # Do not tick here: main()'s loop ticks + gfx_present after D_DoomMain
-    # returns, so the first ASYNCIFY unwind is much shallower.
-    printf("D_DoomLoop: graphics ready, returning to main\n")
+    # Do not tick here: main()'s loop ticks after D_DoomMain returns.
 }
 
 # ---- DEMO LOOP --------------------------------------------------------
