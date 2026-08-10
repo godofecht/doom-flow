@@ -1,5 +1,1772 @@
+diff --git a/src/flow/attributes.py b/src/flow/attributes.py
+index 8fe3440..2f5cc17 100644
+--- a/src/flow/attributes.py
++++ b/src/flow/attributes.py
+@@ -42,16 +42,32 @@ SEMANTIC_ATTRIBUTES = frozenset({
+     "test",       # synthesized by the parser for `test "..." { }` blocks
+     "monomorphized",  # synthesized by monomorphize.py
+     "lifetime",   # lifetime domain (type_checker; docs/language/lifetime-domains.md)
++    # Physical-systems W0 (docs/vision/physical-systems.md)
++    "dma",
++    "noncacheable",
++    "aligned",
++    "hardware",
++    "radiation_sensitive",
++    "deterministic",
++    "guarantee",
+ })
+ 
+ KNOWN_ATTRIBUTES = CODEGEN_ATTRIBUTES | GUARD_ATTRIBUTES | SEMANTIC_ATTRIBUTES
+ 
+ # Attributes that take arguments. Everything else must be bare.
+-ATTRIBUTES_WITH_ARGS = frozenset({"only", "guard", "target", "lifetime"})
++ATTRIBUTES_WITH_ARGS = frozenset({
++    "only", "guard", "target", "lifetime", "aligned", "guarantee",
++})
++
++# Allowed arguments for @guarantee(...).
++GUARANTEE_ARGS = frozenset({
++    "no_alloc",
++    "no_block",
++    "heap_allocations_eq_0",
++    "blocking_eq_false",
++})
+ 
+ # Lifetime domains, shortest-lived first (docs/language/lifetime-domains.md).
+-# The index in this tuple *is* the order: a domain may not hold a reference to,
+-# or be called by, one that appears earlier.
+ LIFETIME_DOMAINS: Tuple[str, ...] = ("callback", "frame", "session", "application")
+ 
+ 
+@@ -61,22 +77,14 @@ def domain_rank(domain: str) -> int:
+ 
+ 
+ def lifetime_domain(attrs: Optional[List[str]]) -> Optional[str]:
+-    """The declared lifetime domain of a declaration, or None if unannotated.
+-
+-    Returns None for a malformed `@lifetime(...)` too; `attribute_errors`
+-    reports that separately, and an unannotated declaration is unchecked
+-    rather than mis-checked.
+-    """
++    """The declared lifetime domain of a declaration, or None if unannotated."""
+     for attr in attrs or []:
+         name, args = parse_attribute(attr)
+         if name == "lifetime" and len(args) == 1 and args[0] in LIFETIME_DOMAINS:
+             return args[0]
+     return None
+ 
+-# One comma-separated item of a `target(...)` spec. Accepts the forms GCC and
+-# Clang document: a bare feature (`avx2`, `crypto`), a signed feature
+-# (`+avx2`, `-sse`, `no-sse`) and a `key=value` pair (`arch=haswell`,
+-# `tune=native`, `branch-protection=standard`).
++# One comma-separated item of a `target(...)` spec.
+ _TARGET_ITEM_RE = re.compile(
+     r"^[+-]?[A-Za-z0-9_.]+(?:-[A-Za-z0-9_.]+)*"
+     r"(?:=[A-Za-z0-9_.+]+(?:-[A-Za-z0-9_.+]+)*)?$"
+@@ -92,13 +100,21 @@ def parse_attribute(attr: str) -> Tuple[str, List[str]]:
+     return attr.strip(), []
+ 
+ 
+-def validate_target_spec(spec: str) -> Optional[str]:
+-    """Check a `@target(...)` string's *shape*.
++def attrs_imply_rt_safe(attrs: Optional[List[str]]) -> bool:
++    """True when attributes require the @rt_safe call-graph discipline.
+ 
+-    Returns an error message, or None when the spec is plausible.  This is a
+-    syntactic check only: whether the named features exist is decided by the
+-    host C compiler for the machine it is targeting, not by Flow.
++    `@deterministic` and any `@guarantee(...)` map onto the same no-heap /
++    no-block checker as `@rt_safe` for physical-systems W0.
+     """
++    for attr in attrs or []:
++        name, _args = parse_attribute(attr)
++        if name in ("rt_safe", "deterministic", "guarantee"):
++            return True
++    return False
++
++
++def validate_target_spec(spec: str) -> Optional[str]:
++    """Check a `@target(...)` string's *shape*."""
+     if not spec:
+         return "@target(...) requires a non-empty target string"
+     items = spec.split(",")
+@@ -161,6 +177,28 @@ def attribute_errors(fn_name: str, attrs: List[str]) -> List[str]:
+                     f"(see docs/language/lifetime-domains.md)"
+                 )
+             continue
++        if name == "aligned":
++            if len(args) != 1 or not args[0].isdigit() or int(args[0]) < 1:
++                errors.append(
++                    f"Attribute '@aligned' on '{fn_name}' requires a positive "
++                    f"integer byte alignment, e.g. @aligned(64)"
++                )
++            continue
++        if name == "guarantee":
++            if not args:
++                errors.append(
++                    f"Attribute '@guarantee' on '{fn_name}' requires at least "
++                    f"one contract, e.g. @guarantee(no_alloc, no_block)"
++                )
++            else:
++                for arg in args:
++                    if arg not in GUARANTEE_ARGS:
++                        known = ", ".join(sorted(GUARANTEE_ARGS))
++                        errors.append(
++                            f"Unknown guarantee '{arg}' on '{fn_name}'. "
++                            f"Known: {known}"
++                        )
++            continue
+         if name == "target":
+             if not args:
+                 errors.append(
+diff --git a/src/flow/fir_analysis.py b/src/flow/fir_analysis.py
+deleted file mode 100644
+index 4e729fd..0000000
+--- a/src/flow/fir_analysis.py
++++ /dev/null
+@@ -1,134 +0,0 @@
+-#!/usr/bin/env python3
+-"""CPU reference analyses over FIR-G (Phase 1).
+-
+-Deterministic fixed-point propagations. Future GPU/MLX ports must match these
+-oracles bit-for-bit on the same graphs (differential tests).
+-"""
+-
+-from __future__ import annotations
+-
+-from typing import Dict, List, Optional, Set, Tuple
+-
+-from .fir_g import (
+-    EFF_ALLOCATES,
+-    EFF_FFI,
+-    EFF_GPU,
+-    EFF_IO,
+-    EFF_UNKNOWN,
+-    EFF_WRITES_MEMORY,
+-    FirG,
+-    OpCode,
+-)
+-
+-
+-def propagate_effects(g: FirG, *, max_iters: int = 64) -> List[int]:
+-    """Monotone call-graph effect OR-propagation.
+-
+-    X^{t+1}[f] = X^t[f] ∨ ⋃_{c ∈ callees(f)} X^t[c]
+-    until fixpoint. Returns per-function effect bitvectors.
+-    """
+-    F = g.num_funcs()
+-    bits = list(g.func_effect_bits)
+-    if not g.call_row_offsets:
+-        g.build_call_graph_csr()
+-
+-    for _ in range(max_iters):
+-        changed = False
+-        for f in range(F):
+-            lo = g.call_row_offsets[f]
+-            hi = g.call_row_offsets[f + 1]
+-            acc = bits[f]
+-            for ei in range(lo, hi):
+-                cal = g.call_columns[ei]
+-                acc |= bits[cal]
+-            if acc != bits[f]:
+-                bits[f] = acc
+-                changed = True
+-        if not changed:
+-            break
+-
+-    g.func_effect_bits = bits
+-    return bits
+-
+-
+-def reachable_functions(g: FirG, roots: Optional[List[str]] = None) -> Set[int]:
+-    """Forward reachability on the call graph from roots (default: main)."""
+-    if not g.call_row_offsets:
+-        g.build_call_graph_csr()
+-    if roots is None:
+-        roots = ["main"]
+-    start: List[int] = []
+-    for name in roots:
+-        fid = g._func_by_name.get(name)
+-        if fid is not None:
+-            start.append(fid)
+-    if not start and g.num_funcs() > 0:
+-        start = [0]
+-
+-    seen: Set[int] = set()
+-    stack = list(start)
+-    while stack:
+-        f = stack.pop()
+-        if f in seen:
+-            continue
+-        seen.add(f)
+-        lo = g.call_row_offsets[f]
+-        hi = g.call_row_offsets[f + 1]
+-        for ei in range(lo, hi):
+-            cal = g.call_columns[ei]
+-            if cal not in seen:
+-                stack.append(cal)
+-    return seen
+-
+-
+-def dead_functions(g: FirG, roots: Optional[List[str]] = None) -> List[str]:
+-    live = reachable_functions(g, roots)
+-    return [g.func_name[i] for i in range(g.num_funcs()) if i not in live]
+-
+-
+-def call_graph_edges(g: FirG) -> List[Tuple[str, str, int]]:
+-    """List (caller, callee, callsite_op) for dumping/tests."""
+-    if not g.call_row_offsets:
+-        g.build_call_graph_csr()
+-    out: List[Tuple[str, str, int]] = []
+-    for f in range(g.num_funcs()):
+-        lo = g.call_row_offsets[f]
+-        hi = g.call_row_offsets[f + 1]
+-        for ei in range(lo, hi):
+-            out.append(
+-                (g.func_name[f], g.func_name[g.call_columns[ei]], g.call_edge_sites[ei])
+-            )
+-    return out
+-
+-
+-def purity_flags(g: FirG) -> Dict[str, bool]:
+-    """Coarse purity: no IO/FFI/alloc/write/unknown/gpu bits after propagation."""
+-    dirty = (
+-        EFF_IO
+-        | EFF_FFI
+-        | EFF_ALLOCATES
+-        | EFF_WRITES_MEMORY
+-        | EFF_UNKNOWN
+-        | EFF_GPU
+-    )
+-    return {
+-        g.func_name[i]: (g.func_effect_bits[i] & dirty) == 0
+-        for i in range(g.num_funcs())
+-    }
+-
+-
+-def analyse(g: FirG) -> dict:
+-    """Run Phase 1 CPU analysis suite; mutates g.func_effect_bits."""
+-    propagate_effects(g)
+-    live = reachable_functions(g)
+-    return {
+-        "summary": g.summary(),
+-        "call_edges": call_graph_edges(g),
+-        "effects": {
+-            g.func_name[i]: int(g.func_effect_bits[i]) for i in range(g.num_funcs())
+-        },
+-        "pure": purity_flags(g),
+-        "reachable": sorted(g.func_name[i] for i in live),
+-        "dead": dead_functions(g),
+-        "num_call_ops": sum(1 for op in g.op_opcode if op == OpCode.CALL),
+-    }
+diff --git a/src/flow/fir_cli.py b/src/flow/fir_cli.py
+deleted file mode 100644
+index d65be42..0000000
+--- a/src/flow/fir_cli.py
++++ /dev/null
+@@ -1,216 +0,0 @@
+-#!/usr/bin/env python3
+-"""CLI for FIR-G: graphify + CPU/MLX analyses + routing + opt candidates."""
+-
+-from __future__ import annotations
+-
+-import argparse
+-import json
+-import sys
+-from pathlib import Path
+-from typing import Any, List, Optional, Set
+-
+-from .fir_analysis import analyse
+-from .fir_graphify import graphify
+-from .module_resolver import resolve_modules
+-from .monomorphize import monomorphize
+-from .transpiler import _filter_declarations
+-
+-
+-def build_fir_g(program: str, *, active_modes: Optional[Set[str]] = None):
+-    modes = active_modes or {"compile", "c"}
+-    declarations = resolve_modules(program)
+-    declarations = _filter_declarations(declarations, modes)
+-    declarations = monomorphize(declarations)
+-    declarations = _filter_declarations(declarations, modes)
+-    return graphify(declarations)
+-
+-
+-def dump_text(report: dict) -> str:
+-    lines = [
+-        report["summary"],
+-        f"call ops: {report['num_call_ops']}",
+-        f"reachable: {', '.join(report['reachable']) or '(none)'}",
+-        f"dead: {', '.join(report['dead']) or '(none)'}",
+-        "call graph:",
+-    ]
+-    for caller, callee, site in report["call_edges"]:
+-        lines.append(f"  {caller} -> {callee}  (op {site})")
+-    lines.append("effects / pure:")
+-    for name, bits in report["effects"].items():
+-        pure = report["pure"].get(name, False)
+-        lines.append(f"  {name}: effects=0x{bits:04x} pure={pure}")
+-    if report.get("device_chosen") is not None:
+-        lines.append(
+-            f"device: requested={report.get('device_requested')} "
+-            f"chosen={report['device_chosen']}"
+-        )
+-    if report.get("bulk_backend"):
+-        lines.append(
+-            f"bulk check ({report['bulk_backend']}): "
+-            f"effects_match={report['bulk_effects_match']} "
+-            f"reach_match={report['bulk_reach_match']} "
+-            f"({report['bulk_ms']:.3f} ms)"
+-        )
+-    opts = report.get("opt_candidates")
+-    if opts:
+-        lines.append(
+-            f"opt candidates: total={opts['total']} by_kind={opts['by_kind']}"
+-        )
+-        for c in opts["top"][:12]:
+-            extra = ""
+-            if c.get("caller"):
+-                extra = f" caller={c['caller']}"
+-            lines.append(
+-                f"  [{c['kind']}] {c['target']} score={c['score']} "
+-                f"({c['reason']}){extra}"
+-            )
+-    return "\n".join(lines)
+-
+-
+-def main(argv: Optional[List[str]] = None) -> int:
+-    parser = argparse.ArgumentParser(
+-        description="Flow FIR-G: program graph + CPU/MLX analyses"
+-    )
+-    parser.add_argument(
+-        "program",
+-        nargs="?",
+-        help=".flow source file (optional with --calibrate alone)",
+-    )
+-    parser.add_argument("--json", action="store_true", help="machine-readable report")
+-    parser.add_argument(
+-        "--device",
+-        default="cpu",
+-        choices=["cpu", "numpy", "mlx", "auto"],
+-        help="analysis device (default: cpu). auto uses measured thresholds "
+-        "(uncalibrated → cpu)",
+-    )
+-    parser.add_argument(
+-        "--bench",
+-        action="store_true",
+-        help="print rough CPU vs bulk wall times for this program",
+-    )
+-    parser.add_argument(
+-        "--calibrate",
+-        action="store_true",
+-        help="sweep synthetic graph sizes, measure break-even, save thresholds",
+-    )
+-    parser.add_argument(
+-        "--thresholds",
+-        type=str,
+-        default=None,
+-        help="path to fir_g_route.json (default: $FLOW_FIR_G_THRESHOLDS or "
+-        "~/.cache/flow/fir_g_route.json)",
+-    )
+-    parser.add_argument(
+-        "--opts",
+-        action="store_true",
+-        help="list deterministic optimisation candidates (dead_elim / inline)",
+-    )
+-    args = parser.parse_args(argv)
+-
+-    thresh_path = Path(args.thresholds) if args.thresholds else None
+-
+-    if args.calibrate:
+-        from .fir_route import calibrate_routing, save_thresholds
+-
+-        th = calibrate_routing()
+-        out = save_thresholds(th, thresh_path)
+-        payload = th.to_json()
+-        payload["saved_to"] = str(out)
+-        if args.json:
+-            print(json.dumps(payload, indent=2))
+-        else:
+-            print(f"calibrated routing → {out}")
+-            print(
+-                f"  bulk_backend={th.bulk_backend} "
+-                f"min_funcs={th.min_funcs} min_edges={th.min_edges}"
+-            )
+-            for s in th.samples:
+-                print(
+-                    f"  F={s['n_funcs']} E={s['n_edges']}: "
+-                    f"cpu={s['cpu_ms']:.3f} ms  "
+-                    f"{s['bulk_backend']}={s['bulk_ms']:.3f} ms"
+-                )
+-            if th.min_funcs >= 10**9:
+-                print("  (bulk never beat CPU in sweep — auto stays on cpu)")
+-        if not args.program:
+-            return 0
+-
+-    if not args.program:
+-        parser.error("program is required unless using --calibrate alone")
+-
+-    path = Path(args.program)
+-    if not path.exists():
+-        print(f"error: no such file: {path}", file=sys.stderr)
+-        return 1
+-
+-    g = build_fir_g(str(path))
+-    report: dict[str, Any] = analyse(g)
+-    report["device_requested"] = args.device
+-
+-    from .fir_route import choose_analysis_backend
+-
+-    chosen = choose_analysis_backend(
+-        g, args.device, thresholds_path=thresh_path
+-    )
+-    report["device_chosen"] = chosen
+-
+-    if chosen != "cpu":
+-        from .fir_mlx import analyse_bulk
+-
+-        bulk = analyse_bulk(g, backend=chosen)
+-        cpu_effects = [report["effects"][g.func_name[i]] for i in range(g.num_funcs())]
+-        cpu_reach = {
+-            g._func_by_name[n] for n in report["reachable"] if n in g._func_by_name
+-        }
+-        report["bulk_backend"] = bulk.backend
+-        report["bulk_ms"] = bulk.elapsed_ms
+-        report["bulk_effects_match"] = list(bulk.effects) == cpu_effects
+-        report["bulk_reach_match"] = bulk.reachable == cpu_reach
+-        if not report["bulk_effects_match"] or not report["bulk_reach_match"]:
+-            print(
+-                "error: bulk analysis diverged from CPU oracle "
+-                f"(effects_match={report['bulk_effects_match']}, "
+-                f"reach_match={report['bulk_reach_match']})",
+-                file=sys.stderr,
+-            )
+-            return 2
+-
+-    if args.opts:
+-        from .fir_opts import discover_candidates, summarise_candidates
+-
+-        cands = discover_candidates(g)
+-        report["opt_candidates"] = summarise_candidates(cands)
+-
+-    if args.bench:
+-        from .fir_mlx import break_even_hint
+-
+-        cpu_ms, bulk_ms, bulk_name = break_even_hint(g)
+-        report["bench_cpu_ms"] = cpu_ms
+-        report["bench_bulk_ms"] = bulk_ms
+-        report["bench_bulk_name"] = bulk_name
+-
+-    if args.json:
+-        payload = dict(report)
+-        payload["call_edges"] = [
+-            {"caller": a, "callee": b, "op": c} for a, b, c in report["call_edges"]
+-        ]
+-        payload["reachable"] = list(report["reachable"])
+-        print(json.dumps(payload, indent=2))
+-    else:
+-        print(dump_text(report))
+-        if args.bench:
+-            bn = report.get("bench_bulk_name")
+-            print(
+-                f"bench: cpu={report['bench_cpu_ms']:.3f} ms"
+-                + (
+-                    f", {bn}={report['bench_bulk_ms']:.3f} ms"
+-                    if bn is not None
+-                    else ", bulk=n/a"
+-                )
+-            )
+-    return 0
+-
+-
+-if __name__ == "__main__":
+-    sys.exit(main())
+diff --git a/src/flow/fir_g.py b/src/flow/fir_g.py
+deleted file mode 100644
+index bbc8e4d..0000000
+--- a/src/flow/fir_g.py
++++ /dev/null
+@@ -1,246 +0,0 @@
+-#!/usr/bin/env python3
+-"""FIR-G: dense-ID structure-of-arrays program graph (Phase 1).
+-
+-See docs/project/fir-g.md. This is the columnar Program Graph Database —
+-not a replacement for C/MLIR emitters.
+-"""
+-
+-from __future__ import annotations
+-
+-from dataclasses import dataclass, field
+-from enum import IntEnum
+-from typing import Dict, List, Optional, Tuple
+-
+-
+-class OpCode(IntEnum):
+-    NOP = 0
+-    CONST = 1
+-    PARAM = 2
+-    LOAD = 3
+-    STORE = 4
+-    BINOP = 5
+-    UNOP = 6
+-    CALL = 7
+-    RET = 8
+-    BR = 9
+-    COND_BR = 10
+-    PHI = 11
+-    ALLOCA = 12
+-    GEP = 13
+-    CAST = 14
+-    EFFECT = 15
+-    OTHER = 255
+-
+-
+-# Effect / purity bitflags on functions (packed for GPU-friendly propagation later).
+-EFF_NONE = 0
+-EFF_READS_MEMORY = 1 << 0
+-EFF_WRITES_MEMORY = 1 << 1
+-EFF_ALLOCATES = 1 << 2
+-EFF_IO = 1 << 3          # print / filesystem / network (coarse)
+-EFF_FFI = 1 << 4
+-EFF_PANIC = 1 << 5
+-EFF_ATOMIC = 1 << 6
+-EFF_THREAD = 1 << 7
+-EFF_GPU = 1 << 8
+-EFF_UNKNOWN = 1 << 15
+-
+-
+-@dataclass
+-class FirG:
+-    """Columnar program graph. All identities are dense ints."""
+-
+-    # --- functions ---
+-    func_name: List[str] = field(default_factory=list)
+-    func_first_block: List[int] = field(default_factory=list)
+-    func_block_count: List[int] = field(default_factory=list)
+-    func_flags: List[int] = field(default_factory=list)
+-    func_effect_bits: List[int] = field(default_factory=list)
+-    func_is_extern: List[bool] = field(default_factory=list)
+-
+-    # --- blocks ---
+-    block_function: List[int] = field(default_factory=list)
+-    block_first_op: List[int] = field(default_factory=list)
+-    block_op_count: List[int] = field(default_factory=list)
+-
+-    # --- ops ---
+-    op_opcode: List[int] = field(default_factory=list)
+-    op_function: List[int] = field(default_factory=list)
+-    op_block: List[int] = field(default_factory=list)
+-    op_flags: List[int] = field(default_factory=list)
+-    op_operand_begin: List[int] = field(default_factory=list)
+-    op_operand_count: List[int] = field(default_factory=list)
+-    op_result_begin: List[int] = field(default_factory=list)
+-    op_result_count: List[int] = field(default_factory=list)
+-    # CALL extras: callee function id (-1 if unknown / indirect)
+-    op_callee: List[int] = field(default_factory=list)
+-
+-    # --- operands (edges into values) ---
+-    operand_value: List[int] = field(default_factory=list)
+-    operand_owner: List[int] = field(default_factory=list)
+-    operand_index: List[int] = field(default_factory=list)
+-
+-    # --- values ---
+-    value_producer: List[int] = field(default_factory=list)  # op id or -1
+-    value_type_id: List[int] = field(default_factory=list)
+-    value_flags: List[int] = field(default_factory=list)
+-    value_use_begin: List[int] = field(default_factory=list)
+-    value_use_count: List[int] = field(default_factory=list)
+-
+-    # --- type table ---
+-    type_name: List[str] = field(default_factory=list)
+-
+-    # --- symbol maps (build helpers; not GPU columns) ---
+-    _func_by_name: Dict[str, int] = field(default_factory=dict, repr=False)
+-    _type_by_name: Dict[str, int] = field(default_factory=dict, repr=False)
+-
+-    # --- CSR call graph (filled by analyses or finalize) ---
+-    call_row_offsets: List[int] = field(default_factory=list)
+-    call_columns: List[int] = field(default_factory=list)  # callee func ids
+-    call_edge_sites: List[int] = field(default_factory=list)  # op ids
+-
+-    def num_funcs(self) -> int:
+-        return len(self.func_name)
+-
+-    def num_blocks(self) -> int:
+-        return len(self.block_function)
+-
+-    def num_ops(self) -> int:
+-        return len(self.op_opcode)
+-
+-    def num_values(self) -> int:
+-        return len(self.value_producer)
+-
+-    def num_operands(self) -> int:
+-        return len(self.operand_value)
+-
+-    def intern_type(self, name: str) -> int:
+-        tid = self._type_by_name.get(name)
+-        if tid is not None:
+-            return tid
+-        tid = len(self.type_name)
+-        self.type_name.append(name)
+-        self._type_by_name[name] = tid
+-        return tid
+-
+-    def add_function(
+-        self,
+-        name: str,
+-        *,
+-        is_extern: bool = False,
+-        effect_bits: int = EFF_NONE,
+-        flags: int = 0,
+-    ) -> int:
+-        fid = len(self.func_name)
+-        self.func_name.append(name)
+-        self.func_first_block.append(0)
+-        self.func_block_count.append(0)
+-        self.func_flags.append(flags)
+-        self.func_effect_bits.append(effect_bits)
+-        self.func_is_extern.append(is_extern)
+-        self._func_by_name[name] = fid
+-        return fid
+-
+-    def add_block(self, function_id: int) -> int:
+-        bid = len(self.block_function)
+-        self.block_function.append(function_id)
+-        self.block_first_op.append(self.num_ops())
+-        self.block_op_count.append(0)
+-        if self.func_block_count[function_id] == 0:
+-            self.func_first_block[function_id] = bid
+-        self.func_block_count[function_id] += 1
+-        return bid
+-
+-    def add_value(self, producer_op: int, type_id: int, flags: int = 0) -> int:
+-        vid = len(self.value_producer)
+-        self.value_producer.append(producer_op)
+-        self.value_type_id.append(type_id)
+-        self.value_flags.append(flags)
+-        self.value_use_begin.append(0)
+-        self.value_use_count.append(0)
+-        return vid
+-
+-    def add_op(
+-        self,
+-        opcode: OpCode,
+-        function_id: int,
+-        block_id: int,
+-        *,
+-        operand_values: Optional[List[int]] = None,
+-        result_type_ids: Optional[List[int]] = None,
+-        callee: int = -1,
+-        flags: int = 0,
+-    ) -> Tuple[int, List[int]]:
+-        """Append an op; returns (op_id, result_value_ids)."""
+-        op_id = self.num_ops()
+-        operand_values = operand_values or []
+-        result_type_ids = result_type_ids or []
+-
+-        op_operand_begin = self.num_operands()
+-        for i, vid in enumerate(operand_values):
+-            self.operand_value.append(vid)
+-            self.operand_owner.append(op_id)
+-            self.operand_index.append(i)
+-
+-        result_ids: List[int] = []
+-        result_begin = self.num_values()
+-        for tid in result_type_ids:
+-            result_ids.append(self.add_value(op_id, tid))
+-
+-        self.op_opcode.append(int(opcode))
+-        self.op_function.append(function_id)
+-        self.op_block.append(block_id)
+-        self.op_flags.append(flags)
+-        self.op_operand_begin.append(op_operand_begin)
+-        self.op_operand_count.append(len(operand_values))
+-        self.op_result_begin.append(result_begin)
+-        self.op_result_count.append(len(result_ids))
+-        self.op_callee.append(callee)
+-
+-        if self.block_op_count[block_id] == 0:
+-            self.block_first_op[block_id] = op_id
+-        self.block_op_count[block_id] += 1
+-        return op_id, result_ids
+-
+-    def finalize_uses(self) -> None:
+-        """Build per-value use lists from operand edges (CSR-style counts)."""
+-        n = self.num_values()
+-        uses: List[List[int]] = [[] for _ in range(n)]
+-        for ei, vid in enumerate(self.operand_value):
+-            if 0 <= vid < n:
+-                uses[vid].append(self.operand_owner[ei])
+-        # Flatten into value_use_* — store use op ids in a side list for Phase 1
+-        # by encoding begin/count over a packed use_ops array.
+-        self._use_ops: List[int] = []
+-        for vid in range(n):
+-            self.value_use_begin[vid] = len(self._use_ops)
+-            self.value_use_count[vid] = len(uses[vid])
+-            self._use_ops.extend(uses[vid])
+-
+-    def build_call_graph_csr(self) -> None:
+-        """CSR: for each function, list of callee function ids (with call sites)."""
+-        F = self.num_funcs()
+-        edges: List[List[Tuple[int, int]]] = [[] for _ in range(F)]
+-        for op in range(self.num_ops()):
+-            if self.op_opcode[op] != OpCode.CALL:
+-                continue
+-            callee = self.op_callee[op]
+-            if callee < 0:
+-                continue
+-            caller = self.op_function[op]
+-            edges[caller].append((callee, op))
+-        self.call_row_offsets = [0]
+-        self.call_columns = []
+-        self.call_edge_sites = []
+-        for f in range(F):
+-            for callee, site in edges[f]:
+-                self.call_columns.append(callee)
+-                self.call_edge_sites.append(site)
+-            self.call_row_offsets.append(len(self.call_columns))
+-
+-    def summary(self) -> str:
+-        return (
+-            f"FIR-G: funcs={self.num_funcs()} blocks={self.num_blocks()} "
+-            f"ops={self.num_ops()} values={self.num_values()} "
+-            f"operands={self.num_operands()} types={len(self.type_name)}"
+-        )
+diff --git a/src/flow/fir_graphify.py b/src/flow/fir_graphify.py
+deleted file mode 100644
+index db3a6fc..0000000
+--- a/src/flow/fir_graphify.py
++++ /dev/null
+@@ -1,284 +0,0 @@
+-#!/usr/bin/env python3
+-"""AST → FIR-G graphification (Phase 1 coarse lowering).
+-
+-Produces a dense program graph suitable for call-graph / effect / reachability
+-analyses. Not a full SSA builder yet — calls, returns, and structural shells
+-are enough for Phase 1 CPU reference algorithms.
+-"""
+-
+-from __future__ import annotations
+-
+-from typing import Any, List, Optional
+-
+-from .fir_g import (
+-    EFF_ALLOCATES,
+-    EFF_FFI,
+-    EFF_IO,
+-    EFF_NONE,
+-    EFF_UNKNOWN,
+-    EFF_WRITES_MEMORY,
+-    FirG,
+-    OpCode,
+-)
+-from .parser import (
+-    Assignment,
+-    BinaryOperation,
+-    Block,
+-    EffectCall,
+-    FunctionCall,
+-    FunctionDecl,
+-    IfStatement,
+-    Literal,
+-    MethodCall,
+-    ReturnStatement,
+-    VarDecl,
+-    WhileStatement,
+-    ForStatement,
+-    UnaryOperation,
+-)
+-
+-
+-_IO_NAMES = {
+-    "print",
+-    "println",
+-    "printf",
+-    "puts",
+-    "fprintf",
+-    "fputs",
+-    "read",
+-    "write",
+-    "fopen",
+-    "fclose",
+-}
+-_ALLOC_NAMES = {"malloc", "calloc", "realloc", "free", "alloc", "arena_alloc"}
+-
+-
+-def _type_name(t: Any) -> str:
+-    if t is None:
+-        return "void"
+-    name = getattr(t, "name", None)
+-    return name if isinstance(name, str) else "unknown"
+-
+-
+-def _guess_effect_for_name(name: str, is_extern: bool) -> int:
+-    bits = EFF_NONE
+-    if is_extern:
+-        bits |= EFF_FFI
+-    if name in _IO_NAMES or name.startswith("flow_gfx_") or name.startswith("flow_audio_"):
+-        bits |= EFF_IO
+-    if name in _ALLOC_NAMES:
+-        bits |= EFF_ALLOCATES | EFF_WRITES_MEMORY
+-    return bits
+-
+-
+-def graphify(declarations: List[Any]) -> FirG:
+-    """Lower monomorphized declarations into a FIR-G module."""
+-    g = FirG()
+-    void_ty = g.intern_type("void")
+-    i32_ty = g.intern_type("i32")
+-
+-    # Pass 1: register all functions (including extern).
+-    for decl in declarations:
+-        if not isinstance(decl, FunctionDecl):
+-            continue
+-        effects = _guess_effect_for_name(decl.name, bool(getattr(decl, "is_extern", False)))
+-        if getattr(decl, "attributes", None) and "gpu" in (decl.attributes or []):
+-            from .fir_g import EFF_GPU
+-
+-            effects |= EFF_GPU
+-        g.add_function(
+-            decl.name,
+-            is_extern=bool(getattr(decl, "is_extern", False)),
+-            effect_bits=effects,
+-        )
+-
+-    # Pass 2: bodies → blocks/ops.
+-    for decl in declarations:
+-        if not isinstance(decl, FunctionDecl):
+-            continue
+-        fid = g._func_by_name[decl.name]
+-        if getattr(decl, "is_extern", False) or decl.body is None:
+-            # Extern / declaration-only: empty entry block.
+-            g.add_block(fid)
+-            continue
+-
+-        bid = g.add_block(fid)
+-        # Parameters as PARAM ops.
+-        for p in decl.parameters or []:
+-            tid = g.intern_type(_type_name(getattr(p, "type", None)))
+-            g.add_op(OpCode.PARAM, fid, bid, result_type_ids=[tid])
+-
+-        _lower_block(g, fid, bid, decl.body, i32_ty, void_ty)
+-
+-        # Ensure at least one terminator if empty.
+-        if g.block_op_count[bid] == 0:
+-            g.add_op(OpCode.RET, fid, bid)
+-
+-    g.finalize_uses()
+-    g.build_call_graph_csr()
+-    return g
+-
+-
+-def _lower_block(
+-    g: FirG,
+-    fid: int,
+-    bid: int,
+-    block: Optional[Block],
+-    i32_ty: int,
+-    void_ty: int,
+-) -> None:
+-    if block is None:
+-        return
+-    for stmt in block.statements:
+-        _lower_stmt(g, fid, bid, stmt, i32_ty, void_ty)
+-
+-
+-def _lower_stmt(
+-    g: FirG,
+-    fid: int,
+-    bid: int,
+-    stmt: Any,
+-    i32_ty: int,
+-    void_ty: int,
+-) -> None:
+-    if isinstance(stmt, ReturnStatement):
+-        ops: List[int] = []
+-        if getattr(stmt, "value", None) is not None:
+-            vid = _lower_expr(g, fid, bid, stmt.value, i32_ty)
+-            if vid is not None:
+-                ops.append(vid)
+-        g.add_op(OpCode.RET, fid, bid, operand_values=ops)
+-        return
+-
+-    if isinstance(stmt, VarDecl):
+-        if stmt.initializer is not None:
+-            vid = _lower_expr(g, fid, bid, stmt.initializer, i32_ty)
+-            tid = g.intern_type(_type_name(stmt.type))
+-            # Model as store into an alloca result.
+-            alloc, _ = g.add_op(OpCode.ALLOCA, fid, bid, result_type_ids=[tid])
+-            operands = []
+-            # result of alloca is first result value
+-            ptr = g.op_result_begin[alloc]
+-            operands.append(ptr)
+-            if vid is not None:
+-                operands.append(vid)
+-            g.add_op(OpCode.STORE, fid, bid, operand_values=operands)
+-        return
+-
+-    if isinstance(stmt, Assignment):
+-        # value side only for Phase 1 graph edges
+-        _lower_expr(g, fid, bid, stmt.value, i32_ty)
+-        g.add_op(OpCode.STORE, fid, bid, flags=0)
+-        return
+-
+-    if isinstance(stmt, IfStatement):
+-        _lower_expr(g, fid, bid, stmt.condition, i32_ty)
+-        then_b = g.add_block(fid)
+-        _lower_block(g, fid, then_b, stmt.then_block, i32_ty, void_ty)
+-        else_b = -1
+-        if stmt.else_block is not None:
+-            else_b = g.add_block(fid)
+-            _lower_block(g, fid, else_b, stmt.else_block, i32_ty, void_ty)
+-        for _, eblk in getattr(stmt, "elif_blocks", []) or []:
+-            eb = g.add_block(fid)
+-            _lower_block(g, fid, eb, eblk, i32_ty, void_ty)
+-        g.add_op(OpCode.COND_BR, fid, bid)
+-        return
+-
+-    if isinstance(stmt, (WhileStatement, ForStatement)):
+-        body_b = g.add_block(fid)
+-        if isinstance(stmt, WhileStatement):
+-            _lower_expr(g, fid, bid, stmt.condition, i32_ty)
+-            _lower_block(g, fid, body_b, stmt.body, i32_ty, void_ty)
+-        else:
+-            _lower_block(g, fid, body_b, stmt.body, i32_ty, void_ty)
+-        g.add_op(OpCode.BR, fid, bid)
+-        return
+-
+-    if isinstance(stmt, (FunctionCall, MethodCall, EffectCall)):
+-        _lower_expr(g, fid, bid, stmt, i32_ty)
+-        return
+-
+-    # Expression statements / unknown: try as expression
+-    if hasattr(stmt, "__dataclass_fields__") or hasattr(stmt, "operator"):
+-        try:
+-            _lower_expr(g, fid, bid, stmt, i32_ty)
+-        except Exception:
+-            g.add_op(OpCode.OTHER, fid, bid)
+-
+-
+-def _lower_expr(
+-    g: FirG, fid: int, bid: int, expr: Any, default_ty: int
+-) -> Optional[int]:
+-    if expr is None:
+-        return None
+-
+-    if isinstance(expr, Literal):
+-        tid = g.intern_type(_type_name(expr.type) if getattr(expr, "type", None) else "i32")
+-        _, results = g.add_op(OpCode.CONST, fid, bid, result_type_ids=[tid])
+-        return results[0] if results else None
+-
+-    if isinstance(expr, BinaryOperation):
+-        left = _lower_expr(g, fid, bid, expr.left, default_ty)
+-        right = _lower_expr(g, fid, bid, expr.right, default_ty)
+-        ops = [v for v in (left, right) if v is not None]
+-        _, results = g.add_op(
+-            OpCode.BINOP, fid, bid, operand_values=ops, result_type_ids=[default_ty]
+-        )
+-        return results[0] if results else None
+-
+-    if isinstance(expr, UnaryOperation):
+-        inner = _lower_expr(g, fid, bid, expr.operand, default_ty)
+-        ops = [inner] if inner is not None else []
+-        _, results = g.add_op(
+-            OpCode.UNOP, fid, bid, operand_values=ops, result_type_ids=[default_ty]
+-        )
+-        return results[0] if results else None
+-
+-    if isinstance(expr, FunctionCall):
+-        arg_vids: List[int] = []
+-        for a in expr.arguments or []:
+-            v = _lower_expr(g, fid, bid, a, default_ty)
+-            if v is not None:
+-                arg_vids.append(v)
+-        callee = g._func_by_name.get(expr.name, -1)
+-        # Intrinsics / builtins may not be FunctionDecls — still attribute effects.
+-        if expr.name in _IO_NAMES:
+-            g.func_effect_bits[fid] |= EFF_IO
+-        if expr.name in _ALLOC_NAMES:
+-            g.func_effect_bits[fid] |= EFF_ALLOCATES | EFF_WRITES_MEMORY
+-        _, results = g.add_op(
+-            OpCode.CALL,
+-            fid,
+-            bid,
+-            operand_values=arg_vids,
+-            result_type_ids=[default_ty],
+-            callee=callee,
+-        )
+-        if callee < 0 and expr.name not in _IO_NAMES and expr.name not in _ALLOC_NAMES:
+-            g.func_effect_bits[fid] |= EFF_UNKNOWN
+-        return results[0] if results else None
+-
+-    if isinstance(expr, MethodCall):
+-        # Treat as call by method name if registered; else OTHER.
+-        name = getattr(expr, "method", None) or getattr(expr, "name", "")
+-        callee = g._func_by_name.get(name, -1)
+-        _, results = g.add_op(
+-            OpCode.CALL,
+-            fid,
+-            bid,
+-            result_type_ids=[default_ty],
+-            callee=callee,
+-        )
+-        return results[0] if results else None
+-
+-    if isinstance(expr, EffectCall):
+-        g.func_effect_bits[fid] |= EFF_UNKNOWN
+-        _, results = g.add_op(
+-            OpCode.EFFECT, fid, bid, result_type_ids=[default_ty]
+-        )
+-        return results[0] if results else None
+-
+-    # Variable / other — opaque load
+-    _, results = g.add_op(OpCode.LOAD, fid, bid, result_type_ids=[default_ty])
+-    return results[0] if results else None
+diff --git a/src/flow/fir_mlx.py b/src/flow/fir_mlx.py
+deleted file mode 100644
+index 689f71c..0000000
+--- a/src/flow/fir_mlx.py
++++ /dev/null
+@@ -1,304 +0,0 @@
+-#!/usr/bin/env python3
+-"""FIR-G Phase 2: experimental bulk analyses via MLX (Apple GPU) / NumPy.
+-
+-Correctness contract
+---------------------
+-Python CPU oracles in ``fir_analysis`` remain ground truth. Every MLX/NumPy
+-bulk path must match them bit-for-bit on the same ``FirG`` (see
+-``tests/unit/test_fir_mlx_oracle.py``).
+-
+-MLX is for *throughput* on large graphs, never for profitability/ML decisions.
+-Routing (when to leave CPU) is measured, not guessed — see ``break_even_hint``.
+-"""
+-
+-from __future__ import annotations
+-
+-import time
+-from dataclasses import dataclass
+-from typing import List, Optional, Sequence, Set, Tuple
+-
+-from .fir_g import FirG
+-
+-try:
+-    import mlx.core as mx
+-
+-    HAS_MLX = True
+-except ImportError:  # pragma: no cover
+-    mx = None  # type: ignore
+-    HAS_MLX = False
+-
+-try:
+-    import numpy as np
+-
+-    HAS_NUMPY = True
+-except ImportError:  # pragma: no cover
+-    np = None  # type: ignore
+-    HAS_NUMPY = False
+-
+-
+-@dataclass
+-class BulkReport:
+-    backend: str
+-    effects: List[int]
+-    reachable: Set[int]
+-    elapsed_ms: float
+-
+-
+-def _ensure_csr(g: FirG) -> None:
+-    if not g.call_row_offsets:
+-        g.build_call_graph_csr()
+-
+-
+-def _adjacency_numpy(g: FirG):
+-    """Boolean caller×callee adjacency (edge presence), float32 for matmul."""
+-    assert HAS_NUMPY
+-    F = g.num_funcs()
+-    adj = np.zeros((F, F), dtype=np.float32)
+-    for f in range(F):
+-        lo = g.call_row_offsets[f]
+-        hi = g.call_row_offsets[f + 1]
+-        for ei in range(lo, hi):
+-            adj[f, g.call_columns[ei]] = 1.0
+-    return adj
+-
+-
+-def _pack_bit_planes(planes: List, *, backend: str) -> List[int]:
+-    """OR-pack 32 boolean float planes into uint32 effect words."""
+-    F = len(planes[0]) if planes else 0
+-    if F == 0:
+-        return []
+-    if backend == "numpy":
+-        out = np.zeros(F, dtype=np.uint32)
+-        for b, v in enumerate(planes):
+-            on = (np.asarray(v) > 0.0).astype(np.uint32)
+-            out |= on << np.uint32(b)
+-        return [int(x) for x in out.tolist()]
+-    # mlx → host list via numpy bridge
+-    assert HAS_MLX and HAS_NUMPY
+-    out = np.zeros(F, dtype=np.uint32)
+-    for b, v in enumerate(planes):
+-        mx.eval(v)
+-        on = (np.array(v.tolist(), dtype=np.float32) > 0.0).astype(np.uint32)
+-        out |= on << np.uint32(b)
+-    return [int(x) for x in out.tolist()]
+-
+-
+-def _propagate_effects_dense(
+-    bits0: Sequence[int], adj_np, *, backend: str, max_iters: int = 64
+-) -> List[int]:
+-    """Bit-sliced monotone OR: for each bit, v ← max(v, Adj @ v) until fixpoint."""
+-    F = len(bits0)
+-    if F == 0:
+-        return []
+-    bits_u = [int(b) & 0xFFFFFFFF for b in bits0]
+-
+-    if backend == "numpy":
+-        assert HAS_NUMPY
+-        a = adj_np
+-        vs = [
+-            np.array([((bits_u[i] >> b) & 1) for i in range(F)], dtype=np.float32)
+-            for b in range(32)
+-        ]
+-        for _ in range(max_iters):
+-            changed = False
+-            nxt = []
+-            for v in vs:
+-                prop = a @ v
+-                merged = (np.maximum(v, prop) > 0.0).astype(np.float32)
+-                if not np.array_equal(merged, v):
+-                    changed = True
+-                nxt.append(merged)
+-            vs = nxt
+-            if not changed:
+-                break
+-        return _pack_bit_planes(vs, backend="numpy")
+-
+-    assert backend == "mlx" and HAS_MLX and HAS_NUMPY
+-    a = mx.array(adj_np)
+-    vs = [
+-        mx.array(
+-            [float((bits_u[i] >> b) & 1) for i in range(F)],
+-            dtype=mx.float32,
+-        )
+-        for b in range(32)
+-    ]
+-    for _ in range(max_iters):
+-        changed = False
+-        nxt = []
+-        for v in vs:
+-            prop = a @ v
+-            merged = (mx.maximum(v, prop) > 0.0).astype(mx.float32)
+-            mx.eval(merged)
+-            if bool(mx.any(merged != v).item()):
+-                changed = True
+-            nxt.append(merged)
+-        vs = nxt
+-        if not changed:
+-            break
+-    return _pack_bit_planes(vs, backend="mlx")
+-
+-
+-def _reachable_dense(
+-    adj_np, roots: Sequence[int], *, backend: str, max_iters: int = 64
+-) -> Set[int]:
+-    """Forward reachability: R ← max(R, Adjᵀ @ R) from roots."""
+-    F = adj_np.shape[0]
+-    if F == 0:
+-        return set()
+-    a_t = adj_np.T
+-
+-    if backend == "numpy":
+-        r = np.zeros(F, dtype=np.float32)
+-        for i in roots:
+-            if 0 <= i < F:
+-                r[i] = 1.0
+-        for _ in range(max_iters):
+-            nxt = (np.maximum(r, a_t @ r) > 0.0).astype(np.float32)
+-            if np.array_equal(nxt, r):
+-                r = nxt
+-                break
+-            r = nxt
+-        return {i for i, v in enumerate(r.tolist()) if v > 0.0}
+-
+-    assert backend == "mlx" and HAS_MLX
+-    r = mx.zeros((F,), dtype=mx.float32)
+-    # seed roots (small; host loop is fine)
+-    seed = np.zeros(F, dtype=np.float32)
+-    for i in roots:
+-        if 0 <= i < F:
+-            seed[i] = 1.0
+-    r = mx.array(seed)
+-    at = mx.array(a_t)
+-    for _ in range(max_iters):
+-        nxt = mx.maximum(r, at @ r)
+-        nxt = (nxt > 0.0).astype(mx.float32)
+-        mx.eval(nxt)
+-        if bool(mx.all(nxt == r).item()):
+-            r = nxt
+-            break
+-        r = nxt
+-    return {i for i, v in enumerate(r.tolist()) if v > 0.0}
+-
+-
+-def resolve_backend(requested: str = "auto", g: Optional[FirG] = None) -> str:
+-    """Map --device=cpu|numpy|mlx|auto to an implementation name.
+-
+-    ``auto`` without a graph stays on CPU (safe). Prefer
+-    ``fir_route.choose_analysis_backend`` when a ``FirG`` is available.
+-    """
+-    req = (requested or "auto").lower()
+-    if req == "cpu":
+-        return "cpu"
+-    if req == "numpy":
+-        if not HAS_NUMPY:
+-            raise RuntimeError("NumPy not available")
+-        return "numpy"
+-    if req == "mlx":
+-        if not HAS_MLX:
+-            raise RuntimeError("MLX not available")
+-        return "mlx"
+-    if req == "auto":
+-        if g is not None:
+-            from .fir_route import choose_analysis_backend
+-
+-            return choose_analysis_backend(g, "auto")
+-        # Uncalibrated / no graph → never guess GPU.
+-        return "cpu"
+-    raise ValueError(f"unknown device: {requested}")
+-
+-
+-def propagate_effects_bulk(
+-    g: FirG, *, backend: str = "auto", max_iters: int = 64
+-) -> List[int]:
+-    """Bulk effect OR-propagation. Does not mutate ``g``."""
+-    _ensure_csr(g)
+-    be = resolve_backend(backend, g=g)
+-    if be == "cpu":
+-        from .fir_analysis import propagate_effects
+-
+-        saved = list(g.func_effect_bits)
+-        out = propagate_effects(g, max_iters=max_iters)
+-        g.func_effect_bits = saved
+-        return list(out)
+-
+-    if not HAS_NUMPY:
+-        raise RuntimeError("bulk backends require NumPy to build adjacency")
+-    adj = _adjacency_numpy(g)
+-    bits0 = list(g.func_effect_bits)
+-    return _propagate_effects_dense(bits0, adj, backend=be, max_iters=max_iters)
+-
+-
+-def reachable_functions_bulk(
+-    g: FirG,
+-    roots: Optional[List[str]] = None,
+-    *,
+-    backend: str = "auto",
+-    max_iters: int = 64,
+-) -> Set[int]:
+-    _ensure_csr(g)
+-    be = resolve_backend(backend, g=g)
+-    if roots is None:
+-        roots = ["main"]
+-    start: List[int] = []
+-    for name in roots:
+-        fid = g._func_by_name.get(name)
+-        if fid is not None:
+-            start.append(fid)
+-    if not start and g.num_funcs() > 0:
+-        start = [0]
+-
+-    if be == "cpu":
+-        from .fir_analysis import reachable_functions
+-
+-        return set(reachable_functions(g, roots))
+-
+-    if not HAS_NUMPY:
+-        raise RuntimeError("bulk backends require NumPy to build adjacency")
+-    adj = _adjacency_numpy(g)
+-    return _reachable_dense(adj, start, backend=be, max_iters=max_iters)
+-
+-
+-def analyse_bulk(g: FirG, *, backend: str = "auto") -> BulkReport:
+-    """Run bulk effect + reachability; leave ``g.func_effect_bits`` unchanged."""
+-    be = resolve_backend(backend, g=g)
+-    t0 = time.perf_counter()
+-    effects = propagate_effects_bulk(g, backend=be)
+-    live = reachable_functions_bulk(g, backend=be)
+-    elapsed = (time.perf_counter() - t0) * 1000.0
+-    return BulkReport(backend=be, effects=effects, reachable=live, elapsed_ms=elapsed)
+-
+-
+-def break_even_hint(
+-    g: FirG,
+-    *,
+-    repeats: int = 5,
+-) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+-    """Rough wall-time compare CPU vs best bulk backend (ms). Not a product threshold.
+-
+-    Returns (cpu_ms, bulk_ms, bulk_name) or Nones if bulk unavailable.
+-    """
+-    from .fir_analysis import propagate_effects, reachable_functions
+-
+-    _ensure_csr(g)
+-    saved = list(g.func_effect_bits)
+-
+-    def run_cpu() -> None:
+-        g.func_effect_bits = list(saved)
+-        propagate_effects(g)
+-        reachable_functions(g)
+-        g.func_effect_bits = list(saved)
+-
+-    t0 = time.perf_counter()
+-    for _ in range(repeats):
+-        run_cpu()
+-    cpu_ms = (time.perf_counter() - t0) * 1000.0 / repeats
+-
+-    bulk_name = "mlx" if HAS_MLX else ("numpy" if HAS_NUMPY else None)
+-    if bulk_name is None:
+-        return cpu_ms, None, None
+-
+-    t1 = time.perf_counter()
+-    for _ in range(repeats):
+-        analyse_bulk(g, backend=bulk_name)
+-    bulk_ms = (time.perf_counter() - t1) * 1000.0 / repeats
+-    return cpu_ms, bulk_ms, bulk_name
+diff --git a/src/flow/fir_opts.py b/src/flow/fir_opts.py
+deleted file mode 100644
+index c717571..0000000
+--- a/src/flow/fir_opts.py
++++ /dev/null
+@@ -1,140 +0,0 @@
+-#!/usr/bin/env python3
+-"""FIR-G Phase 4 (start): batched optimisation *candidates* + deterministic costs.
+-
+-Profitability only — proposals never rewrite the graph or bypass semantic checks.
+-Transforms that would change meaning stay gated on the trusted compiler path.
+-"""
+-
+-from __future__ import annotations
+-
+-from dataclasses import asdict, dataclass
+-from typing import Dict, List, Optional
+-
+-from .fir_analysis import purity_flags, reachable_functions
+-from .fir_g import FirG, OpCode
+-
+-
+-# Heuristic knobs (deterministic, documented — not learned).
+-INLINE_MAX_CALLEE_OPS = 16
+-INLINE_SINGLE_SITE_BONUS = 2.0
+-INLINE_PURE_BONUS = 1.5
+-DEAD_ELIM_BASE_SCORE = 10.0
+-
+-
+-@dataclass(frozen=True)
+-class OptCandidate:
+-    kind: str  # "dead_elim" | "inline"
+-    target: str
+-    score: float  # higher = more profitable to consider
+-    reason: str
+-    caller: Optional[str] = None
+-    callsite_op: Optional[int] = None
+-    callee_ops: Optional[int] = None
+-    call_sites: Optional[int] = None
+-
+-    def to_dict(self) -> dict:
+-        return asdict(self)
+-
+-
+-def func_op_count(g: FirG, fid: int) -> int:
+-    total = 0
+-    first = g.func_first_block[fid]
+-    nblocks = g.func_block_count[fid]
+-    for bi in range(first, first + nblocks):
+-        total += g.block_op_count[bi]
+-    return total
+-
+-
+-def _callee_call_sites(g: FirG) -> Dict[int, List[int]]:
+-    """Map callee func id → list of CALL op ids."""
+-    if not g.call_row_offsets:
+-        g.build_call_graph_csr()
+-    sites: Dict[int, List[int]] = {}
+-    for op in range(g.num_ops()):
+-        if g.op_opcode[op] != OpCode.CALL:
+-            continue
+-        cal = g.op_callee[op]
+-        if cal < 0:
+-            continue
+-        sites.setdefault(cal, []).append(op)
+-    return sites
+-
+-
+-def discover_candidates(
+-    g: FirG,
+-    *,
+-    roots: Optional[List[str]] = None,
+-    inline_max_ops: int = INLINE_MAX_CALLEE_OPS,
+-) -> List[OptCandidate]:
+-    """Scan FIR-G for dead-elim and inline candidates; score deterministically."""
+-    if not g.call_row_offsets:
+-        g.build_call_graph_csr()
+-    # Effects/purity should reflect propagated bits when available.
+-    pure = purity_flags(g)
+-    live = reachable_functions(g, roots)
+-    sites_by_callee = _callee_call_sites(g)
+-    out: List[OptCandidate] = []
+-
+-    for fid in range(g.num_funcs()):
+-        name = g.func_name[fid]
+-        if fid in live:
+-            continue
+-        if name == "main":
+-            continue
+-        # Unreachable from roots → dead code elimination candidate.
+-        out.append(
+-            OptCandidate(
+-                kind="dead_elim",
+-                target=name,
+-                score=DEAD_ELIM_BASE_SCORE + float(func_op_count(g, fid)),
+-                reason="unreachable from roots",
+-                callee_ops=func_op_count(g, fid),
+-            )
+-        )
+-
+-    for cal, sites in sites_by_callee.items():
+-        if cal not in live:
+-            continue
+-        if g.func_is_extern[cal]:
+-            continue
+-        ops = func_op_count(g, cal)
+-        if ops <= 0 or ops > inline_max_ops:
+-            continue
+-        name = g.func_name[cal]
+-        is_pure = pure.get(name, False)
+-        n_sites = len(sites)
+-        # Smaller body, fewer sites, purity → higher score.
+-        score = (inline_max_ops - ops + 1) / float(n_sites)
+-        if n_sites == 1:
+-            score *= INLINE_SINGLE_SITE_BONUS
+-        if is_pure:
+-            score *= INLINE_PURE_BONUS
+-        for op in sites:
+-            caller = g.func_name[g.op_function[op]]
+-            reason = f"callee_ops={ops} sites={n_sites} pure={is_pure}"
+-            out.append(
+-                OptCandidate(
+-                    kind="inline",
+-                    target=name,
+-                    score=round(score, 4),
+-                    reason=reason,
+-                    caller=caller,
+-                    callsite_op=op,
+-                    callee_ops=ops,
+-                    call_sites=n_sites,
+-                )
+-            )
+-
+-    out.sort(key=lambda c: (-c.score, c.kind, c.target, c.callsite_op or -1))
+-    return out
+-
+-
+-def summarise_candidates(cands: List[OptCandidate], *, limit: int = 32) -> dict:
+-    by_kind: Dict[str, int] = {}
+-    for c in cands:
+-        by_kind[c.kind] = by_kind.get(c.kind, 0) + 1
+-    return {
+-        "total": len(cands),
+-        "by_kind": by_kind,
+-        "top": [c.to_dict() for c in cands[:limit]],
+-    }
+diff --git a/src/flow/fir_route.py b/src/flow/fir_route.py
+deleted file mode 100644
+index d954c62..0000000
+--- a/src/flow/fir_route.py
++++ /dev/null
+@@ -1,246 +0,0 @@
+-#!/usr/bin/env python3
+-"""FIR-G Phase 3: measured CPU vs bulk analysis routing.
+-
+-Thresholds are never guessed. ``calibrate_routing`` sweeps synthetic call-graph
+-sizes, times CPU vs MLX/NumPy, and persists the first size where bulk wins.
+-Uncalibrated ``--device=auto`` stays on CPU (safe default).
+-"""
+-
+-from __future__ import annotations
+-
+-import json
+-import os
+-import time
+-from dataclasses import asdict, dataclass, field
+-from pathlib import Path
+-from typing import Any, Dict, List, Optional, Sequence
+-
+-from .fir_g import EFF_IO, FirG, OpCode
+-
+-try:
+-    from .fir_mlx import HAS_MLX, HAS_NUMPY, analyse_bulk
+-except ImportError:  # pragma: no cover
+-    HAS_MLX = False
+-    HAS_NUMPY = False
+-    analyse_bulk = None  # type: ignore
+-
+-DEFAULT_SIZES: tuple = (8, 16, 32, 64, 128, 256, 512, 1024)
+-# If bulk never wins in the sweep, keep auto on CPU forever for this machine.
+-NEVER_BULK = 10**9
+-
+-
+-@dataclass
+-class Sample:
+-    n_funcs: int
+-    n_edges: int
+-    cpu_ms: float
+-    bulk_ms: float
+-    bulk_backend: str
+-
+-
+-@dataclass
+-class RouteThresholds:
+-    bulk_backend: str
+-    min_funcs: int
+-    min_edges: int
+-    host: str = ""
+-    samples: List[Dict[str, Any]] = field(default_factory=list)
+-
+-    def to_json(self) -> dict:
+-        return asdict(self)
+-
+-    @classmethod
+-    def from_json(cls, data: dict) -> "RouteThresholds":
+-        return cls(
+-            bulk_backend=str(data["bulk_backend"]),
+-            min_funcs=int(data["min_funcs"]),
+-            min_edges=int(data.get("min_edges", data["min_funcs"])),
+-            host=str(data.get("host", "")),
+-            samples=list(data.get("samples") or []),
+-        )
+-
+-
+-def default_thresholds_path() -> Path:
+-    env = os.environ.get("FLOW_FIR_G_THRESHOLDS")
+-    if env:
+-        return Path(env)
+-    xdg = os.environ.get("XDG_CACHE_HOME")
+-    if xdg:
+-        return Path(xdg) / "flow" / "fir_g_route.json"
+-    return Path.home() / ".cache" / "flow" / "fir_g_route.json"
+-
+-
+-def load_thresholds(path: Optional[Path] = None) -> Optional[RouteThresholds]:
+-    p = path or default_thresholds_path()
+-    if not p.is_file():
+-        return None
+-    try:
+-        data = json.loads(p.read_text())
+-        return RouteThresholds.from_json(data)
+-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+-        return None
+-
+-
+-def save_thresholds(th: RouteThresholds, path: Optional[Path] = None) -> Path:
+-    p = path or default_thresholds_path()
+-    p.parent.mkdir(parents=True, exist_ok=True)
+-    p.write_text(json.dumps(th.to_json(), indent=2) + "\n")
+-    return p
+-
+-
+-def synthetic_call_graph(n_funcs: int, *, fanout: int = 2) -> FirG:
+-    """Build a dense-ish synthetic FirG for calibration (no parser).
+-
+-    Layout: ``main`` calls ``f0..f{n-1}``; each ``fi`` (i>0) calls ``f0`` and
+-    up to ``fanout`` earlier siblings — enough edges for Adj matmul cost to show.
+-    ``f0`` is marked IO so effect propagation has work to do.
+-    """
+-    g = FirG()
+-    if n_funcs < 1:
+-        return g
+-    ids = [g.add_function(f"f{i}") for i in range(n_funcs)]
+-    main = g.add_function("main")
+-    g.func_effect_bits[ids[0]] = EFF_IO
+-    b_main = g.add_block(main)
+-    for i in range(n_funcs):
+-        g.add_op(OpCode.CALL, main, b_main, callee=ids[i])
+-    for i in range(1, n_funcs):
+-        bi = g.add_block(ids[i])
+-        g.add_op(OpCode.CALL, ids[i], bi, callee=ids[0])
+-        for k in range(1, min(fanout, i) + 1):
+-            g.add_op(OpCode.CALL, ids[i], bi, callee=ids[i - k])
+-    g.build_call_graph_csr()
+-    return g
+-
+-
+-def _best_bulk_name() -> Optional[str]:
+-    if HAS_MLX:
+-        return "mlx"
+-    if HAS_NUMPY:
+-        return "numpy"
+-    return None
+-
+-
+-def _time_cpu(g: FirG, repeats: int) -> float:
+-    from .fir_analysis import propagate_effects, reachable_functions
+-
+-    saved = list(g.func_effect_bits)
+-
+-    def once() -> None:
+-        g.func_effect_bits = list(saved)
+-        propagate_effects(g)
+-        reachable_functions(g)
+-        g.func_effect_bits = list(saved)
+-
+-    once()  # warmup
+-    t0 = time.perf_counter()
+-    for _ in range(repeats):
+-        once()
+-    return (time.perf_counter() - t0) * 1000.0 / repeats
+-
+-
+-def _time_bulk(g: FirG, backend: str, repeats: int) -> float:
+-    assert analyse_bulk is not None
+-    analyse_bulk(g, backend=backend)  # warmup
+-    t0 = time.perf_counter()
+-    for _ in range(repeats):
+-        analyse_bulk(g, backend=backend)
+-    return (time.perf_counter() - t0) * 1000.0 / repeats
+-
+-
+-def calibrate_routing(
+-    *,
+-    sizes: Sequence[int] = DEFAULT_SIZES,
+-    repeats: int = 5,
+-    margin: float = 1.05,
+-) -> RouteThresholds:
+-    """Sweep sizes; first N where bulk_ms * margin < cpu_ms becomes the threshold.
+-
+-    ``margin`` requires bulk to beat CPU by ~5% so noise does not flip routing.
+-    """
+-    bulk = _best_bulk_name()
+-    if bulk is None:
+-        return RouteThresholds(
+-            bulk_backend="cpu",
+-            min_funcs=NEVER_BULK,
+-            min_edges=NEVER_BULK,
+-            host=_host_tag(),
+-            samples=[],
+-        )
+-
+-    samples: List[Sample] = []
+-    min_funcs = NEVER_BULK
+-    min_edges = NEVER_BULK
+-    for n in sizes:
+-        g = synthetic_call_graph(int(n))
+-        cpu_ms = _time_cpu(g, repeats)
+-        bulk_ms = _time_bulk(g, bulk, repeats)
+-        n_edges = len(g.call_columns)
+-        samples.append(
+-            Sample(
+-                n_funcs=g.num_funcs(),
+-                n_edges=n_edges,
+-                cpu_ms=cpu_ms,
+-                bulk_ms=bulk_ms,
+-                bulk_backend=bulk,
+-            )
+-        )
+-        if min_funcs == NEVER_BULK and bulk_ms * margin < cpu_ms:
+-            min_funcs = g.num_funcs()
+-            min_edges = n_edges
+-
+-    return RouteThresholds(
+-        bulk_backend=bulk,
+-        min_funcs=min_funcs,
+-        min_edges=min_edges,
+-        host=_host_tag(),
+-        samples=[asdict(s) for s in samples],
+-    )
+-
+-
+-def _host_tag() -> str:
+-    import platform
+-
+-    return f"{platform.system()}-{platform.machine()}-mlx={HAS_MLX}-np={HAS_NUMPY}"
+-
+-
+-def graph_stats(g: FirG) -> tuple:
+-    if not g.call_row_offsets:
+-        g.build_call_graph_csr()
+-    return g.num_funcs(), len(g.call_columns)
+-
+-
+-def choose_analysis_backend(
+-    g: FirG,
+-    requested: str = "auto",
+-    *,
+-    thresholds: Optional[RouteThresholds] = None,
+-    thresholds_path: Optional[Path] = None,
+-) -> str:
+-    """Pick cpu|numpy|mlx. ``auto`` uses measured thresholds; uncalibrated → cpu."""
+-    req = (requested or "auto").lower()
+-    if req == "cpu":
+-        return "cpu"
+-    if req == "numpy":
+-        if not HAS_NUMPY:
+-            raise RuntimeError("NumPy not available")
+-        return "numpy"
+-    if req == "mlx":
+-        if not HAS_MLX:
+-            raise RuntimeError("MLX not available")
+-        return "mlx"
+-    if req != "auto":
+-        raise ValueError(f"unknown device: {requested}")
+-
+-    th = thresholds if thresholds is not None else load_thresholds(thresholds_path)
+-    if th is None or th.min_funcs >= NEVER_BULK:
+-        return "cpu"
+-    n_funcs, n_edges = graph_stats(g)
+-    if n_funcs >= th.min_funcs or n_edges >= th.min_edges:
+-        be = th.bulk_backend
+-        if be == "mlx" and not HAS_MLX:
+-            return "numpy" if HAS_NUMPY else "cpu"
+-        if be == "numpy" and not HAS_NUMPY:
+-            return "cpu"
+-        return be
+-    return "cpu"
+diff --git a/src/flow/lsp_syntax.py b/src/flow/lsp_syntax.py
+index 861d72c..18f4b75 100644
+--- a/src/flow/lsp_syntax.py
++++ b/src/flow/lsp_syntax.py
+@@ -242,6 +242,29 @@ SYNTAX_HOVER: Dict[str, str] = {
+         "**`@rt_safe`** — real-time safety attribute (no unbounded alloc / locks).\n\n"
+         "```flow\n@rt_safe\nfunction process_block(buf: ptr<f32>, n: i32) -> void { ... }\n```"
+     ),
++    "@guarantee": (
++        "**`@guarantee(...)`** — RT contracts (W0: same discipline as `@rt_safe`).\n\n"
++        "```flow\n@guarantee(no_alloc, no_block)\nfunction demod(...) -> ... { ... }\n```"
++    ),
++    "@deterministic": (
++        "**`@deterministic`** — forbid allocating / blocking APIs (W0: `@rt_safe` checker)."
++    ),
++    "@dma": (
++        "**`@dma`** — DMA-capable / DMA-placed buffer hint "
++        "(docs/vision/physical-systems.md)."
++    ),
++    "@noncacheable": (
++        "**`@noncacheable`** — non-cacheable memory region hint."
++    ),
++    "@aligned": (
++        "**`@aligned(N)`** — required alignment in bytes, e.g. `@aligned(64)`."
++    ),
++    "@hardware": (
++        "**`@hardware`** — FPGA/RTL candidate (accepted in W0; synthesis is W5)."
++    ),
++    "@radiation_sensitive": (
++        "**`@radiation_sensitive`** — radiation-aware storage / scrubbing marker."
++    ),
+     "@lifetime": (
+         "**`@lifetime(D)`** — lifetime domain: `callback`, `frame`, `session` "
+         "or `application`, shortest-lived first. Goes on a function (the "
 diff --git a/src/flow/mlir_generator.py b/src/flow/mlir_generator.py
-index 5ccfc64..f76af9d 100644
+index 1ad072d..f76af9d 100644
 --- a/src/flow/mlir_generator.py
 +++ b/src/flow/mlir_generator.py
 @@ -3274,6 +3274,8 @@ class MLIRGenerator:
@@ -139,3 +1906,284 @@ index 5ccfc64..f76af9d 100644
          return ssa_name, ops
      
      def get_expression_type(self, expr: Expression) -> str:
+@@ -6245,10 +6289,90 @@ class MLIRGenerator:
+         )
+         return "\n".join(mlir_code)
+ 
++    def _intern_string_const(self, literal_value: str) -> str:
++        """Register a string literal in string_constants; return global sym name."""
++        key = (
++            literal_value
++            if len(literal_value) >= 2 and literal_value[0] == '"'
++            else f'"{literal_value}"'
++        )
++        if key not in self.string_constants:
++            gname = f"str_{self.string_counter}"
++            self.string_counter += 1
++            self.string_constants[key] = gname
++        return self.string_constants[key]
++
++    def _emit_static_llvm_array_global(
++        self,
++        name: str,
++        llvm_array_ty: str,
++        flow_type: Type,
++        array_lit: Optional[ArrayLiteral],
++    ) -> List[str]:
++        """Emit `llvm.mlir.global` with an init body for fixed array statics.
++
++        Pointer/string element arrays must not stay undef — doom-flow config
++        tables (`array<string, N>`) are searched by name at startup.
++        """
++        ind = self.indent()
++        size = int(flow_type.size)
++        elem_mlir = self.flow_type_to_mlir(flow_type.element_type)
++        is_ptr = elem_mlir == "!llvm.ptr"
++        lines = [
++            f"{ind}// Module static: {name}",
++            f"{ind}llvm.mlir.global internal @{name}() : {llvm_array_ty} {{",
++        ]
++
++        elements = list(array_lit.elements) if array_lit is not None else []
++        acc = f"%{self.function_counter}"
++        self.function_counter += 1
++        lines.append(f"{ind}  {acc} = llvm.mlir.undef : {llvm_array_ty}")
++
++        for i in range(size):
++            el = elements[i] if i < len(elements) else None
++            val = f"%{self.function_counter}"
++            self.function_counter += 1
++            if is_ptr:
++                if (
++                    isinstance(el, Literal)
++                    and getattr(el.type, "name", None) == "string"
++                ):
++                    gname = self._intern_string_const(str(el.value))
++                    lines.append(
++                        f"{ind}  {val} = llvm.mlir.addressof @{gname} : !llvm.ptr"
++                    )
++                else:
++                    # null / missing / unsupported → null pointer
++                    lines.append(f"{ind}  {val} = llvm.mlir.zero : !llvm.ptr")
++            else:
++                if isinstance(el, Literal) and getattr(el.type, "name", None) == "bool":
++                    lit = (
++                        "1"
++                        if str(el.value).lower() in ("true", "1")
++                        else "0"
++                    )
++                elif isinstance(el, Literal):
++                    lit = self._format_mlir_numeric(str(el.value), elem_mlir)
++                else:
++                    lit = "0.0" if elem_mlir in ("f32", "f64") else "0"
++                lines.append(
++                    f"{ind}  {val} = llvm.mlir.constant({lit} : {elem_mlir}) : {elem_mlir}"
++                )
++
++            nxt = f"%{self.function_counter}"
++            self.function_counter += 1
++            lines.append(
++                f"{ind}  {nxt} = llvm.insertvalue {val}, {acc}[{i}] : {llvm_array_ty}"
++            )
++            acc = nxt
++
++        lines.append(f"{ind}  llvm.return {acc} : {llvm_array_ty}")
++        lines.append(f"{ind}}}")
++        return lines
++
+     def generate_static(self, static: StaticDecl) -> str:
+         """Generate a mutable module-scope llvm.mlir.global for `let mut` at top level."""
+         mlir_code = []
+-        mlir_code.append(f"{self.indent()}// Module static: {static.name}")
+ 
+         mlir_type = self.flow_type_to_mlir(static.type)
+         if getattr(static.type, "name", None) == "bool":
+@@ -6257,11 +6381,35 @@ class MLIRGenerator:
+         llvm_array_ty = self._llvm_array_type_from_flow(static.type)
+         if llvm_array_ty:
+             # Global storage is the array; SSA uses pointer-to-array.
+-            # Zero-init; literal element lists are applied via later stores when needed.
+-            mlir_type = "!llvm.ptr"
+-            mlir_code.append(
+-                f"{self.indent()}llvm.mlir.global internal @{static.name}() : {llvm_array_ty}"
++            elem_mlir = self.flow_type_to_mlir(static.type.element_type)
++            array_lit = (
++                static.value if isinstance(static.value, ArrayLiteral) else None
++            )
++            # Struct-element arrays cannot use scalar llvm.mlir.constant(0);
++            # leave those zero-inited. Pointer/string/scalar arrays get a
++            # real init body so string tables are not undef at runtime.
++            can_init = elem_mlir == "!llvm.ptr" or elem_mlir in (
++                "i1",
++                "i8",
++                "i16",
++                "i32",
++                "i64",
++                "f32",
++                "f64",
+             )
++            if can_init:
++                mlir_code.extend(
++                    self._emit_static_llvm_array_global(
++                        static.name, llvm_array_ty, static.type, array_lit
++                    )
++                )
++            else:
++                mlir_code.append(f"{self.indent()}// Module static: {static.name}")
++                mlir_code.append(
++                    f"{self.indent()}llvm.mlir.global internal @{static.name}() "
++                    f": {llvm_array_ty}"
++                )
++            mlir_type = "!llvm.ptr"
+             self.symbol_table[static.name] = {
+                 "type": "variable",
+                 "mlir_type": mlir_type,
+@@ -6279,6 +6427,7 @@ class MLIRGenerator:
+             return "\n".join(mlir_code)
+ 
+         # Aggregates (structs/arrays) get zero init for now; scalar literals use the value.
++        mlir_code.append(f"{self.indent()}// Module static: {static.name}")
+         init_payload = f"() : {mlir_type}"
+         if isinstance(static.value, Literal) and getattr(static.value.type, "name", "") != "string":
+             if (
+diff --git a/src/flow/parser.py b/src/flow/parser.py
+index 281eef9..5cb16cb 100644
+--- a/src/flow/parser.py
++++ b/src/flow/parser.py
+@@ -21,6 +21,21 @@ DURATION_UNIT_NS = {
+     "min": 60_000_000_000,
+ }
+ 
++# Quantity suffixes in ordinary expressions (physical-systems W0).
++# `2.45GHz` → `((2.45 * 1e9) as Hertz)`. Duration suffixes stay
++# duration-position-only. Values are (unit_type_name, scale).
++QUANTITY_SUFFIX_UNITS = {
++    "Hz": ("Hertz", 1.0),
++    "kHz": ("Hertz", 1_000.0),
++    "MHz": ("Hertz", 1_000_000.0),
++    "GHz": ("Hertz", 1_000_000_000.0),
++    "dB": ("Decibel", 1.0),
++    "dBm": ("dBm", 1.0),
++    "dBW": ("dBW", 1.0),
++    "deg": ("Degree", 1.0),
++    "rad": ("Radian", 1.0),
++}
++
+ 
+ class FlowSyntaxError(SyntaxError):
+     """Enhanced syntax error with source context and suggestions."""
+@@ -1644,11 +1659,14 @@ class Parser:
+                     self.advance()
+                     args = []
+                     if self.current_token.type != TokenType.RPAREN:
+-                        # Parse identifiers or string literals as args
++                        # Identifiers, numbers (@aligned(64)), or string literals
+                         while True:
+                             if self.current_token.type == TokenType.IDENTIFIER:
+                                 args.append(self.current_token.value)
+                                 self.advance()
++                            elif self.current_token.type == TokenType.NUMBER:
++                                args.append(str(self.current_token.value))
++                                self.advance()
+                             elif self.current_token.type == TokenType.STRING_LITERAL:
+                                 args.append(self.current_token.value.strip('"').strip("'"))
+                                 self.advance()
+@@ -1680,6 +1698,9 @@ class Parser:
+                     TokenType.IMPORT,
+                 ):
+                     is_exported = True
++                elif self._at_unit_decl() or self._at_flow_decl():
++                    # Contextual keywords (`unit`, `flow`) lex as IDENT.
++                    is_exported = True
+                 else:
+                     declarations.append(self.parse_export_list())
+                     continue
+@@ -4447,6 +4468,27 @@ class Parser:
+         if self.current_token.type == TokenType.NUMBER:
+             value = self.current_token.value
+             self.advance()
++            # Quantity suffix (physical-systems W0): `2.45GHz` → scaled cast.
++            if (
++                self.current_token.type == TokenType.IDENTIFIER
++                and self.current_token.value in QUANTITY_SUFFIX_UNITS
++            ):
++                unit_name, scale = QUANTITY_SUFFIX_UNITS[self.current_token.value]
++                self.advance()
++                text = str(value)
++                if text.lower().startswith("0x"):
++                    num = float(int(text, 16))
++                else:
++                    num = float(text)
++                scaled = num * scale
++                if scaled == int(scaled) and abs(scaled) < 1e15:
++                    lit_text = f"{int(scaled)}.0"
++                else:
++                    lit_text = repr(scaled)
++                return CastExpression(
++                    Literal(lit_text, Type("f64")),
++                    Type(unit_name),
++                )
+             # Infer float vs int from token text.
+             # This keeps the language ergonomic for SIMD examples that use 0.0/1.0.
+             is_hex = isinstance(value, str) and value.startswith("0x")
+diff --git a/src/flow/type_checker.py b/src/flow/type_checker.py
+index 8e469c8..171b530 100644
+--- a/src/flow/type_checker.py
++++ b/src/flow/type_checker.py
+@@ -32,6 +32,7 @@ from .parser import (
+ )
+ from .attributes import (
+     attribute_errors,
++    attrs_imply_rt_safe,
+     domain_rank,
+     lifetime_domain,
+ )
+@@ -1536,9 +1537,16 @@ class TypeChecker:
+         prev_domain = self._current_domain
+         prev_rt_from_domain = self._rt_safe_from_domain
+         self._current_domain = domain
+-        if 'rt_safe' in attrs:
++        if attrs_imply_rt_safe(attrs):
+             self._current_rt_safe_fn = func.name
+-            self._rt_safe_from_domain = False
++            self._rt_safe_from_domain = (
++                'rt_safe' not in attrs
++                and not any(
++                    (a == 'deterministic' or a.startswith('guarantee'))
++                    for a in attrs
++                )
++                and domain == 'callback'
++            )
+         elif domain == 'callback':
+             self._current_rt_safe_fn = func.name
+             self._rt_safe_from_domain = True
+@@ -2771,6 +2779,29 @@ class TypeChecker:
+                 ):
+                     return SemanticType(TypeKind.BOOL)
+ 
++        # RF affine (physical-systems W0): dBm/dBW + Decibel → power;
++        # absolute power units must not add to each other.
++        left_name = getattr(left_type, "name", "") or ""
++        right_name = getattr(right_type, "name", "") or ""
++        rf_abs = {"dBm", "dBW"}
++        if op.operator in ("+", "-"):
++            if left_name in rf_abs and right_name in rf_abs:
++                line = getattr(op, "line", 0)
++                loc = f"line {line}: " if line else ""
++                self.errors.append(
++                    f"{loc}dimensional error: {left_type} {op.operator} {right_type} "
++                    f"(absolute RF power units do not add; use Decibel for gain, "
++                    f"e.g. `20dBm + 3dB`)"
++                )
++                return left_type
++            if op.operator == "+":
++                if left_name in rf_abs and right_name == "Decibel":
++                    return left_type
++                if left_name == "Decibel" and right_name in rf_abs:
++                    return right_type
++                if left_name == "Decibel" and right_name == "Decibel":
++                    return left_type
++
+         # Units of measure: dimensional analysis (north-star.md section 6)
+         left_dims = self._dims_of(left_type)
+         right_dims = self._dims_of(right_type)
