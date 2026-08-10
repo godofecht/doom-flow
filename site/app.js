@@ -189,13 +189,16 @@
           stopBtn.disabled = true;
         };
         try {
+          console.log("DBG: calling main()");
           mod.callMain([]);
+          console.log("DBG: main() returned");
           // MLIR build: main() returns after init. Drive frames via rAF
           // calling doomflow_frame() + doomflow_present(). No ASYNCIFY.
           if (typeof mod._doomflow_frame === "function") {
-            var ctx = null;
+            var ctx = 0;
             if (typeof mod._doomflow_get_gfx_ctx === "function") {
               ctx = mod._doomflow_get_gfx_ctx();
+              console.log("DBG: gfx_ctx=" + ctx);
             }
             var rafId = null;
             var stopped = false;
@@ -215,22 +218,35 @@
                   if (window.flowGfxOnExit) window.flowGfxOnExit(0);
                   return;
                 }
-                if (mod._doomflow_present) mod._doomflow_present(ctx);
+                if (mod._doomflow_present) {
+                  var p = mod._doomflow_present(ctx);
+                  if (rafFrame < 3) console.log("DBG: present(" + ctx + ")=" + p);
+                }
                 rafFrame++;
                 if (rafFrame === 1 || rafFrame === 10 || rafFrame === 60 || (rafFrame % 300) === 0) {
                   console.log("rAF frame " + rafFrame + " alive=" + alive);
+                  if (mod._doomflow_first_pixel) {
+                    console.log("DBG: first_pixel=0x" + (mod._doomflow_first_pixel(ctx) >>> 0).toString(16));
+                  }
+                  if (mod._doomflow_count_nonzero) {
+                    console.log("DBG: nonzero=" + mod._doomflow_count_nonzero(ctx, 8));
+                  }
                 }
               } catch (e) {
                 cancelAnimationFrame(rafId);
                 log(String(e), true);
                 setStatus("crashed");
+                console.log("DBG: crash in frameLoop: " + String(e));
                 return;
               }
               rafId = requestAnimationFrame(frameLoop);
             }
             rafId = requestAnimationFrame(frameLoop);
+          } else {
+            console.log("DBG: no _doomflow_frame, ASYNCIFY mode");
           }
         } catch (e) {
+          console.log("DBG: callMain threw: " + String(e));
           if (!(e && e.name === "ExitStatus")) log(String(e), true);
         }
       })
