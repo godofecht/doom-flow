@@ -335,10 +335,21 @@ function convert_frame(src: ptr<u8>, dst: ptr<u8>, npix: i32) -> void {
     }
 }
 
+# Module-level game loop state. Keeping these out of main() avoids
+# alloca-based locals that ASYNCIFY corrupts on stack rewind in the
+# MLIR -O0 backend.
+let mut loop_g: Gfx = null as Gfx
+let mut loop_w: i32 = 0
+let mut loop_h: i32 = 0
+let mut loop_fb: ptr<u8> = null
+let mut loop_src: ptr<u8> = null
+let mut loop_frame: i32 = 0
+let mut loop_npix: i32 = 0
+
 function main() -> i32 {
-    let w: i32 = dg_resx()
-    let h: i32 = dg_resy()
-    let g: Gfx = gfx_open(w, h, "DOOM (Flow)")
+    loop_w = dg_resx()
+    loop_h = dg_resy()
+    loop_g = gfx_open(loop_w, loop_h, "DOOM (Flow)")
 
     if doomflow_ai_wanted() != 0 {
         ai_pilot = 1
@@ -347,28 +358,33 @@ function main() -> i32 {
 
     doom_bootstrap("doom1.wad")
 
-    let npix: i32 = w * h
-    let fb: ptr<u8> = calloc((npix * 3) as i64, 1) as ptr<u8>
-    let src: ptr<u8> = dg_screen()
+    loop_npix = loop_w * loop_h
+    loop_fb = calloc((loop_npix * 3) as i64, 1) as ptr<u8>
+    loop_src = dg_screen()
 
     keyscript = getenv("DOOMFLOW_KEYSCRIPT")
-    let mut frame: i32 = 0
+    loop_frame = 0
 
-    while !gfx_should_close(g) {
-        gfx_poll(g)
-        pump_keys(g)
-        pump_keyscript(frame)
-        pump_ai(frame)
-        frame = frame + 1
-        if frame == 1 or frame == 400 or (frame & 255) == 0 {
-            printf("main: frame %d\n", frame)
-        }
-        doomgeneric_Tick()
-        convert_frame(src, fb, npix)
-        gfx_blit_rgb(g, 0, 0, w, h, fb)
-        gfx_present(g)
+    while !gfx_should_close(loop_g) {
+        doomflow_frame()
     }
 
-    gfx_close(g)
+    gfx_close(loop_g)
     return 0
+}
+
+@flow_api
+function doomflow_frame() -> void {
+    gfx_poll(loop_g)
+    pump_keys(loop_g)
+    pump_keyscript(loop_frame)
+    pump_ai(loop_frame)
+    loop_frame = loop_frame + 1
+    if loop_frame == 1 or loop_frame == 400 or (loop_frame & 255) == 0 {
+        printf("main: frame %d\n", loop_frame)
+    }
+    doomgeneric_Tick()
+    convert_frame(loop_src, loop_fb, loop_npix)
+    gfx_blit_rgb(loop_g, 0, 0, loop_w, loop_h, loop_fb)
+    gfx_present(loop_g)
 }
