@@ -199,6 +199,7 @@
             }
             var rafId = null;
             var stopped = false;
+            var rafFrame = 0;
             window.flowGfxStop = function () { stopped = true; };
             function frameLoop() {
               if (stopped) {
@@ -215,6 +216,10 @@
                   return;
                 }
                 if (mod._doomflow_present) mod._doomflow_present(ctx);
+                rafFrame++;
+                if (rafFrame === 1 || rafFrame === 10 || rafFrame === 60 || (rafFrame % 300) === 0) {
+                  console.log("rAF frame " + rafFrame + " alive=" + alive);
+                }
               } catch (e) {
                 cancelAnimationFrame(rafId);
                 log(String(e), true);

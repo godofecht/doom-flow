@@ -42,7 +42,7 @@ var ENVIRONMENT_IS_SHELL = !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_NODE && !ENVIR
 
 // --pre-jses are emitted after the Module integration code, so that they can
 // refer to Module (if they choose; they can also define Module)
-// include: /var/folders/6n/6ssrqqs517z9ct_hvszxp0sr0000gn/T/tmprmby2agg.js
+// include: /var/folders/6n/6ssrqqs517z9ct_hvszxp0sr0000gn/T/tmpql22say6.js
 
   if (!Module['expectedDataFileDownloads']) Module['expectedDataFileDownloads'] = 0;
   Module['expectedDataFileDownloads']++;
@@ -174,7 +174,7 @@ var ENVIRONMENT_IS_SHELL = !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_NODE && !ENVIR
 
   })();
 
-// end include: /var/folders/6n/6ssrqqs517z9ct_hvszxp0sr0000gn/T/tmprmby2agg.js
+// end include: /var/folders/6n/6ssrqqs517z9ct_hvszxp0sr0000gn/T/tmpql22say6.js
 
 
 var arguments_ = [];
@@ -3908,6 +3908,9 @@ var _malloc,
   _main,
   _doomflow_present,
   _doomflow_should_close,
+  _doomflow_dump_pixel,
+  _doomflow_count_nonzero,
+  _doomflow_first_pixel,
   __emscripten_stack_restore,
   __emscripten_stack_alloc,
   _emscripten_stack_get_current,
@@ -3926,6 +3929,9 @@ function assignWasmExports(wasmExports) {
   _main = Module['_main'] = wasmExports['main'];
   _doomflow_present = Module['_doomflow_present'] = wasmExports['doomflow_present'];
   _doomflow_should_close = Module['_doomflow_should_close'] = wasmExports['doomflow_should_close'];
+  _doomflow_dump_pixel = Module['_doomflow_dump_pixel'] = wasmExports['doomflow_dump_pixel'];
+  _doomflow_count_nonzero = Module['_doomflow_count_nonzero'] = wasmExports['doomflow_count_nonzero'];
+  _doomflow_first_pixel = Module['_doomflow_first_pixel'] = wasmExports['doomflow_first_pixel'];
   __emscripten_stack_restore = wasmExports['_emscripten_stack_restore'];
   __emscripten_stack_alloc = wasmExports['_emscripten_stack_alloc'];
   _emscripten_stack_get_current = wasmExports['emscripten_stack_get_current'];

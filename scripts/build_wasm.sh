@@ -190,7 +190,7 @@ build_doom() {
       -sINVOKE_RUN=0 \
       -sEXIT_RUNTIME=0 \
       -sEXPORTED_RUNTIME_METHODS=callMain,ccall,ENV,cwrap \
-      -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai,_doomflow_frame,_doomflow_present,_doomflow_get_gfx_ctx,_doomflow_should_close \
+      -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai,_doomflow_frame,_doomflow_present,_doomflow_get_gfx_ctx,_doomflow_should_close,_doomflow_dump_pixel,_doomflow_count_nonzero,_doomflow_first_pixel \
       -sSTACK_OVERFLOW_CHECK=0 \
       -sFORCE_FILESYSTEM=1 \
       --preload-file "$wad@/doom1.wad" \
