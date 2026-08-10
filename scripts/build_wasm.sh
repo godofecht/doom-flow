@@ -174,9 +174,11 @@ build_doom() {
   if [ "$BACKEND" = "mlir" ]; then
     # Hybrid: Flow IR at -O0 (LLVM -O1+ miscompiles string loops), C runtime
     # at -O2, link with -O1 for binaryen passes on the final wasm.
-    emcc -c "$ir" -O0 -o "$TMP/doom.o"
-    emcc -c "$FLOW_DIR/runtime/gfx_wasm.c" -O2 -o "$TMP/gfx_wasm.o"
-    emcc -c "$FLOW_DIR/runtime/flow_rt_support.c" -O2 -o "$TMP/flow_rt.o"
+    # ASYNCIFY checks must be inserted at compile time (SjLj mode), so
+    # -sASYNCIFY=1 is passed to every emcc -c, not just the link step.
+    emcc -c "$ir" -O0 -sASYNCIFY=1 -o "$TMP/doom.o"
+    emcc -c "$FLOW_DIR/runtime/gfx_wasm.c" -O2 -sASYNCIFY=1 -o "$TMP/gfx_wasm.o"
+    emcc -c "$FLOW_DIR/runtime/flow_rt_support.c" -O2 -sASYNCIFY=1 -o "$TMP/flow_rt.o"
     emcc "$TMP/doom.o" "$TMP/gfx_wasm.o" "$TMP/flow_rt.o" \
       "${EMCC_LINK_OPT[@]}" \
       -sASYNCIFY=1 \

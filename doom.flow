@@ -338,7 +338,7 @@ function convert_frame(src: ptr<u8>, dst: ptr<u8>, npix: i32) -> void {
 # Module-level game loop state. Keeping these out of main() avoids
 # alloca-based locals that ASYNCIFY corrupts on stack rewind in the
 # MLIR -O0 backend.
-let mut loop_g: Gfx = null as Gfx
+let mut loop_g: Gfx = Gfx{ctx: 0 as ptr<void>}
 let mut loop_w: i32 = 0
 let mut loop_h: i32 = 0
 let mut loop_fb: ptr<u8> = null
@@ -364,16 +364,17 @@ function main() -> i32 {
 
     keyscript = getenv("DOOMFLOW_KEYSCRIPT")
     loop_frame = 0
+    printf("DBG: main entering game loop\n")
 
     while !gfx_should_close(loop_g) {
         doomflow_frame()
     }
+    printf("DBG: main game loop exited\n")
 
     gfx_close(loop_g)
     return 0
 }
 
-@flow_api
 function doomflow_frame() -> void {
     gfx_poll(loop_g)
     pump_keys(loop_g)
@@ -385,6 +386,11 @@ function doomflow_frame() -> void {
     }
     doomgeneric_Tick()
     convert_frame(loop_src, loop_fb, loop_npix)
+    if loop_frame == 1 or loop_frame == 2 {
+        printf("DBG: frame %d fb[0..5]=%d %d %d %d %d\n", loop_frame,
+            loop_fb[0] as i32, loop_fb[1] as i32, loop_fb[2] as i32,
+            loop_fb[3] as i32, loop_fb[4] as i32)
+    }
     gfx_blit_rgb(loop_g, 0, 0, loop_w, loop_h, loop_fb)
     gfx_present(loop_g)
 }
