@@ -1,0 +1,141 @@
+diff --git a/src/flow/mlir_generator.py b/src/flow/mlir_generator.py
+index 5ccfc64..f76af9d 100644
+--- a/src/flow/mlir_generator.py
++++ b/src/flow/mlir_generator.py
+@@ -3274,6 +3274,8 @@ class MLIRGenerator:
+             from_type = self.get_expression_type(expr.expr)
+             to_type = self.flow_type_to_mlir(expr.target_type)
+             cast_ssa, cast_ops = self._emit_cast(value_ssa, from_type, to_type)
++            if getattr(expr.target_type, 'name', '').startswith('u'):
++                self._ssa_unsigned.add(cast_ssa)
+             return cast_ssa, value_ops + cast_ops
+         elif isinstance(expr, ArrayAccess):
+             return self.generate_array_access(expr)
+@@ -3291,6 +3293,15 @@ class MLIRGenerator:
+                 f"{type(expr).__name__}; use the C backend (--c)"
+             )
+ 
++    def _mark_unsigned_from_load(self, ssa_name: str, elem_flow) -> None:
++        """Mark a loaded element as unsigned (u8/u16) so later widen casts
++        use zero-extension instead of sign-extension."""
++        if elem_flow is None:
++            return
++        fname = getattr(elem_flow, 'name', '')
++        if fname.startswith('u'):
++            self._ssa_unsigned.add(ssa_name)
++
+     def _emit_cast(self, value_ssa: str, from_type: str, to_type: str) -> tuple[str, List[str]]:
+         from_type = self._ssa_types.get(value_ssa, from_type)
+         if from_type == to_type:
+@@ -3414,6 +3425,9 @@ class MLIRGenerator:
+         ssa_name = f"%{self.function_counter}"
+         self.function_counter += 1
+         mlir_type = self.flow_type_to_mlir(literal.type)
++        # u8/u16/u32/u64 literals stay unsigned when widened by _emit_cast.
++        if literal.type.name.startswith('u'):
++            self._ssa_unsigned.add(ssa_name)
+         
+         if literal.type.name == 'bool':
+             mlir_type = 'i1'
+@@ -3515,6 +3529,10 @@ class MLIRGenerator:
+         self.function_counter += 1
+         ops.append(f"{self.indent()}{val} = llvm.load {ptr} : !llvm.ptr -> {mlir_type}")
+         self._ssa_types[val] = mlir_type
++        # Track unsigned globals so later widening casts use extui.
++        flow_ty = info.get("flow_type")
++        if flow_ty and hasattr(flow_ty, 'name') and flow_ty.name in ('u8', 'u16', 'u32', 'u64'):
++            self._ssa_unsigned.add(val)
+         return val, ops
+ 
+     def _store_module_global(self, name: str, mlir_type: str, value_ssa: str) -> List[str]:
+@@ -3761,6 +3779,20 @@ class MLIRGenerator:
+         if isinstance(operand, Variable) and operand.name in self.symbol_table:
+             var_info = self.symbol_table[operand.name]
+             mlir_type = var_info.get('mlir_type')
++            if var_info.get('is_module_global'):
++                # &globalscope let mut → real storage, not a per-call spill.
++                # A module-level read fixed VIEW width: without this, the
++                # shim returned a pointer to a copy and DRAW-scaled values
++                # never updated the actual global (doom-flow R_ExecuteSetViewSize).
++                ptr = f"%{self.function_counter}"
++                self.function_counter += 1
++                ops = [
++                    f"{self.indent()}{ptr} = llvm.mlir.addressof @{operand.name} : !llvm.ptr"
++                ]
++                self._ssa_types[ptr] = "!llvm.ptr"
++                if var_info.get("llvm_array_type"):
++                    self._llvm_array_types[ptr] = var_info["llvm_array_type"]
++                return ptr, ops
+             ptr = var_info.get('alloca_ptr')
+             ops: List[str] = []
+             if not ptr and mlir_type:
+@@ -4007,6 +4039,9 @@ class MLIRGenerator:
+                         f"{self.indent()}{load} = llvm.load {gep} : !llvm.ptr -> {field_ty}"
+                     )
+                     self._ssa_types[load] = field_ty
++                    # Track unsigned fields so later widening casts use extui.
++                    if hasattr(field_type, 'name') and field_type.name in ('u8', 'u16', 'u32', 'u64'):
++                        self._ssa_unsigned.add(load)
+                     return load, ops
+ 
+         # Prefer LLVM struct extraction when available.
+@@ -4060,6 +4095,9 @@ class MLIRGenerator:
+                         if self._is_tensor_struct(field_ty):
+                             self._tensor_field_extracts.add(ssa_name)
+                             self._tensor_extract_origins[ssa_name] = (obj_ssa, idx)
++                        # Track unsigned fields so later widening casts use extui.
++                        if hasattr(field_type, 'name') and field_type.name in ('u8', 'u16', 'u32', 'u64'):
++                            self._ssa_unsigned.add(ssa_name)
+                         return ssa_name, ops
+ 
+         # Get the struct layout to find field offset
+@@ -4204,7 +4242,7 @@ class MLIRGenerator:
+             if field_type.name in ['u8', 'bool']:
+                 ext_name = f"%{self.function_counter}"
+                 self.function_counter += 1
+-                ops.append(f"{self.indent()}{ext_name} = arith.extsi {byte_name} : i8 to i32")
++                ops.append(f"{self.indent()}{ext_name} = arith.extui {byte_name} : i8 to i32")
+                 self._ssa_types[ext_name] = "i32"
+                 return ext_name, ops
+             else:
+@@ -4338,6 +4376,8 @@ class MLIRGenerator:
+         """
+         if isinstance(expr, Variable):
+             return self._find_variable_type(expr.name)
++        if isinstance(expr, CastExpression):
++            return expr.target_type
+         if isinstance(expr, FieldAccess):
+             return self._determine_field_type(expr)
+         if isinstance(expr, ArrayAccess):
+@@ -5776,6 +5816,7 @@ class MLIRGenerator:
+             ops.extend(gep_ops)
+             ops.append(f"{self.indent()}{ssa_name} = llvm.load {gep} : !llvm.ptr -> {elem_type}")
+             self._ssa_types[ssa_name] = elem_type
++            self._mark_unsigned_from_load(ssa_name, elem_flow)
+             return ssa_name, ops
+ 
+         if self._is_pointer_array_ssa(array_ssa, access):
+@@ -5789,6 +5830,7 @@ class MLIRGenerator:
+             ops.extend(gep_ops)
+             ops.append(f"{self.indent()}{ssa_name} = llvm.load {gep} : !llvm.ptr -> {elem_type}")
+             self._ssa_types[ssa_name] = elem_type
++            self._mark_unsigned_from_load(ssa_name, elem_flow)
+             return ssa_name, ops
+ 
+         if index_type == 'index':
+@@ -5804,6 +5846,7 @@ class MLIRGenerator:
+             arr_mlir = self.symbol_table[access.array.name].get('mlir_type', '')
+ 
+         elem_type = None
++        elem_flow = None
+         if arr_mlir:
+             elem_type = self._memref_element_type(arr_mlir)
+         if not elem_type:
+@@ -5824,6 +5867,7 @@ class MLIRGenerator:
+         load_memref = arr_mlir if arr_mlir and arr_mlir.startswith('memref<') else f"memref<?x{elem_type}>"
+         ops.append(f"{self.indent()}{ssa_name} = memref.load {array_ssa}[{final_index}] : {load_memref}")
+         self._ssa_types[ssa_name] = elem_type
++        self._mark_unsigned_from_load(ssa_name, elem_flow)
+         return ssa_name, ops
+     
+     def get_expression_type(self, expr: Expression) -> str:

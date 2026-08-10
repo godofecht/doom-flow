@@ -55,3 +55,50 @@ jobs:
         env:
           SMOKE_TIMEOUT: 30000
         run: node scripts/smoke_test_mlir.js
+
+  byte-identical:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Checkout Flow
+        uses: actions/checkout@v5
+        with:
+          repository: flooooooooooow/flow
+          path: flow
+
+      - name: Apply MLIR unsigned fix
+        run: |
+          cd flow
+          git apply ../scripts/mlir_unsigned_fix.patch
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Flow Python deps
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -r flow/requirements.txt
+          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Emscripten
+        uses: emscripten-core/setup-emsdk@v15
+        with:
+          version: 5.0.1
+          actions-cache-folder: 'emsdk-cache'
+
+      - name: Byte-identicality test (C vs MLIR)
+        env:
+          FLOW_DIR: ${{ github.workspace }}/flow
+          WASM_ENVIRONMENT: web,node
+          SMOKE_TIMEOUT: 120000
+        run: |
+          chmod +x scripts/run_byte_identical.sh
+          ./scripts/run_byte_identical.sh

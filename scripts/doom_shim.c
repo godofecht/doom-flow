@@ -91,3 +91,44 @@ int32_t doomflow_first_pixel(void *handle) {
            ((int32_t)g->pixels[2] << 8) |
            ((int32_t)g->pixels[3]);
 }
+
+// CRC32 of the full pixel buffer. Used for byte-identicality checks
+// between C and MLIR backends. Returns the CRC32 as an unsigned i32.
+static uint32_t crc32_table[256];
+static int crc32_table_init = 0;
+static void crc32_init(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++) {
+            c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        }
+        crc32_table[i] = c;
+    }
+    crc32_table_init = 1;
+}
+int32_t doomflow_fb_crc32(void *handle) {
+    DoomFlowGfx *g = (DoomFlowGfx *)handle;
+    if (!g || !g->pixels) return -1;
+    if (!crc32_table_init) crc32_init();
+    uint32_t crc = 0xFFFFFFFFu;
+    int32_t n = g->width * g->height * 4;
+    for (int32_t i = 0; i < n; i++) {
+        crc = crc32_table[(crc ^ g->pixels[i]) & 0xFF] ^ (crc >> 8);
+    }
+    return (int32_t)(crc ^ 0xFFFFFFFFu);
+}
+
+// Copy a row of the pixel buffer into a destination buffer.
+// Used for per-row comparison between backends.
+int32_t doomflow_fb_row(void *handle, int32_t y, uint8_t *dst, int32_t dst_len) {
+    DoomFlowGfx *g = (DoomFlowGfx *)handle;
+    if (!g || !g->pixels) return -1;
+    if (y < 0 || y >= g->height) return -2;
+    int32_t row_bytes = g->width * 4;
+    if (dst_len < row_bytes) return -3;
+    int32_t off = y * row_bytes;
+    for (int32_t i = 0; i < row_bytes; i++) {
+        dst[i] = g->pixels[off + i];
+    }
+    return row_bytes;
+}

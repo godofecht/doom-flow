@@ -30,6 +30,7 @@ DO_DOOM=1
 DO_AI=1
 BACKEND="${BACKEND:-c}"
 WASM_ENVIRONMENT="${WASM_ENVIRONMENT:-web}"
+TEST_CLOCK=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -37,6 +38,7 @@ while [ $# -gt 0 ]; do
     --doom-only) DO_AI=0; shift ;;
     --backend=*) BACKEND="${1#--backend=}"; shift ;;
     --backend) shift; BACKEND="${1:-c}"; shift ;;
+    --test-clock) TEST_CLOCK=1; shift ;;
     *) echo "unknown flag: $1" >&2; exit 1 ;;
   esac
 done
@@ -77,6 +79,10 @@ mkdir -p "$TMP"
 # can still optimize the final wasm without touching the Flow IR.
 EMCC_OPT=(-O2)
 EMCC_LINK_OPT=()
+JS_LIBRARY=()
+if [ "$TEST_CLOCK" = "1" ]; then
+  JS_LIBRARY=(--js-library "$ROOT/scripts/deterministic_clock.js")
+fi
 if [ "$BACKEND" = "mlir" ]; then
   EMCC_OPT=(-O0)
   EMCC_LINK_OPT=(-O1)
@@ -113,7 +119,7 @@ emcc_common=(
   -sINVOKE_RUN=0
   -sEXIT_RUNTIME=0
   -sEXPORTED_RUNTIME_METHODS=callMain,ccall,ENV
-  -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai
+  -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai,_doomflow_frame,_doomflow_present,_doomflow_get_gfx_ctx,_doomflow_should_close,_doomflow_dump_pixel,_doomflow_count_nonzero,_doomflow_first_pixel,_doomflow_fb_crc32,_doomflow_fb_row
   -Wno-implicit-function-declaration
   -lm
 )
@@ -181,6 +187,7 @@ build_doom() {
     emcc -c "$ROOT/scripts/doom_shim.c" -O2 -o "$TMP/doom_shim.o"
     emcc "$TMP/doom.o" "$TMP/gfx_wasm.o" "$TMP/flow_rt.o" "$TMP/doom_shim.o" \
       -O1 \
+      "${JS_LIBRARY[@]}" \
       -sSTACK_SIZE=$STACK_SIZE \
       -sINITIAL_MEMORY=$INITIAL_MEMORY \
       -sALLOW_MEMORY_GROWTH=1 \
@@ -190,7 +197,7 @@ build_doom() {
       -sINVOKE_RUN=0 \
       -sEXIT_RUNTIME=0 \
       -sEXPORTED_RUNTIME_METHODS=callMain,ccall,ENV,cwrap \
-      -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai,_doomflow_frame,_doomflow_present,_doomflow_get_gfx_ctx,_doomflow_should_close,_doomflow_dump_pixel,_doomflow_count_nonzero,_doomflow_first_pixel \
+      -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai,_doomflow_frame,_doomflow_present,_doomflow_get_gfx_ctx,_doomflow_should_close,_doomflow_dump_pixel,_doomflow_count_nonzero,_doomflow_first_pixel,_doomflow_fb_crc32,_doomflow_fb_row \
       -sSTACK_OVERFLOW_CHECK=0 \
       -sFORCE_FILESYSTEM=1 \
       --preload-file "$wad@/doom1.wad" \
@@ -202,7 +209,9 @@ build_doom() {
     emcc "$ir" \
       "$FLOW_DIR/runtime/gfx_wasm.c" \
       "$FLOW_DIR/runtime/flow_rt_support.c" \
+      "$ROOT/scripts/doom_shim.c" \
       "${emcc_common[@]}" \
+      "${JS_LIBRARY[@]}" \
       -sFORCE_FILESYSTEM=1 \
       --preload-file "$wad@/doom1.wad" \
       -DNORMALUNIX -DSNDSERV -D_DEFAULT_SOURCE \
