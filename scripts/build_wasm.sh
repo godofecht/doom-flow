@@ -172,17 +172,15 @@ build_doom() {
   ir="$(flow_lower "$ROOT/doom.flow" doom)"
 
   if [ "$BACKEND" = "mlir" ]; then
-    # Hybrid: Flow IR at -O0 (LLVM -O1+ miscompiles string loops), C runtime
-    # at -O2, link with -O1 for binaryen passes on the final wasm.
-    # ASYNCIFY checks must be inserted at compile time (SjLj mode), so
-    # -sASYNCIFY=1 is passed to every emcc -c, not just the link step.
-    emcc -c "$ir" -O0 -sASYNCIFY=1 -o "$TMP/doom.o"
-    emcc -c "$FLOW_DIR/runtime/gfx_wasm.c" -O2 -sASYNCIFY=1 -o "$TMP/gfx_wasm.o"
-    emcc -c "$FLOW_DIR/runtime/flow_rt_support.c" -O2 -sASYNCIFY=1 -o "$TMP/flow_rt.o"
-    emcc "$TMP/doom.o" "$TMP/gfx_wasm.o" "$TMP/flow_rt.o" \
-      "${EMCC_LINK_OPT[@]}" \
-      -sASYNCIFY=1 \
-      -sASYNCIFY_STACK_SIZE=$ASYNCIFY_STACK \
+    # No ASYNCIFY: main() returns after init, JS drives frames via rAF
+    # calling doomflow_frame() + doomflow_present(). This avoids the
+    # ASYNCIFY + alloca corruption that breaks the MLIR -O0 build.
+    emcc -c "$ir" -O0 -o "$TMP/doom.o"
+    emcc -c "$FLOW_DIR/runtime/gfx_wasm.c" -O2 -o "$TMP/gfx_wasm.o"
+    emcc -c "$FLOW_DIR/runtime/flow_rt_support.c" -O2 -o "$TMP/flow_rt.o"
+    emcc -c "$ROOT/scripts/doom_shim.c" -O2 -o "$TMP/doom_shim.o"
+    emcc "$TMP/doom.o" "$TMP/gfx_wasm.o" "$TMP/flow_rt.o" "$TMP/doom_shim.o" \
+      -O1 \
       -sSTACK_SIZE=$STACK_SIZE \
       -sINITIAL_MEMORY=$INITIAL_MEMORY \
       -sALLOW_MEMORY_GROWTH=1 \
@@ -191,8 +189,8 @@ build_doom() {
       -sEXPORT_NAME=createFlowModule \
       -sINVOKE_RUN=0 \
       -sEXIT_RUNTIME=0 \
-      -sEXPORTED_RUNTIME_METHODS=callMain,ccall,ENV \
-      -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai \
+      -sEXPORTED_RUNTIME_METHODS=callMain,ccall,ENV,cwrap \
+      -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai,_doomflow_frame,_doomflow_present,_doomflow_get_gfx_ctx,_doomflow_should_close \
       -sSTACK_OVERFLOW_CHECK=0 \
       -sFORCE_FILESYSTEM=1 \
       --preload-file "$wad@/doom1.wad" \

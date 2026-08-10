@@ -55,6 +55,38 @@ createFlowModule(hooks).then((mod) => {
   if (typeof mod._doomflow_set_ai === "function") mod._doomflow_set_ai(0);
   if (mod._main) mod.callMain([]);
   console.log("SMOKE callMain_returned");
+
+  // MLIR build: main() returns after init. Drive frames manually.
+  if (typeof mod._doomflow_frame === "function") {
+    var ctx = null;
+    if (typeof mod._doomflow_get_gfx_ctx === "function") {
+      ctx = mod._doomflow_get_gfx_ctx();
+    }
+    var frame = 0;
+    function tick() {
+      if (frame >= 3000) {
+        console.log("SMOKE_OK frame loop completed 3000 frames");
+        process.exit(0);
+        return;
+      }
+      try {
+        var alive = mod._doomflow_frame();
+        if (!alive) {
+          console.log("SMOKE_OK frame loop exited at frame " + frame);
+          process.exit(0);
+          return;
+        }
+        if (mod._doomflow_present) mod._doomflow_present(ctx);
+        frame++;
+      } catch (e) {
+        console.log("SMOKE_FAIL frame " + frame + ": " + String(e));
+        process.exit(1);
+        return;
+      }
+      setImmediate(tick);
+    }
+    tick();
+  }
 }).catch((e) => {
   console.log("SMOKE_RESULT", String(e && e.message || e).slice(0, 300));
   if (e && e.stack) {

@@ -364,18 +364,19 @@ function main() -> i32 {
 
     keyscript = getenv("DOOMFLOW_KEYSCRIPT")
     loop_frame = 0
-    printf("DBG: main entering game loop\n")
+    printf("DBG: main init done, returning to JS for rAF loop\n")
 
-    while !gfx_should_close(loop_g) {
-        doomflow_frame()
-    }
-    printf("DBG: main game loop exited\n")
-
-    gfx_close(loop_g)
+    # No while-loop: the JS host calls doomflow_frame() per
+    # requestAnimationFrame. This avoids ASYNCIFY entirely.
     return 0
 }
 
-function doomflow_frame() -> void {
+@flow_api
+function doomflow_frame() -> i32 {
+    if gfx_should_close(loop_g) != 0 {
+        gfx_close(loop_g)
+        return 0
+    }
     gfx_poll(loop_g)
     pump_keys(loop_g)
     pump_keyscript(loop_frame)
@@ -392,5 +393,12 @@ function doomflow_frame() -> void {
             loop_fb[3] as i32, loop_fb[4] as i32)
     }
     gfx_blit_rgb(loop_g, 0, 0, loop_w, loop_h, loop_fb)
-    gfx_present(loop_g)
+    # No gfx_present: the JS host calls doomflow_present() after this
+    # returns to blit the pixel buffer to canvas. No ASYNCIFY needed.
+    return 1
+}
+
+@flow_api
+function doomflow_get_gfx_ctx() -> ptr<void> {
+    return loop_g.ctx
 }

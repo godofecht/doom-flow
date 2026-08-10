@@ -190,6 +190,41 @@
         };
         try {
           mod.callMain([]);
+          // MLIR build: main() returns after init. Drive frames via rAF
+          // calling doomflow_frame() + doomflow_present(). No ASYNCIFY.
+          if (typeof mod._doomflow_frame === "function") {
+            var ctx = null;
+            if (typeof mod._doomflow_get_gfx_ctx === "function") {
+              ctx = mod._doomflow_get_gfx_ctx();
+            }
+            var rafId = null;
+            var stopped = false;
+            window.flowGfxStop = function () { stopped = true; };
+            function frameLoop() {
+              if (stopped) {
+                cancelAnimationFrame(rafId);
+                setStatus("stopped");
+                stopBtn.disabled = true;
+                return;
+              }
+              try {
+                var alive = mod._doomflow_frame();
+                if (!alive) {
+                  cancelAnimationFrame(rafId);
+                  if (window.flowGfxOnExit) window.flowGfxOnExit(0);
+                  return;
+                }
+                if (mod._doomflow_present) mod._doomflow_present(ctx);
+              } catch (e) {
+                cancelAnimationFrame(rafId);
+                log(String(e), true);
+                setStatus("crashed");
+                return;
+              }
+              rafId = requestAnimationFrame(frameLoop);
+            }
+            rafId = requestAnimationFrame(frameLoop);
+          }
         } catch (e) {
           if (!(e && e.name === "ExitStatus")) log(String(e), true);
         }
