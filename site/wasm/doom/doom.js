@@ -42,7 +42,7 @@ var ENVIRONMENT_IS_SHELL = !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_NODE && !ENVIR
 
 // --pre-jses are emitted after the Module integration code, so that they can
 // refer to Module (if they choose; they can also define Module)
-// include: /var/folders/6n/6ssrqqs517z9ct_hvszxp0sr0000gn/T/tmp66kqhnyu.js
+// include: /var/folders/6n/6ssrqqs517z9ct_hvszxp0sr0000gn/T/tmp7mr7mh2v.js
 
   if (!Module['expectedDataFileDownloads']) Module['expectedDataFileDownloads'] = 0;
   Module['expectedDataFileDownloads']++;
@@ -174,7 +174,7 @@ var ENVIRONMENT_IS_SHELL = !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_NODE && !ENVIR
 
   })();
 
-// end include: /var/folders/6n/6ssrqqs517z9ct_hvszxp0sr0000gn/T/tmp66kqhnyu.js
+// end include: /var/folders/6n/6ssrqqs517z9ct_hvszxp0sr0000gn/T/tmp7mr7mh2v.js
 
 
 var arguments_ = [];
@@ -1556,6 +1556,8 @@ var findStringEnd = (heapOrArray, idx, maxBytesToRead, ignoreNul) => {
   ignorePermissions:true,
   filesystems:null,
   syncFSRequests:0,
+  readFiles:{
+  },
   ErrnoError:class {
         name = 'ErrnoError';
         // We set the `name` property to be able to identify `FS.ErrnoError`
@@ -1821,11 +1823,9 @@ var findStringEnd = (heapOrArray, idx, maxBytesToRead, ignoreNul) => {
         // return 0 if any user, group or owner bits are set.
         if (perms.includes('r') && !(node.mode & 292)) {
           return 2;
-        }
-        if (perms.includes('w') && !(node.mode & 146)) {
+        } else if (perms.includes('w') && !(node.mode & 146)) {
           return 2;
-        }
-        if (perms.includes('x') && !(node.mode & 73)) {
+        } else if (perms.includes('x') && !(node.mode & 73)) {
           return 2;
         }
         return 0;
@@ -1866,8 +1866,10 @@ var findStringEnd = (heapOrArray, idx, maxBytesToRead, ignoreNul) => {
           if (FS.isRoot(node) || FS.getPath(node) === FS.cwd()) {
             return 10;
           }
-        } else if (FS.isDir(node.mode)) {
-          return 31;
+        } else {
+          if (FS.isDir(node.mode)) {
+            return 31;
+          }
         }
         return 0;
       },
@@ -1877,16 +1879,13 @@ var findStringEnd = (heapOrArray, idx, maxBytesToRead, ignoreNul) => {
         }
         if (FS.isLink(node.mode)) {
           return 32;
-        }
-        var mode = FS.flagsToPermissionString(flags);
-        if (FS.isDir(node.mode)) {
-          // opening for write
-          // TODO: check for O_SEARCH? (== search for dir only)
-          if (mode !== 'r' || (flags & (512 | 64))) {
+        } else if (FS.isDir(node.mode)) {
+          if (FS.flagsToPermissionString(flags) !== 'r' // opening for write
+              || (flags & (512 | 64))) { // TODO: check for O_SEARCH? (== search for dir only)
             return 31;
           }
         }
-        return FS.nodePermissions(node, mode);
+        return FS.nodePermissions(node, FS.flagsToPermissionString(flags));
       },
   checkOpExists(op, err) {
         if (!op) {
@@ -2540,6 +2539,11 @@ var findStringEnd = (heapOrArray, idx, maxBytesToRead, ignoreNul) => {
         }
         if (created) {
           FS.chmod(node, mode & 0o777);
+        }
+        if (Module['logReadFiles'] && !(flags & 1)) {
+          if (!(path in FS.readFiles)) {
+            FS.readFiles[path] = 1;
+          }
         }
         return stream;
       },

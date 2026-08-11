@@ -56,7 +56,7 @@ jobs:
           WASM_ENVIRONMENT: web,node
         run: |
           chmod +x scripts/build_wasm.sh
-          ./scripts/build_wasm.sh --doom-only
+          ./scripts/build_wasm.sh --doom-only --test-clock
 
       - name: Record GIF
         env:

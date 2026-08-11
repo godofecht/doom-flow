@@ -110,6 +110,7 @@ createFlowModule({
       return;
     }
     try {
+      if (typeof global !== "undefined") global.__detFrame = frame;
       var alive = mod._doomflow_frame();
       if (!alive) {
         console.log("game exited at frame " + frame);

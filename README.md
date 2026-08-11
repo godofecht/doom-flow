@@ -75,8 +75,8 @@ mismatches across all 79 samples.
 ## Record a GIF
 
 ```bash
-FLOW_DIR=~/flow ./scripts/record_gif.sh
-# optional: --frames 180 --out media/doom.gif --args "-timedemo demo1"
+FLOW_DIR=~/flow ./scripts/build_wasm.sh --doom-only --test-clock
+FLOW_DIR=~/flow node scripts/record_wasm_gif.js --frames 600 --skip 6 --fps 15 --width 320 --out media/doom.gif
 ```
 
 ## Controls
