@@ -11,7 +11,7 @@ MLIR backend (MLIR to LLVM to emcc). Framebuffer output is byte-identical
 to the C backend, verified across 136 samples spanning title screen and
 AI gameplay including the E1M1 to E1M2 level transition.
 
-![Doom timedemo gameplay (CI GIF)](media/doom.gif)
+![Doom AI pilot gameplay (CI GIF)](media/doom.gif)
 
 | | |
 | --- | --- |
@@ -32,8 +32,9 @@ The MLIR object compiles at -O1 and links with emcc at -O1. The C
 backend is used for native macOS builds. Both backends produce
 byte-identical framebuffer output.
 
-CI records the GIF with Flow's headless gfx-record path
-(`FLOW_GFX_RECORD_*` + `frames_to_gif.py`), same idea as `flow record`.
+CI records the GIF by driving the MLIR WASM build in Node with the
+deterministic test clock, capturing RGBA frames, and encoding with
+`frames_to_gif.py`.
 
 ## Build and run (native)
 

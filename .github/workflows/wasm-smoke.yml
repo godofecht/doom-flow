@@ -109,3 +109,12 @@ jobs:
         run: |
           chmod +x scripts/run_byte_identical.sh
           ./scripts/run_byte_identical.sh
+
+      - name: Gameplay byte-identicality test (C vs MLIR)
+        env:
+          FLOW_DIR: ${{ github.workspace }}/flow
+          WASM_ENVIRONMENT: web,node
+          SMOKE_TIMEOUT: 300000
+        run: |
+          chmod +x scripts/run_gameplay_test.sh
+          ./scripts/run_gameplay_test.sh
