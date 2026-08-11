@@ -22,23 +22,50 @@ jobs:
           repository: flooooooooooow/flow
           path: flow
 
-      - name: Install tools
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Flow Python deps and Pillow
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang python3 python3-pip python3-venv
           python3 -m venv .venv
           .venv/bin/pip install -r flow/requirements.txt pillow
           echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
 
-      - name: Record GIF via Flow gfx-record
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Emscripten
+        uses: emscripten-core/setup-emsdk@v15
+        with:
+          version: 5.0.1
+          actions-cache-folder: 'emsdk-cache'
+
+      - name: Install LLVM (for mlir-opt)
+        run: |
+          wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/LLVM-20.1.8-Linux-X64.tar.xz -O /tmp/llvm.tar.xz
+          mkdir -p /tmp/llvm && tar xf /tmp/llvm.tar.xz -C /tmp/llvm --strip-components=1
+          echo "/tmp/llvm/bin" >> "$GITHUB_PATH"
+
+      - name: Build WASM
         env:
           FLOW_DIR: ${{ github.workspace }}/flow
-          FLOW_HOST: python
+          WASM_ENVIRONMENT: web,node
         run: |
-          chmod +x scripts/record_gif.sh
-          ./scripts/record_gif.sh --frames 120 --skip 2 --fps 15 --width 320 \
-            --out media/doom.gif \
-            --args "-timedemo demo1"
+          chmod +x scripts/build_wasm.sh
+          ./scripts/build_wasm.sh --doom-only
+
+      - name: Record GIF
+        env:
+          FLOW_DIR: ${{ github.workspace }}/flow
+          SMOKE_TIMEOUT: 120000
+        run: |
+          node scripts/record_wasm_gif.js \
+            --frames 120 --skip 2 --fps 15 --width 320 \
+            --out media/doom.gif
 
       - name: Upload gameplay GIF
         uses: actions/upload-artifact@v7

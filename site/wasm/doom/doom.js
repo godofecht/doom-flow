@@ -42,7 +42,7 @@ var ENVIRONMENT_IS_SHELL = !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_NODE && !ENVIR
 
 // --pre-jses are emitted after the Module integration code, so that they can
 // refer to Module (if they choose; they can also define Module)
-// include: /var/folders/6n/6ssrqqs517z9ct_hvszxp0sr0000gn/T/tmpnmqnucu0.js
+// include: /var/folders/6n/6ssrqqs517z9ct_hvszxp0sr0000gn/T/tmp66kqhnyu.js
 
   if (!Module['expectedDataFileDownloads']) Module['expectedDataFileDownloads'] = 0;
   Module['expectedDataFileDownloads']++;
@@ -174,7 +174,7 @@ var ENVIRONMENT_IS_SHELL = !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_NODE && !ENVIR
 
   })();
 
-// end include: /var/folders/6n/6ssrqqs517z9ct_hvszxp0sr0000gn/T/tmpnmqnucu0.js
+// end include: /var/folders/6n/6ssrqqs517z9ct_hvszxp0sr0000gn/T/tmp66kqhnyu.js
 
 
 var arguments_ = [];
@@ -359,7 +359,7 @@ function updateMemoryViews() {
   var b = wasmMemory.buffer;
   HEAP8 = new Int8Array(b);
   HEAP16 = new Int16Array(b);
-  HEAPU8 = new Uint8Array(b);
+  Module['HEAPU8'] = HEAPU8 = new Uint8Array(b);
   HEAPU16 = new Uint16Array(b);
   HEAP32 = new Int32Array(b);
   HEAPU32 = new Uint32Array(b);
@@ -3456,8 +3456,6 @@ var findStringEnd = (heapOrArray, idx, maxBytesToRead, ignoreNul) => {
   }
   }
 
-  var _emscripten_date_now = () => Date.now();
-
   var getHeapMax = () =>
       // Stay one Wasm page short of 4GB: while e.g. Chrome is able to allocate
       // full 4GB Wasm memories, the size will wrap back to 0 bytes in Wasm side
@@ -3714,6 +3712,12 @@ var findStringEnd = (heapOrArray, idx, maxBytesToRead, ignoreNul) => {
   }
   }
 
+  function _flow_rt_time_ms() {
+      var g = (typeof global !== "undefined") ? global : (typeof window !== "undefined") ? window : {};
+      var f = g.__detFrame || 0;
+      return (f * 29) | 0;
+    }
+
 
   var handleException = (e) => {
       // Certain exception types we do not treat as errors since they are used for
@@ -3909,6 +3913,10 @@ var _malloc,
   _doomflow_first_pixel,
   _doomflow_fb_crc32,
   _doomflow_fb_row,
+  _doomflow_pixels,
+  _doomflow_width,
+  _doomflow_height,
+  _doomflow_fb_copy,
   __emscripten_stack_restore,
   __emscripten_stack_alloc,
   _emscripten_stack_get_current,
@@ -3932,6 +3940,10 @@ function assignWasmExports(wasmExports) {
   _doomflow_first_pixel = Module['_doomflow_first_pixel'] = wasmExports['doomflow_first_pixel'];
   _doomflow_fb_crc32 = Module['_doomflow_fb_crc32'] = wasmExports['doomflow_fb_crc32'];
   _doomflow_fb_row = Module['_doomflow_fb_row'] = wasmExports['doomflow_fb_row'];
+  _doomflow_pixels = Module['_doomflow_pixels'] = wasmExports['doomflow_pixels'];
+  _doomflow_width = Module['_doomflow_width'] = wasmExports['doomflow_width'];
+  _doomflow_height = Module['_doomflow_height'] = wasmExports['doomflow_height'];
+  _doomflow_fb_copy = Module['_doomflow_fb_copy'] = wasmExports['doomflow_fb_copy'];
   __emscripten_stack_restore = wasmExports['_emscripten_stack_restore'];
   __emscripten_stack_alloc = wasmExports['_emscripten_stack_alloc'];
   _emscripten_stack_get_current = wasmExports['emscripten_stack_get_current'];
@@ -3955,8 +3967,6 @@ var wasmImports = {
   /** @export */
   doomflow_js_blit,
   /** @export */
-  emscripten_date_now: _emscripten_date_now,
-  /** @export */
   emscripten_resize_heap: _emscripten_resize_heap,
   /** @export */
   environ_get: _environ_get,
@@ -3979,7 +3989,9 @@ var wasmImports = {
   /** @export */
   flow_gfx_js_key,
   /** @export */
-  flow_gfx_js_shutdown
+  flow_gfx_js_shutdown,
+  /** @export */
+  flow_rt_time_ms: _flow_rt_time_ms
 };
 
 

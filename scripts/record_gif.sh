@@ -68,9 +68,20 @@ case "$(uname -s)" in
   Darwin) CF_FLAGS=(-framework CoreFoundation) ;;
 esac
 
+# The C generator's fault handler is overridden via -DFLOW_FAULT_HANDLER
+# so Doom's intentional negative left-shifts don't abort. Provide the
+# handler as a real function in a small shim TU (doom_shim.c pulls
+# emscripten.h, not available for native builds).
+SHIM_C="$BUILD/noop_shim.c"
+cat > "$SHIM_C" <<'EOF'
+static inline void flow_noop_handler(const char* msg) { (void)msg; }
+EOF
+
 clang -O2 -fno-omit-frame-pointer \
   -include sys/types.h -include sys/stat.h \
   -DNORMALUNIX -DSNDSERV -D_DEFAULT_SOURCE \
+  -DFLOW_FAULT_HANDLER=flow_noop_handler \
+  -include "$SHIM_C" \
   "$C_FILE" "$REC_LOGIC" \
   "$FLOW_DIR/runtime/gfx_record.c" \
   "$FLOW_DIR/runtime/flow_rt_support.c" \

@@ -136,3 +136,28 @@ int32_t doomflow_fb_row(void *handle, int32_t y, uint8_t *dst, int32_t dst_len) 
     }
     return row_bytes;
 }
+
+// Return a pointer to the raw RGBA8 pixel buffer and its dimensions.
+// Used by record_wasm_gif.js to capture frames for GIF encoding.
+uint8_t *doomflow_pixels(void *handle) {
+    DoomFlowGfx *g = (DoomFlowGfx *)handle;
+    return g ? g->pixels : NULL;
+}
+int32_t doomflow_width(void *handle) {
+    DoomFlowGfx *g = (DoomFlowGfx *)handle;
+    return g ? g->width : 0;
+}
+int32_t doomflow_height(void *handle) {
+    DoomFlowGfx *g = (DoomFlowGfx *)handle;
+    return g ? g->height : 0;
+}
+// Copy the full RGBA8 pixel buffer into a destination buffer.
+// Returns bytes copied, or negative on error.
+int32_t doomflow_fb_copy(void *handle, uint8_t *dst, int32_t dst_len) {
+    DoomFlowGfx *g = (DoomFlowGfx *)handle;
+    if (!g || !g->pixels) return -1;
+    int32_t n = g->width * g->height * 4;
+    if (dst_len < n) return -2;
+    for (int32_t i = 0; i < n; i++) dst[i] = g->pixels[i];
+    return n;
+}
