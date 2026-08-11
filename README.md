@@ -8,8 +8,8 @@
 Doom, rewritten in [Flow](https://github.com/flooooooooooow/flow).
 Native build uses Flow's C backend. The browser demo ships with the
 MLIR backend (MLIR to LLVM to emcc). Framebuffer output is byte-identical
-to the C backend, verified across 79 samples spanning title screen and
-AI gameplay.
+to the C backend, verified across 136 samples spanning title screen and
+AI gameplay including the E1M1 to E1M2 level transition.
 
 ![Doom timedemo gameplay (CI GIF)](media/doom.gif)
 
@@ -65,12 +65,12 @@ through levels every 3600 frames), **RL Arena**.
 
 ```bash
 FLOW_DIR=~/flow bash scripts/run_byte_identical.sh    # title screen: 15 samples
-FLOW_DIR=~/flow bash scripts/run_gameplay_test.sh      # AI gameplay: 64 samples
+FLOW_DIR=~/flow bash scripts/run_gameplay_test.sh      # AI gameplay: 121 samples
 ```
 
 Both suites build C and MLIR WASM variants, drive them through the
 deterministic test clock, and compare CRC32 values per frame. Zero
-mismatches across all 79 samples.
+mismatches across all 136 samples.
 
 ## Record a GIF
 
