@@ -2,21 +2,16 @@
 # Build doom-flow (and the Q-DOOM watch agent) to WebAssembly for GitHub Pages.
 #
 # Flow browser path (selectable CPU backend):
-#   BACKEND=c    (default): doom.flow → C → emcc
-#   BACKEND=mlir           : doom.flow → MLIR → LLVM IR → emcc
+#   BACKEND=mlir (default): doom.flow → MLIR → LLVM IR → emcc
+#   BACKEND=c             : doom.flow → C → emcc
 #
 # Both paths link gfx_wasm.c + flow_rt_support.c, preload DOOM1.WAD, and use
 # doom-scale ASYNCIFY / INITIAL_MEMORY. Intermediate .c / .ll never ships in site/.
 #
 # Requires: emcc on PATH, Flow checkout at FLOW_DIR (default ../flow).
-# Flow tip should include epic #221 / PR #229 (preload, link, MLIR gfx).
-# BACKEND=mlir also needs Flow's static string-array global init
-# (fix/mlir-static-string-arrays). Prefer a dedicated worktree so other
-# checkouts of ~/flow cannot race the build:
-#   git -C ~/flow worktree add ~/flow-mlir-doom fix/mlir-static-string-arrays
 #
 #   FLOW_DIR=~/flow ./scripts/build_wasm.sh
-#   FLOW_DIR=~/flow-mlir-doom BACKEND=mlir ./scripts/build_wasm.sh --doom-only
+#   FLOW_DIR=~/flow BACKEND=c ./scripts/build_wasm.sh --doom-only
 #   FLOW_DIR=~/flow ./scripts/build_wasm.sh --ai-only
 
 set -euo pipefail
@@ -28,7 +23,7 @@ OUT_AI="$ROOT/site/wasm/ai"
 TMP="$ROOT/build/wasm"
 DO_DOOM=1
 DO_AI=1
-BACKEND="${BACKEND:-c}"
+BACKEND="${BACKEND:-mlir}"
 WASM_ENVIRONMENT="${WASM_ENVIRONMENT:-web}"
 TEST_CLOCK=0
 
