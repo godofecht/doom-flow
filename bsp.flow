@@ -337,7 +337,10 @@ function R_ClipSolidWallSegment(first: i32, last: i32) -> void {
             let mut next: i32 = newend
             newend = newend + 1
             while next != start {
-                bsp_seg_at(next)[0] = bsp_seg_at(next - 1)[0]
+                let src: ptr<Cliprange> = bsp_seg_at(next - 1)
+                let dst: ptr<Cliprange> = bsp_seg_at(next)
+                dst[0].first = src[0].first
+                dst[0].last = src[0].last
                 next = next - 1
             }
             bsp_seg_at(next)[0].first = first
@@ -374,7 +377,10 @@ function R_ClipSolidWallSegment(first: i32, last: i32) -> void {
                     break
                 }
                 start = start + 1
-                bsp_seg_at(start)[0] = bsp_seg_at(n)[0]
+                let src2: ptr<Cliprange> = bsp_seg_at(n)
+                let dst2: ptr<Cliprange> = bsp_seg_at(start)
+                dst2[0].first = src2[0].first
+                dst2[0].last = src2[0].last
             }
             newend = start + 1
             return
@@ -397,7 +403,10 @@ function R_ClipSolidWallSegment(first: i32, last: i32) -> void {
             break
         }
         start = start + 1
-        bsp_seg_at(start)[0] = bsp_seg_at(n2)[0]
+        let src3: ptr<Cliprange> = bsp_seg_at(n2)
+        let dst3: ptr<Cliprange> = bsp_seg_at(start)
+        dst3[0].first = src3[0].first
+        dst3[0].last = src3[0].last
     }
     newend = start + 1
 }

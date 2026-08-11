@@ -129,6 +129,14 @@ extern { function argvflow_set_args(argc: i32, argv: ptr<i64>) -> void }
 extern { function M_FindResponseFile() -> void }
 extern { function D_DoomMain() -> void }
 extern { function doomgeneric_Tick() -> void }
+extern { function G_ExitLevel() -> void }
+extern { function STAT_gamestate() -> i32 }
+extern { function STAT_gamemap() -> i32 }
+
+const DOOM_GS_LEVEL: i32 = 0
+const DOOM_AI_LEVEL_FRAMES: i32 = 3600
+let mut ai_level_start: i32 = 0
+let mut ai_exited: i32 = 0
 
 # Bootstrap: was doomgeneric_Create/dg_create in dg_shim.c. Builds argv
 # ("doomflow" "-iwad" <wad> + DOOMFLOW_ARGS tokens split on spaces), same
@@ -265,6 +273,22 @@ function pump_keyscript(frame: i32) -> void {
 function pump_ai(frame: i32) -> void {
     if ai_pilot == 0 {
         return
+    }
+    # Track level changes so we can auto-advance after a fixed dwell time.
+    if STAT_gamestate() == DOOM_GS_LEVEL {
+        if ai_exited != 0 {
+            ai_level_start = frame
+            ai_exited = 0
+        }
+    }
+    # Auto-exit the level after DOOM_AI_LEVEL_FRAMES frames so the pilot
+    # cycles through maps without needing to reach the exit switch.
+    if STAT_gamestate() == DOOM_GS_LEVEL and ai_exited == 0 {
+        if frame - ai_level_start >= DOOM_AI_LEVEL_FRAMES {
+            G_ExitLevel()
+            ai_exited = 1
+            return
+        }
     }
     # In-level shortly after autostart warp (no long menu wait).
     if frame < 40 {

@@ -8,6 +8,10 @@
 #include <emscripten.h>
 #include <stdint.h>
 
+// No-op handlers for Flow runtime safety checks (shift UB / div-by-zero).
+// Doom uses negative left-shifts intentionally; the checks abort otherwise.
+void flow_noop_handler(void) {}
+
 typedef struct {
     int32_t width;
     int32_t height;

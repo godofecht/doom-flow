@@ -80,8 +80,10 @@ mkdir -p "$TMP"
 EMCC_OPT=(-O2)
 EMCC_LINK_OPT=()
 JS_LIBRARY=""
+TEST_CLOCK_DEFINE=""
 if [ "$TEST_CLOCK" = "1" ]; then
   JS_LIBRARY="--js-library $ROOT/scripts/deterministic_clock.js"
+  TEST_CLOCK_DEFINE="-DFLOW_TEST_CLOCK"
 fi
 if [ "$BACKEND" = "mlir" ]; then
   EMCC_OPT=(-O0)
@@ -154,7 +156,7 @@ flow_lower() {
     echo "$ll"
   else
     local c="$TMP/${stem}.c"
-    if ! python3 -m "$FLOWC" "$src" --c --lenient -o "$c" >&2; then
+    if ! python3 -m "$FLOWC" "$src" --c --lenient --no-bounds-check -o "$c" >&2; then
       echo "Flow→C failed for $src" >&2
       exit 1
     fi
@@ -183,7 +185,7 @@ build_doom() {
     # ASYNCIFY + alloca corruption that breaks the MLIR -O0 build.
     emcc -c "$ir" -O0 -o "$TMP/doom.o"
     emcc -c "$FLOW_DIR/runtime/gfx_wasm.c" -O2 -o "$TMP/gfx_wasm.o"
-    emcc -c "$FLOW_DIR/runtime/flow_rt_support.c" -O2 -o "$TMP/flow_rt.o"
+    emcc -c "$FLOW_DIR/runtime/flow_rt_support.c" -O2 $TEST_CLOCK_DEFINE -o "$TMP/flow_rt.o"
     emcc -c "$ROOT/scripts/doom_shim.c" -O2 -o "$TMP/doom_shim.o"
     emcc "$TMP/doom.o" "$TMP/gfx_wasm.o" "$TMP/flow_rt.o" "$TMP/doom_shim.o" \
       -O1 \
@@ -215,6 +217,8 @@ build_doom() {
       -sFORCE_FILESYSTEM=1 \
       --preload-file "$wad@/doom1.wad" \
       -DNORMALUNIX -DSNDSERV -D_DEFAULT_SOURCE \
+      $TEST_CLOCK_DEFINE \
+      '-DFLOW_SHIFT_UB_HANDLER=flow_noop_handler' '-DFLOW_DIV0_HANDLER=flow_noop_handler' \
       -o "$OUT_DOOM/doom.js"
   fi
   # Keep MLIR IR for fast ASYNCIFY/emcc iteration (Flow transpile is the slow part).
