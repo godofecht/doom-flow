@@ -73,10 +73,12 @@ export PYTHONPATH="$FLOW_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 FLOWC=flow.transpiler
 mkdir -p "$TMP"
 
-# MLIR→LLVM IR is not opt-stable at -O1+: LLVM miscompiles string scanning
-# loops (IdentifyIWADByName hangs on a null-byte check). Compile the Flow
-# object at -O0 and the C runtime at -O2, then link with -O1 so binaryen
-# can still optimize the final wasm without touching the Flow IR.
+# MLIR→LLVM IR is now opt-stable at -O1. Earlier string-scan miscompiles
+# (IdentifyIWADByName null-byte check) were caused by missing wasm32
+# datalayout, incorrect unsigned cast propagation, and zero-initialized
+# binary const expressions in the MLIR generator. Those are fixed in the
+# current Flow compiler, so we compile the Flow object at -O1 and link
+# with -O1 for binaryen optimization.
 EMCC_OPT=(-O2)
 EMCC_LINK_OPT=()
 JS_LIBRARY=""
@@ -86,7 +88,7 @@ if [ "$TEST_CLOCK" = "1" ]; then
   TEST_CLOCK_DEFINE="-DFLOW_TEST_CLOCK"
 fi
 if [ "$BACKEND" = "mlir" ]; then
-  EMCC_OPT=(-O0)
+  EMCC_OPT=(-O1)
   EMCC_LINK_OPT=(-O1)
   # Config string-table globals must be initialized (Flow branch
   # fix/mlir-static-string-arrays). Without this, M_LoadDefaults dies on
@@ -182,8 +184,8 @@ build_doom() {
   if [ "$BACKEND" = "mlir" ]; then
     # No ASYNCIFY: main() returns after init, JS drives frames via rAF
     # calling doomflow_frame() + doomflow_present(). This avoids the
-    # ASYNCIFY + alloca corruption that breaks the MLIR -O0 build.
-    emcc -c "$ir" -O0 -o "$TMP/doom.o"
+    # ASYNCIFY + alloca corruption that breaks the MLIR build.
+    emcc -c "$ir" ${EMCC_OPT[@]} -o "$TMP/doom.o"
     emcc -c "$FLOW_DIR/runtime/gfx_wasm.c" -O2 -o "$TMP/gfx_wasm.o"
     emcc -c "$FLOW_DIR/runtime/flow_rt_support.c" -O2 $TEST_CLOCK_DEFINE -o "$TMP/flow_rt.o"
     emcc -c "$ROOT/scripts/doom_shim.c" -O2 -o "$TMP/doom_shim.o"

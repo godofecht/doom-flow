@@ -129,9 +129,8 @@
     </ol>
     <p class="pipeline-note">
       This page ships via Flow's <strong>MLIR → LLVM → emcc</strong> path
-      (<code>./flow wasm --backend=mlir</code>). The Flow IR is compiled at -O0
-      and linked with binaryen -O1, because LLVM -O1+ miscompiles string loops
-      in the current MLIR backend. The C → emcc path is still used for native
+      (<code>./flow wasm --backend=mlir</code>). The Flow IR is compiled at -O1
+      and linked with binaryen -O1. The C → emcc path is still used for native
       macOS builds.
       <a href="https://github.com/flooooooooooow/flow/issues/221" rel="noopener">epic #221</a>,
       <a href="https://github.com/flooooooooooow/flow/discussions/226" rel="noopener">roadmap discussion</a>.
