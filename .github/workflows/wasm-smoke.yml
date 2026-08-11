@@ -67,11 +67,6 @@ jobs:
           repository: flooooooooooow/flow
           path: flow
 
-      - name: Apply MLIR unsigned fix
-        run: |
-          cd flow
-          git apply ../scripts/mlir_unsigned_fix.patch
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
