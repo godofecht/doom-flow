@@ -11,7 +11,7 @@ MLIR backend (MLIR to LLVM to emcc). Framebuffer output is byte-identical
 to the C backend, verified across 136 samples spanning title screen and
 AI gameplay including the E1M1 to E1M2 level transition.
 
-![Doom AI pilot gameplay (CI GIF)](media/doom.gif)
+![Doom AI pilot gameplay (CI GIF)](site/doom.gif)
 
 | | |
 | --- | --- |

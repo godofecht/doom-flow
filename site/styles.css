@@ -349,6 +349,15 @@ canvas {
   padding: 0 1.25rem 2rem;
 }
 
+.verify-gif {
+  display: block;
+  width: 100%;
+  max-width: 640px;
+  margin: 0 auto 1.5rem;
+  border: 1px solid var(--steel);
+  image-rendering: pixelated;
+}
+
 .verify-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
