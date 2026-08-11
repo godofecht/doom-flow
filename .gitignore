@@ -10,3 +10,5 @@
 .DS_Store
 /*.cfg
 /assets/
+/.venv/
+/emsdk-cache/
