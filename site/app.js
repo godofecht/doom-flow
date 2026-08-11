@@ -23,8 +23,8 @@
       assetDir: "wasm/doom/",
       canvasW: 640,
       canvasH: 400,
-      copy: "Flow → MLIR → LLVM → emcc. rAF-driven, no ASYNCIFY. IWAD preloaded; audio silent. Click to boot.",
-      hint: "Arrows / WASD · X fire · E use · Esc menu · silent (no FEATURE_SOUND)",
+      copy: "Flow through MLIR to LLVM to emcc. The shareware IWAD is preloaded. Audio is silent in this build. Click to boot.",
+      hint: "Arrows / WASD / X fire / E use / Esc menu",
       env: {}
     },
     ai: {
@@ -33,8 +33,8 @@
       assetDir: "wasm/doom/",
       canvasW: 640,
       canvasH: 400,
-      copy: "Warps into E1M1 and an open-loop Flow pilot takes the stick.",
-      hint: "doomflow_set_ai · warp E1M1 · forward / turn / fire",
+      copy: "An open-loop Flow pilot warps into E1M1 and cycles through the levels automatically.",
+      hint: "doomflow_set_ai / warp E1M1 / forward / turn / fire",
       env: { DOOMFLOW_AI: "1" },
       setAi: 1
     },
@@ -44,8 +44,8 @@
       assetDir: "wasm/ai/",
       canvasW: 368,
       canvasH: 400,
-      copy: "Tabular Q-learning trains in-page, then the greedy policy clears the room.",
-      hint: "stdlib/ai.flow · amber marine · rust imp · green HP",
+      copy: "Tabular Q-learning trains in-page. The greedy policy then clears the room.",
+      hint: "stdlib/ai.flow / amber marine / rust imp / green HP",
       env: {}
     }
   };
