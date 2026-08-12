@@ -42,7 +42,7 @@ var ENVIRONMENT_IS_SHELL = !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_NODE && !ENVIR
 
 // --pre-jses are emitted after the Module integration code, so that they can
 // refer to Module (if they choose; they can also define Module)
-// include: /var/folders/6n/6ssrqqs517z9ct_hvszxp0sr0000gn/T/tmp7mr7mh2v.js
+// include: /var/folders/6n/6ssrqqs517z9ct_hvszxp0sr0000gn/T/tmpcigvq8ee.js
 
   if (!Module['expectedDataFileDownloads']) Module['expectedDataFileDownloads'] = 0;
   Module['expectedDataFileDownloads']++;
@@ -174,7 +174,7 @@ var ENVIRONMENT_IS_SHELL = !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_NODE && !ENVIR
 
   })();
 
-// end include: /var/folders/6n/6ssrqqs517z9ct_hvszxp0sr0000gn/T/tmp7mr7mh2v.js
+// end include: /var/folders/6n/6ssrqqs517z9ct_hvszxp0sr0000gn/T/tmpcigvq8ee.js
 
 
 var arguments_ = [];
@@ -3460,6 +3460,8 @@ var findStringEnd = (heapOrArray, idx, maxBytesToRead, ignoreNul) => {
   }
   }
 
+  var _emscripten_date_now = () => Date.now();
+
   var getHeapMax = () =>
       // Stay one Wasm page short of 4GB: while e.g. Chrome is able to allocate
       // full 4GB Wasm memories, the size will wrap back to 0 bytes in Wasm side
@@ -3716,12 +3718,6 @@ var findStringEnd = (heapOrArray, idx, maxBytesToRead, ignoreNul) => {
   }
   }
 
-  function _flow_rt_time_ms() {
-      var g = (typeof global !== "undefined") ? global : (typeof window !== "undefined") ? window : {};
-      var f = g.__detFrame || 0;
-      return (f * 29) | 0;
-    }
-
 
   var handleException = (e) => {
       // Certain exception types we do not treat as errors since they are used for
@@ -3971,6 +3967,8 @@ var wasmImports = {
   /** @export */
   doomflow_js_blit,
   /** @export */
+  emscripten_date_now: _emscripten_date_now,
+  /** @export */
   emscripten_resize_heap: _emscripten_resize_heap,
   /** @export */
   environ_get: _environ_get,
@@ -3993,9 +3991,7 @@ var wasmImports = {
   /** @export */
   flow_gfx_js_key,
   /** @export */
-  flow_gfx_js_shutdown,
-  /** @export */
-  flow_rt_time_ms: _flow_rt_time_ms
+  flow_gfx_js_shutdown
 };
 
 
