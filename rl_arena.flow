@@ -1,0 +1,669 @@
+# RL Arena: DQN agent for a Doom-like combat arena.
+#
+# Standard Deep Q-Network with experience replay and target network.
+# Uses Flow stdlib ai.flow MLP (8 inputs, 16 hidden, 4 outputs) as the
+# Q-function approximator. Mini-batch SGD updates sampled from a replay
+# buffer. Target network updated periodically for stable TD targets.
+#
+# Architecture: 8 inputs -> 16 tanh hidden -> 4 linear Q-value outputs
+# Inputs: [wall_ahead, los, enemy_left, enemy_right, dist_norm, hp_norm,
+#          enemy_alive, bias]
+# Outputs: Q(s, turn_left), Q(s, turn_right), Q(s, forward), Q(s, fire)
+#
+# Build:
+#   flow wasm rl_arena.flow --backend=c --out build/rl_arena
+
+import "stdlib/ai.flow"
+
+extern {
+    function printf(fmt: string, ...) -> i32
+    function expf(x: f32) -> f32
+}
+
+const GRID: i32 = 12
+const N_ACTIONS: i32 = 4
+const STEP_CAP: i32 = 200
+const PLAYER_HP: i32 = 3
+const IMP_HP: i32 = 2
+
+const N_INPUTS: i32 = 8
+const N_HIDDEN: i32 = 16
+const N_OUTPUTS: i32 = 4
+
+# DQN hyperparameters
+const REPLAY_SIZE: i32 = 4096
+const REPLAY_BATCH: i32 = 32
+const TARGET_UPDATE_EVERY: i32 = 10
+
+# Actions as named constants (match arms need literal patterns)
+const ACT_LEFT: i32 = 0
+const ACT_RIGHT: i32 = 1
+const ACT_FORWARD: i32 = 2
+const ACT_FIRE: i32 = 3
+
+# ---------------------------------------------------------------------------
+# Structs
+# ---------------------------------------------------------------------------
+
+struct Arena {
+    px: i32,
+    py: i32,
+    face: i32,
+    php: i32,
+    ex: i32,
+    ey: i32,
+    ehp: i32,
+    steps: i32,
+    alive: bool,
+    rng: u32
+}
+
+struct StepResult {
+    reward: f32,
+    terminal: bool,
+    killed: bool
+}
+
+# ---------------------------------------------------------------------------
+# Training state (module statics for WASM export)
+# ---------------------------------------------------------------------------
+
+let mut rl_episode: i32 = 0
+let mut rl_total_episodes: i32 = 0
+let mut rl_total_kills: i32 = 0
+let mut rl_eval_rate: f32 = 0.0
+let mut rl_best_rate: f32 = 0.0
+let mut rl_avg_return: f32 = 0.0
+let mut rl_loss: f32 = 0.0
+
+# Weight snapshot buffers for JS visualization
+let mut rl_w1: array<f32, 128> = [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]
+let mut rl_b1: array<f32, 16> = [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]
+let mut rl_w2: array<f32, 64> = [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]
+let mut rl_b2: array<f32, 4> = [0.0, 0.0, 0.0, 0.0]
+
+# Activation snapshots for visualization
+let mut rl_hidden: array<f32, 16> = [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]
+let mut rl_output: array<f32, 4> = [0.0, 0.0, 0.0, 0.0]
+let mut rl_input: array<f32, 8> = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+# Target network weights (separate copy for stable TD targets)
+let mut tgt_w1: array<f32, 128> = [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]
+let mut tgt_b1: array<f32, 16> = [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]
+let mut tgt_w2: array<f32, 64> = [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]
+let mut tgt_b2: array<f32, 4> = [0.0, 0.0, 0.0, 0.0]
+
+# Experience replay buffer (flat circular arrays)
+let mut buf_s: array<f32, 32768> = [0.0]
+let mut buf_a: array<i32, 4096> = [0]
+let mut buf_r: array<f32, 4096> = [0.0]
+let mut buf_s2: array<f32, 32768> = [0.0]
+let mut buf_done: array<i32, 4096> = [0]
+let mut buf_count: i32 = 0
+let mut buf_idx: i32 = 0
+
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+
+function dx_of(face: i32) -> i32 {
+    match face {
+        1 => { return 1 }
+        3 => { return 0 - 1 }
+        _ => { return 0 }
+    }
+}
+
+function dy_of(face: i32) -> i32 {
+    match face {
+        0 => { return 0 - 1 }
+        2 => { return 1 }
+        _ => { return 0 }
+    }
+}
+
+function turn_left(face: i32) -> i32 { return (face + 3) % 4 }
+function turn_right(face: i32) -> i32 { return (face + 1) % 4 }
+
+function abs_i32(v: i32) -> i32 {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+function in_bounds(x: i32, y: i32) -> bool {
+    return x >= 1 and x < GRID - 1 and y >= 1 and y < GRID - 1
+}
+
+function rng_next(seed: u32) -> u32 {
+    return seed * 1664525 + 1013904223
+}
+
+function clear_los(px: i32, py: i32, ex: i32, ey: i32) -> bool {
+    if px != ex and py != ey { return false }
+    if px == ex {
+        let mut y0: i32 = py
+        let mut y1: i32 = ey
+        if y0 > y1 {
+            let t: i32 = y0
+            y0 = y1
+            y1 = t
+        }
+        let mut y: i32 = y0 + 1
+        while y < y1 {
+            if !in_bounds(px, y) { return false }
+            y = y + 1
+        }
+        return true
+    }
+    let mut x0: i32 = px
+    let mut x1: i32 = ex
+    if x0 > x1 {
+        let t: i32 = x0
+        x0 = x1
+        x1 = t
+    }
+    let mut x: i32 = x0 + 1
+    while x < x1 {
+        if !in_bounds(x, py) { return false }
+        x = x + 1
+    }
+    return true
+}
+
+function facing_enemy(face: i32, px: i32, py: i32, ex: i32, ey: i32) -> bool {
+    let dx: i32 = dx_of(face)
+    let dy: i32 = dy_of(face)
+    if dx != 0 {
+        if py != ey { return false }
+        if dx > 0 { return ex > px }
+        return ex < px
+    }
+    if px != ex { return false }
+    if dy > 0 { return ey > py }
+    return ey < py
+}
+
+function on_side(face: i32, px: i32, py: i32, ex: i32, ey: i32, left: bool) -> bool {
+    let rx: i32 = ex - px
+    let ry: i32 = ey - py
+    let cross: i32 = dx_of(face) * ry - dy_of(face) * rx
+    if left { return cross > 0 }
+    return cross < 0
+}
+
+# Tanh for target network forward pass (ai_tanh is private in stdlib).
+function my_tanh(x: f32) -> f32 {
+    if x > 8.0 { return 1.0 }
+    if x < -8.0 { return 0 - 1.0 }
+    let e: f32 = expf(2.0 * x)
+    return (e - 1.0) / (e + 1.0)
+}
+
+# ---------------------------------------------------------------------------
+# Arena environment
+# ---------------------------------------------------------------------------
+
+function arena_init(seed: u32) -> Arena {
+    return Arena {
+        px: 2, py: 2, face: 1, php: PLAYER_HP,
+        ex: GRID - 3, ey: GRID - 3, ehp: IMP_HP,
+        steps: 0, alive: true, rng: seed
+    }
+}
+
+# Encode the arena state as 8 float features for the MLP.
+function encode(a: ptr<Arena>, out: ptr<f32>) -> void {
+    let ax: i32 = a.px + dx_of(a.face)
+    let ay: i32 = a.py + dy_of(a.face)
+
+    out[0] = 0.0
+    if !in_bounds(ax, ay) { out[0] = 1.0 }
+
+    out[1] = 0.0
+    if a.ehp > 0 and facing_enemy(a.face, a.px, a.py, a.ex, a.ey) and clear_los(a.px, a.py, a.ex, a.ey) {
+        out[1] = 1.0
+    }
+
+    out[2] = 0.0
+    if a.ehp > 0 and on_side(a.face, a.px, a.py, a.ex, a.ey, true) { out[2] = 1.0 }
+
+    out[3] = 0.0
+    if a.ehp > 0 and on_side(a.face, a.px, a.py, a.ex, a.ey, false) { out[3] = 1.0 }
+
+    let dist: i32 = abs_i32(a.px - a.ex) + abs_i32(a.py - a.ey)
+    out[4] = (dist as f32) / 20.0
+    out[5] = (a.php as f32) / (PLAYER_HP as f32)
+
+    out[6] = 0.0
+    if a.ehp > 0 { out[6] = 1.0 }
+
+    out[7] = 1.0
+}
+
+# Apply an action to the arena. Returns (reward, terminal, killed).
+# Uses match for action dispatch and elif chains for the imp AI.
+function arena_step(a: ptr<Arena>, action: i32) -> StepResult {
+    let mut reward: f32 = -0.01
+    let mut terminal: bool = false
+    let mut killed: bool = false
+    let old_dist: i32 = abs_i32(a.px - a.ex) + abs_i32(a.py - a.ey)
+
+    match action {
+        0 => { a.face = turn_left(a.face) }
+        1 => { a.face = turn_right(a.face) }
+        2 => {
+            let nx: i32 = a.px + dx_of(a.face)
+            let ny: i32 = a.py + dy_of(a.face)
+            if in_bounds(nx, ny) and !(nx == a.ex and ny == a.ey and a.ehp > 0) {
+                a.px = nx
+                a.py = ny
+            } else {
+                reward = reward - 0.4
+            }
+        }
+        _ => {
+            if a.ehp > 0 and facing_enemy(a.face, a.px, a.py, a.ex, a.ey) and clear_los(a.px, a.py, a.ex, a.ey) {
+                a.ehp = a.ehp - 1
+                reward = reward + 5.0
+                if a.ehp <= 0 {
+                    killed = true
+                    terminal = true
+                    reward = reward + 20.0
+                }
+            } else {
+                reward = reward - 0.5
+            }
+        }
+    }
+
+    # Imp AI: moves every 2 steps toward the player
+    if !terminal and a.ehp > 0 and (a.steps % 2) == 0 {
+        let mut ix: i32 = a.ex
+        let mut iy: i32 = a.ey
+        let adx: i32 = abs_i32(a.px - a.ex)
+        let ady: i32 = abs_i32(a.py - a.ey)
+        if adx >= ady {
+            if a.px > a.ex { ix = a.ex + 1 }
+            if a.px < a.ex { ix = a.ex - 1 }
+        } else {
+            if a.py > a.ey { iy = a.ey + 1 }
+            if a.py < a.ey { iy = a.ey - 1 }
+        }
+        if in_bounds(ix, iy) and !(ix == a.px and iy == a.py) {
+            a.ex = ix
+            a.ey = iy
+        } elif in_bounds(ix, iy) and ix == a.px and iy == a.py {
+            a.php = a.php - 1
+            reward = reward - 6.0
+            if a.php <= 0 {
+                terminal = true
+                a.alive = false
+                reward = reward - 15.0
+            }
+        }
+    }
+
+    # Shaping rewards: approach bonus, retreat penalty
+    if !terminal and a.ehp > 0 {
+        let new_dist: i32 = abs_i32(a.px - a.ex) + abs_i32(a.py - a.ey)
+        if facing_enemy(a.face, a.px, a.py, a.ex, a.ey) and new_dist < old_dist {
+            reward = reward + 0.3
+        }
+        if new_dist > old_dist {
+            reward = reward - 0.15
+        }
+    }
+
+    a.steps = a.steps + 1
+    return StepResult { reward: reward, terminal: terminal, killed: killed }
+}
+
+# ---------------------------------------------------------------------------
+# Q-network helpers
+# ---------------------------------------------------------------------------
+
+function read_qvalues(features: ptr<f32>, out: ptr<f32>) -> void {
+    mlp_forward(features)
+    for i in 0 to N_OUTPUTS {
+        out[i] = mlp_output(i)
+    }
+}
+
+# Forward pass through the target network (manual, using tgt_* weights).
+function target_forward(features: ptr<f32>, out: ptr<f32>) -> void {
+    let hidden: array<f32, 16> = [
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    ]
+    for h in 0 to N_HIDDEN {
+        let mut z: f32 = tgt_b1[h]
+        for i in 0 to N_INPUTS {
+            z = z + features[i] * tgt_w1[h * N_INPUTS + i]
+        }
+        hidden[h] = my_tanh(z)
+    }
+    for o in 0 to N_OUTPUTS {
+        let mut z2: f32 = tgt_b2[o]
+        for h in 0 to N_HIDDEN {
+            z2 = z2 + hidden[h] * tgt_w2[o * N_HIDDEN + h]
+        }
+        out[o] = z2
+    }
+}
+
+function update_target() -> void {
+    for i in 0 to 128 { tgt_w1[i] = ai_mlp_w1[i] }
+    for j in 0 to 16 { tgt_b1[j] = ai_mlp_b1[j] }
+    for k in 0 to 64 { tgt_w2[k] = ai_mlp_w2[k] }
+    for o in 0 to 4 { tgt_b2[o] = ai_mlp_b2[o] }
+}
+
+# ---------------------------------------------------------------------------
+# Experience replay
+# ---------------------------------------------------------------------------
+
+function replay_add(s: ptr<f32>, a: i32, r: f32, s2: ptr<f32>, done: i32) -> void {
+    for i in 0 to N_INPUTS {
+        buf_s[buf_idx * N_INPUTS + i] = s[i]
+        buf_s2[buf_idx * N_INPUTS + i] = s2[i]
+    }
+    buf_a[buf_idx] = a
+    buf_r[buf_idx] = r
+    buf_done[buf_idx] = done
+    buf_idx = buf_idx + 1
+    if buf_idx >= REPLAY_SIZE { buf_idx = 0 }
+    if buf_count < REPLAY_SIZE { buf_count = buf_count + 1 }
+}
+
+# Sample a mini-batch from the replay buffer and run SGD updates.
+# Uses the target network for TD targets. Returns mean loss.
+function replay_train(batch_size: i32, lr: f32, gamma: f32) -> f32 {
+    if buf_count < batch_size { return 0.0 }
+
+    let target_q: array<f32, 4> = [0.0, 0.0, 0.0, 0.0]
+    let next_q: array<f32, 4> = [0.0, 0.0, 0.0, 0.0]
+    let s_sample: array<f32, 8> = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let s2_sample: array<f32, 8> = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut total_loss: f32 = 0.0
+
+    for b in 0 to batch_size {
+        let idx: i32 = ai_rand_range(buf_count)
+
+        for i in 0 to N_INPUTS {
+            s_sample[i] = buf_s[idx * N_INPUTS + i]
+            s2_sample[i] = buf_s2[idx * N_INPUTS + i]
+        }
+        let a: i32 = buf_a[idx]
+        let r: f32 = buf_r[idx]
+        let done: i32 = buf_done[idx]
+
+        target_forward(&s_sample[0], &target_q[0])
+
+        if done != 0 {
+            target_q[a] = r
+        } else {
+            target_forward(&s2_sample[0], &next_q[0])
+            let mut max_q: f32 = next_q[0]
+            if next_q[1] > max_q { max_q = next_q[1] }
+            if next_q[2] > max_q { max_q = next_q[2] }
+            if next_q[3] > max_q { max_q = next_q[3] }
+            target_q[a] = r + gamma * max_q
+        }
+
+        let loss: f32 = mlp_train_mse(&s_sample[0], &target_q[0], lr)
+        total_loss = total_loss + loss
+    }
+
+    return total_loss / (batch_size as f32)
+}
+
+# ---------------------------------------------------------------------------
+# Visualization snapshot
+# ---------------------------------------------------------------------------
+
+function snapshot_weights(features: ptr<f32>) -> void {
+    mlp_forward(features)
+    for i in 0 to 128 { rl_w1[i] = ai_mlp_w1[i] }
+    for j in 0 to 16 {
+        rl_b1[j] = ai_mlp_b1[j]
+        rl_hidden[j] = ai_mlp_h[j]
+    }
+    for k in 0 to 64 { rl_w2[k] = ai_mlp_w2[k] }
+    for o in 0 to 4 {
+        rl_b2[o] = ai_mlp_b2[o]
+        rl_output[o] = ai_mlp_z[o]
+    }
+    for n in 0 to 8 { rl_input[n] = ai_mlp_x[n] }
+}
+
+# ---------------------------------------------------------------------------
+# Training and evaluation
+# ---------------------------------------------------------------------------
+
+# Run one training episode with epsilon-greedy, storing transitions in the
+# replay buffer. After the episode, sample mini-batches and update the
+# main network. Periodically sync the target network.
+# Returns 1 if the agent killed the imp, 0 otherwise.
+export function rl_train_episode(epsilon: f32, lr: f32, gamma: f32, seed: u32) -> i32 {
+    let mut a: Arena = arena_init(seed)
+    let features: array<f32, 8> = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let next_features: array<f32, 8> = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let q_current: array<f32, 4> = [0.0, 0.0, 0.0, 0.0]
+    let mut ep_return: f32 = 0.0
+    let mut killed: bool = false
+
+    while a.alive and a.ehp > 0 and a.steps < STEP_CAP {
+        encode(&a, &features[0])
+        read_qvalues(&features[0], &q_current[0])
+
+        # Epsilon-greedy action selection
+        a.rng = rng_next(a.rng)
+        let rng_f: f32 = ((a.rng >> 8) as f32) / 16777216.0
+        let action: i32 = 0
+        if rng_f < epsilon {
+            a.rng = rng_next(a.rng)
+            action = ((a.rng >> 8) as i32) % N_ACTIONS
+            if action < 0 { action = 0 - action }
+        } else {
+            action = mlp_argmax()
+        }
+
+        let result: StepResult = arena_step(&a, action)
+        ep_return = ep_return + result.reward
+        if result.killed { killed = true }
+
+        # Store transition in replay buffer
+        encode(&a, &next_features[0])
+        let done_flag: i32 = 0
+        if result.terminal { done_flag = 1 }
+        replay_add(&features[0], action, result.reward, &next_features[0], done_flag)
+    }
+
+    # Mini-batch updates from replay buffer
+    let loss: f32 = replay_train(REPLAY_BATCH, lr, gamma)
+    rl_loss = rl_loss * 0.9 + loss * 0.1
+
+    # Periodic target network sync
+    if rl_episode % TARGET_UPDATE_EVERY == 0 {
+        update_target()
+    }
+
+    rl_avg_return = rl_avg_return * 0.99 + ep_return * 0.01
+    snapshot_weights(&features[0])
+
+    rl_episode = rl_episode + 1
+    rl_total_episodes = rl_total_episodes + 1
+    if killed { rl_total_kills = rl_total_kills + 1 }
+
+    if killed { return 1 }
+    return 0
+}
+
+# Run one greedy evaluation episode.
+export function rl_eval_episode(seed: u32) -> i32 {
+    let mut a: Arena = arena_init(seed)
+    let features: array<f32, 8> = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    while a.alive and a.ehp > 0 and a.steps < STEP_CAP {
+        encode(&a, &features[0])
+        mlp_forward(&features[0])
+        let action: i32 = mlp_argmax()
+        let result: StepResult = arena_step(&a, action)
+        if result.killed {
+            snapshot_weights(&features[0])
+            return 1
+        }
+    }
+
+    snapshot_weights(&features[0])
+    return 0
+}
+
+# Evaluate over N episodes and update rl_eval_rate.
+export function rl_eval(n_episodes: i32) -> f32 {
+    let mut total: i32 = 0
+    for i in 0 to n_episodes {
+        let seed: u32 = 4242 + (i as u32) * 17
+        total = total + rl_eval_episode(seed)
+    }
+    let rate: f32 = (total as f32) / (n_episodes as f32)
+    rl_eval_rate = rate
+    if rate > rl_best_rate { rl_best_rate = rate }
+    return rate
+}
+
+# Initialize the MLP, target network, and replay buffer.
+export function rl_init(seed: u32) -> void {
+    mlp_init(N_INPUTS, N_HIDDEN, N_OUTPUTS, seed)
+    update_target()
+
+    rl_episode = 0
+    rl_total_episodes = 0
+    rl_total_kills = 0
+    rl_eval_rate = 0.0
+    rl_best_rate = 0.0
+    rl_avg_return = 0.0
+    rl_loss = 0.0
+    buf_count = 0
+    buf_idx = 0
+
+    let features: array<f32, 8> = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    snapshot_weights(&features[0])
+}
+
+# ---------------------------------------------------------------------------
+# JS export surface
+# ---------------------------------------------------------------------------
+
+export function rl_get_w1() -> ptr<f32> { return &rl_w1[0] }
+export function rl_get_b1() -> ptr<f32> { return &rl_b1[0] }
+export function rl_get_w2() -> ptr<f32> { return &rl_w2[0] }
+export function rl_get_b2() -> ptr<f32> { return &rl_b2[0] }
+export function rl_get_hidden() -> ptr<f32> { return &rl_hidden[0] }
+export function rl_get_output() -> ptr<f32> { return &rl_output[0] }
+export function rl_get_input() -> ptr<f32> { return &rl_input[0] }
+
+export function rl_get_episode() -> i32 { return rl_episode }
+export function rl_get_total_episodes() -> i32 { return rl_total_episodes }
+export function rl_get_total_kills() -> i32 { return rl_total_kills }
+export function rl_get_eval_rate() -> f32 { return rl_eval_rate }
+export function rl_get_best_rate() -> f32 { return rl_best_rate }
+export function rl_get_avg_return() -> f32 { return rl_avg_return }
+export function rl_get_loss() -> f32 { return rl_loss }
+
+export function rl_get_n_inputs() -> i32 { return N_INPUTS }
+export function rl_get_n_hidden() -> i32 { return N_HIDDEN }
+export function rl_get_n_outputs() -> i32 { return N_OUTPUTS }
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+function main() -> i32 {
+    print("RL Arena: DQN agent for Doom-like combat")
+    print("Network: 8 inputs -> 16 tanh hidden -> 4 Q-value outputs")
+    print("DQN: experience replay (4096) + target network (sync every 10 ep)")
+    print("Actions: turn L/R, forward, fire | Goal: kill the imp")
+    print("")
+
+    rl_init(42 as u32)
+
+    let episodes: i32 = 5000
+    let decay_over: i32 = 2000
+    let lr: f32 = 0.001
+    let gamma: f32 = 0.95
+    let eval_eps: i32 = 100
+
+    print("training 5000 episodes (epsilon 1.00 -> 0.05 over 2000):")
+
+    let mut window: i32 = 0
+    for ep in 0 to episodes {
+        let eps_f: f32 = 1.0 - (1.0 - 0.05) * ((ep as f32) / (decay_over as f32))
+        if eps_f < 0.05 { eps_f = 0.05 }
+        let seed: u32 = 900 + (ep as u32) * 97
+        window = window + rl_train_episode(eps_f, lr, gamma, seed)
+
+        if (ep + 1) % 500 == 0 {
+            let avg: f32 = (window as f32) / 500.0
+            print("  episode ")
+            print(ep + 1)
+            print("  kill-rate ")
+            printf("%.2f", avg as f64)
+            print("  epsilon ")
+            printf("%.2f", eps_f as f64)
+            print("  loss ")
+            printf("%.4f", rl_loss as f64)
+            print("")
+            window = 0
+        }
+    }
+
+    print("")
+    let trained: f32 = rl_eval(eval_eps)
+    print("trained (greedy): kill-rate ")
+    printf("%.2f", trained as f64)
+    print(" over ")
+    print(eval_eps)
+    print(" episodes")
+
+    if trained > 0.40 {
+        print("PASS: agent learned to clear the arena")
+        return 0
+    }
+    print("FAIL: agent did not reach 0.40 kill rate")
+    return 1
+}
