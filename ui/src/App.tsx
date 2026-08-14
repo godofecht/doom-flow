@@ -776,8 +776,8 @@ function StatsSection() {
   const stats = [
     { num: "0", label: "render mismatches" },
     { num: "136", label: "samples compared" },
-    { num: "-O1", label: "MLIR opt level" },
-    { num: "487K", label: "wasm size" },
+    { num: "-O2", label: "MLIR opt level" },
+    { num: "410K", label: "wasm size" },
   ]
   return (
     <section className="mx-auto max-w-[920px] px-6 pb-10">
@@ -828,8 +828,8 @@ function StatsSection() {
 function PipelineSection() {
   const steps = [
     { num: "1", title: "Flow source", desc: "Doom rewritten as *.flow modules." },
-    { num: "2", title: "MLIR -> LLVM IR", desc: "flow.transpiler at -O1." },
-    { num: "3", title: "emcc link", desc: "gfx_wasm runtime, linked at -O1." },
+    { num: "2", title: "MLIR -> LLVM IR", desc: "flow.transpiler with mlir-opt O1 passes." },
+    { num: "3", title: "emcc link", desc: "gfx_wasm runtime, linked at -O2." },
     { num: "4", title: "WASM", desc: "Running in this tab." },
   ]
   return (

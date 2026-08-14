@@ -83,8 +83,8 @@ if [ "$TEST_CLOCK" = "1" ]; then
   TEST_CLOCK_DEFINE="-DFLOW_TEST_CLOCK"
 fi
 if [ "$BACKEND" = "mlir" ]; then
-  EMCC_OPT=(-O1)
-  EMCC_LINK_OPT=(-O1)
+  EMCC_OPT=(-O2)
+  EMCC_LINK_OPT=(-O2)
   # Config string-table globals must be initialized (Flow branch
   # fix/mlir-static-string-arrays). Without this, M_LoadDefaults dies on
   # 'use_mouse' from an undef @config_*_names array.
@@ -98,12 +98,6 @@ fi
 ASYNCIFY_STACK=65536
 STACK_SIZE=16MB
 INITIAL_MEMORY=64MB
-if [ "$BACKEND" = "mlir" ]; then
-  # MLIR -O0 frames are heavy; title/demo need large wasm + asyncify stacks.
-  ASYNCIFY_STACK=16777216
-  STACK_SIZE=64MB
-  INITIAL_MEMORY=128MB
-fi
 
 emcc_common=(
   "${EMCC_OPT[@]}"
@@ -122,11 +116,6 @@ emcc_common=(
   -Wno-implicit-function-declaration
   -lm
 )
-# Cookie at stack_get_end()==0 false-trips after ~title; keep running while
-# we chase real overflow. Remove once stack discipline is solid.
-if [ "$BACKEND" = "mlir" ]; then
-  emcc_common+=(-sSTACK_OVERFLOW_CHECK=0)
-fi
 
 # Lower .flow → intermediate for emcc. Echoes the path on stdout.
 flow_lower() {
@@ -136,7 +125,7 @@ flow_lower() {
     local ll="$TMP/${stem}.ll"
     # Flow logs on stdout; keep command substitution returning only the path.
     # --wasm32: libc size_t/long are i32 (Flow sources annotate them as i64).
-    if ! python3 -m "$FLOWC" "$src" --mlir --llvm --wasm32 --lenient -o "$ll" >&2; then
+    if ! python3 -m "$FLOWC" "$src" --mlir --llvm --wasm32 --lenient --optimize --opt-level O1 -o "$ll" >&2; then
       echo "Flow→MLIR→LLVM failed for $src" >&2
       exit 1
     fi
@@ -185,7 +174,7 @@ build_doom() {
     emcc -c "$FLOW_DIR/runtime/flow_rt_support.c" -O2 $TEST_CLOCK_DEFINE -o "$TMP/flow_rt.o"
     emcc -c "$ROOT/scripts/doom_shim.c" -O2 -o "$TMP/doom_shim.o"
     emcc "$TMP/doom.o" "$TMP/gfx_wasm.o" "$TMP/flow_rt.o" "$TMP/doom_shim.o" \
-      -O1 \
+      -O2 \
       $JS_LIBRARY \
       -sSTACK_SIZE=$STACK_SIZE \
       -sINITIAL_MEMORY=$INITIAL_MEMORY \
@@ -197,7 +186,6 @@ build_doom() {
       -sEXIT_RUNTIME=0 \
       -sEXPORTED_RUNTIME_METHODS=callMain,ccall,ENV,HEAPU8,cwrap \
       -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai,_doomflow_frame,_doomflow_present,_doomflow_get_gfx_ctx,_doomflow_should_close,_doomflow_dump_pixel,_doomflow_count_nonzero,_doomflow_first_pixel,_doomflow_fb_crc32,_doomflow_fb_row,_doomflow_pixels,_doomflow_width,_doomflow_height,_doomflow_fb_copy \
-      -sSTACK_OVERFLOW_CHECK=0 \
       -sFORCE_FILESYSTEM=1 \
       --preload-file "$wad@/doom1.wad" \
       -DNORMALUNIX -DSNDSERV -D_DEFAULT_SOURCE \
