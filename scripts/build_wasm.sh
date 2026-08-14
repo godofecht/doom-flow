@@ -125,7 +125,7 @@ flow_lower() {
     local ll="$TMP/${stem}.ll"
     # Flow logs on stdout; keep command substitution returning only the path.
     # --wasm32: libc size_t/long are i32 (Flow sources annotate them as i64).
-    if ! python3 -m "$FLOWC" "$src" --mlir --llvm --wasm32 --lenient --optimize --opt-level O1 -o "$ll" >&2; then
+    if ! python3 -m "$FLOWC" "$src" --mlir --llvm --wasm32 --lenient --optimize --opt-level O2 --no-loop-fusion --no-inline -o "$ll" >&2; then
       echo "Flow→MLIR→LLVM failed for $src" >&2
       exit 1
     fi

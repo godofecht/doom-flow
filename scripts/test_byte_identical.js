@@ -17,15 +17,15 @@ const timeoutMs = parseInt(process.env.SMOKE_TIMEOUT, 10) || 120000;
 const label = process.env.TEST_LABEL || "unknown";
 
 // Frames at which to collect CRC32. Dense early (catch first divergence),
-// sparse later (confirm long-term stability).
-// Frames 10-1000 are the stable title screen (byte-identical between
-// backends). Frames 1500+ diverge due to demo timing (TryRunTics has
-// a non-deterministic yield point), so we stop at 1000.
+// sparse later (confirm long-term stability). The title screen demo
+// cycles through attract mode and is byte-identical between backends
+// through the full 3000-frame run.
 const SAMPLE_FRAMES = [
   0, 1, 2, 3, 5, 10, 20, 30, 50, 100, 200, 300, 500,
-  750, 1000,
+  750, 1000, 1050, 1100, 1200, 1300, 1400, 1500, 1600,
+  1800, 2000, 2200, 2500, 2800, 3000,
 ];
-const MAX_FRAMES = 1000;
+const MAX_FRAMES = 3000;
 
 function err(t) {
   if (/out of bounds|abort|Assertion|RuntimeError/i.test(String(t))) {

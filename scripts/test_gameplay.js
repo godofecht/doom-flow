@@ -11,7 +11,7 @@ const dir = process.env.SMOKE_DIR
   : path.join(__dirname, "..", "site", "wasm", "doom");
 const timeoutMs = parseInt(process.env.SMOKE_TIMEOUT, 10) || 180000;
 const label = process.env.TEST_LABEL || "unknown";
-const maxFrames = parseInt(process.env.MAX_FRAMES, 10) || 4000;
+const maxFrames = parseInt(process.env.MAX_FRAMES, 10) || 6000;
 
 // Sample densely early (level load), periodically through gameplay,
 // and around the AI level transition at frame 3600.
