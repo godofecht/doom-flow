@@ -45,7 +45,7 @@ jobs:
 
       - name: Install LLVM (for mlir-opt)
         run: |
-          wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/LLVM-20.1.8-Linux-X64.tar.xz -O /tmp/llvm.tar.xz
+          wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.7/LLVM-22.1.7-Linux-X64.tar.xz -O /tmp/llvm.tar.xz
           mkdir -p /tmp/llvm && tar xf /tmp/llvm.tar.xz -C /tmp/llvm --strip-components=1
           echo "/tmp/llvm/bin" >> "$GITHUB_PATH"
 
@@ -97,7 +97,7 @@ jobs:
 
       - name: Install LLVM (for mlir-opt)
         run: |
-          wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/LLVM-20.1.8-Linux-X64.tar.xz -O /tmp/llvm.tar.xz
+          wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.7/LLVM-22.1.7-Linux-X64.tar.xz -O /tmp/llvm.tar.xz
           mkdir -p /tmp/llvm && tar xf /tmp/llvm.tar.xz -C /tmp/llvm --strip-components=1
           echo "/tmp/llvm/bin" >> "$GITHUB_PATH"
 
