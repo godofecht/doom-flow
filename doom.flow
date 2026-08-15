@@ -114,6 +114,16 @@ function doomflow_get_ai() -> i32 {
     return doomflow_ai_js
 }
 
+@flow_api
+function doomflow_debug_state() -> i32 {
+    # Pack game state into a single i32 for quick comparison:
+    # bits 0-7: gamestate, bits 8-15: gamemap, bits 16-23: gameaction
+    let gs: i32 = STAT_gamestate()
+    let gm: i32 = STAT_gamemap()
+    let ga: i32 = STAT_gameaction()
+    return (gs & 0xFF) | ((gm & 0xFF) << 8) | ((ga & 0xFF) << 16)
+}
+
 function doomflow_ai_wanted() -> i32 {
     if doomflow_get_ai() != 0 {
         return 1
@@ -132,6 +142,7 @@ extern { function doomgeneric_Tick() -> void }
 extern { function G_ExitLevel() -> void }
 extern { function STAT_gamestate() -> i32 }
 extern { function STAT_gamemap() -> i32 }
+extern { function STAT_gameaction() -> i32 }
 
 const DOOM_GS_LEVEL: i32 = 0
 const DOOM_AI_LEVEL_FRAMES: i32 = 3600

@@ -112,7 +112,7 @@ emcc_common=(
   -sINVOKE_RUN=0
   -sEXIT_RUNTIME=0
   -sEXPORTED_RUNTIME_METHODS=callMain,ccall,ENV,HEAPU8
-  -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai,_doomflow_frame,_doomflow_present,_doomflow_get_gfx_ctx,_doomflow_should_close,_doomflow_dump_pixel,_doomflow_count_nonzero,_doomflow_first_pixel,_doomflow_fb_crc32,_doomflow_fb_row,_doomflow_pixels,_doomflow_width,_doomflow_height,_doomflow_fb_copy,_dg_push_key
+  -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai,_doomflow_frame,_doomflow_present,_doomflow_get_gfx_ctx,_doomflow_should_close,_doomflow_dump_pixel,_doomflow_count_nonzero,_doomflow_first_pixel,_doomflow_fb_crc32,_doomflow_fb_row,_doomflow_pixels,_doomflow_width,_doomflow_height,_doomflow_fb_copy,_dg_push_key,_doomflow_debug_state
   -Wno-implicit-function-declaration
   -lm
 )
@@ -192,7 +192,7 @@ build_doom() {
       -sINVOKE_RUN=0 \
       -sEXIT_RUNTIME=0 \
       -sEXPORTED_RUNTIME_METHODS=callMain,ccall,ENV,HEAPU8,cwrap \
-      -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai,_doomflow_frame,_doomflow_present,_doomflow_get_gfx_ctx,_doomflow_should_close,_doomflow_dump_pixel,_doomflow_count_nonzero,_doomflow_first_pixel,_doomflow_fb_crc32,_doomflow_fb_row,_doomflow_pixels,_doomflow_width,_doomflow_height,_doomflow_fb_copy,_dg_push_key \
+      -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai,_doomflow_frame,_doomflow_present,_doomflow_get_gfx_ctx,_doomflow_should_close,_doomflow_dump_pixel,_doomflow_count_nonzero,_doomflow_first_pixel,_doomflow_fb_crc32,_doomflow_fb_row,_doomflow_pixels,_doomflow_width,_doomflow_height,_doomflow_fb_copy,_dg_push_key,_doomflow_debug_state \
       -sFORCE_FILESYSTEM=1 \
       --preload-file "$wad@/doom1.wad" \
       -DNORMALUNIX -DSNDSERV -D_DEFAULT_SOURCE \
