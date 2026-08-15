@@ -775,7 +775,7 @@ function ArenaPanel() {
 function StatsSection() {
   const stats = [
     { num: "0", label: "render mismatches" },
-    { num: "730", label: "samples compared" },
+    { num: "916", label: "samples compared" },
     { num: "-O2", label: "LLVM opt level" },
     { num: "411K", label: "wasm size" },
   ]
@@ -797,8 +797,8 @@ function StatsSection() {
         ))}
       </div>
       <p className="mt-4 max-w-[68ch] text-xs leading-relaxed text-muted-foreground">
-        Title screen (3000 frames), AI gameplay (24000 frames covering E1M1
-        through E1M6), and deterministic keyboard input replay (3000 frames)
+        Title screen (3000 frames), AI gameplay (28800 frames covering E1M1
+        through E1M8), and deterministic keyboard input replay (3000 frames)
         produce identical CRC32 values across the C and MLIR backends. The
         regression suite runs on every push.{" "}
         <a
