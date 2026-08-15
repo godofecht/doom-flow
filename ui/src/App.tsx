@@ -775,7 +775,7 @@ function ArenaPanel() {
 function StatsSection() {
   const stats = [
     { num: "0", label: "render mismatches" },
-    { num: "189", label: "samples compared" },
+    { num: "326", label: "samples compared" },
     { num: "-O2", label: "MLIR opt level" },
     { num: "410K", label: "wasm size" },
   ]
@@ -797,9 +797,10 @@ function StatsSection() {
         ))}
       </div>
       <p className="mt-4 max-w-[68ch] text-xs leading-relaxed text-muted-foreground">
-        Title screen and AI gameplay frames produce identical CRC32 values
-        across the C and MLIR backends, including the E1M1 to E1M2 level
-        transition. The regression suite runs on every push.{" "}
+        Title screen (3000 frames) and AI gameplay (12000 frames) produce
+        identical CRC32 values across the C and MLIR backends, covering E1M1,
+        E1M2, and E1M3 with level transitions. The regression suite runs on
+        every push.{" "}
         <a
           href="https://github.com/godofecht/doom-flow/blob/main/scripts/run_byte_identical.sh"
           rel="noopener"
