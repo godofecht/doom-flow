@@ -11,20 +11,21 @@ const dir = process.env.SMOKE_DIR
   : path.join(__dirname, "..", "site", "wasm", "doom");
 const timeoutMs = parseInt(process.env.SMOKE_TIMEOUT, 10) || 180000;
 const label = process.env.TEST_LABEL || "unknown";
-const maxFrames = parseInt(process.env.MAX_FRAMES, 10) || 12000;
+const maxFrames = parseInt(process.env.MAX_FRAMES, 10) || 24000;
 
 // Sample densely early (level load), periodically through gameplay,
-// and around AI level transitions at frames 3600 and 7200.
+// and around AI level transitions every 3600 frames.
 const SAMPLE_FRAMES = [];
 for (let f = 0; f <= 50; f += 5) SAMPLE_FRAMES.push(f);
 for (let f = 60; f <= 500; f += 20) SAMPLE_FRAMES.push(f);
 for (let f = 520; f <= maxFrames; f += 50) SAMPLE_FRAMES.push(f);
-// Extra samples around level transitions (E1M1->E1M2 ~3600, E1M2->E1M3 ~7200).
-for (let f = 3550; f <= 3750; f += 10) {
-  if (SAMPLE_FRAMES.indexOf(f) < 0) SAMPLE_FRAMES.push(f);
-}
-for (let f = 7150; f <= 7350; f += 10) {
-  if (SAMPLE_FRAMES.indexOf(f) < 0) SAMPLE_FRAMES.push(f);
+// Extra samples around level transitions (every 3600 frames).
+for (let transition = 3600; transition <= maxFrames; transition += 3600) {
+  for (let f = transition - 50; f <= transition + 150; f += 10) {
+    if (f >= 0 && f <= maxFrames && SAMPLE_FRAMES.indexOf(f) < 0) {
+      SAMPLE_FRAMES.push(f);
+    }
+  }
 }
 SAMPLE_FRAMES.sort((a, b) => a - b);
 

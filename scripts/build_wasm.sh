@@ -112,7 +112,7 @@ emcc_common=(
   -sINVOKE_RUN=0
   -sEXIT_RUNTIME=0
   -sEXPORTED_RUNTIME_METHODS=callMain,ccall,ENV,HEAPU8
-  -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai,_doomflow_frame,_doomflow_present,_doomflow_get_gfx_ctx,_doomflow_should_close,_doomflow_dump_pixel,_doomflow_count_nonzero,_doomflow_first_pixel,_doomflow_fb_crc32,_doomflow_fb_row,_doomflow_pixels,_doomflow_width,_doomflow_height,_doomflow_fb_copy
+  -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai,_doomflow_frame,_doomflow_present,_doomflow_get_gfx_ctx,_doomflow_should_close,_doomflow_dump_pixel,_doomflow_count_nonzero,_doomflow_first_pixel,_doomflow_fb_crc32,_doomflow_fb_row,_doomflow_pixels,_doomflow_width,_doomflow_height,_doomflow_fb_copy,_dg_push_key
   -Wno-implicit-function-declaration
   -lm
 )
@@ -125,7 +125,10 @@ flow_lower() {
     local ll="$TMP/${stem}.ll"
     # Flow logs on stdout; keep command substitution returning only the path.
     # --wasm32: libc size_t/long are i32 (Flow sources annotate them as i64).
-    if ! python3 -m "$FLOWC" "$src" --mlir --llvm --wasm32 --lenient --optimize --opt-level O2 --no-loop-fusion --no-inline -o "$ll" >&2; then
+    # --no-inline: mlir-opt inline pass takes 20+ min on 5991 functions.
+    #   LLVM -O2 handles inlining at the backend stage.
+    #   affine-loop-fusion is disabled by default in Flow (flow#466).
+    if ! python3 -m "$FLOWC" "$src" --mlir --llvm --wasm32 --lenient --optimize --opt-level O2 --no-inline -o "$ll" >&2; then
       echo "Flow→MLIR→LLVM failed for $src" >&2
       exit 1
     fi
@@ -166,9 +169,11 @@ build_doom() {
   ir="$(flow_lower "$ROOT/doom.flow" doom)"
 
   if [ "$BACKEND" = "mlir" ]; then
-    # No ASYNCIFY: main() returns after init, JS drives frames via rAF
-    # calling doomflow_frame() + doomflow_present(). This avoids the
-    # ASYNCIFY + alloca corruption that breaks the MLIR build.
+    # No ASYNCIFY for MLIR: main() returns after init, JS drives frames
+    # via rAF calling doomflow_frame() + doomflow_present(). The alloca
+    # corruption that previously blocked ASYNCIFY is fixed in Flow (flow#467),
+    # but ASYNCIFY still requires a while(1) loop inside D_DoomLoop to work.
+    # The Flow source uses a return-after-init architecture instead.
     emcc -c "$ir" ${EMCC_OPT[@]} -o "$TMP/doom.o"
     emcc -c "$FLOW_DIR/runtime/gfx_wasm.c" -O2 -o "$TMP/gfx_wasm.o"
     emcc -c "$FLOW_DIR/runtime/flow_rt_support.c" -O2 $TEST_CLOCK_DEFINE -o "$TMP/flow_rt.o"
@@ -185,7 +190,7 @@ build_doom() {
       -sINVOKE_RUN=0 \
       -sEXIT_RUNTIME=0 \
       -sEXPORTED_RUNTIME_METHODS=callMain,ccall,ENV,HEAPU8,cwrap \
-      -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai,_doomflow_frame,_doomflow_present,_doomflow_get_gfx_ctx,_doomflow_should_close,_doomflow_dump_pixel,_doomflow_count_nonzero,_doomflow_first_pixel,_doomflow_fb_crc32,_doomflow_fb_row,_doomflow_pixels,_doomflow_width,_doomflow_height,_doomflow_fb_copy \
+      -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_doomflow_set_ai,_doomflow_get_ai,_doomflow_frame,_doomflow_present,_doomflow_get_gfx_ctx,_doomflow_should_close,_doomflow_dump_pixel,_doomflow_count_nonzero,_doomflow_first_pixel,_doomflow_fb_crc32,_doomflow_fb_row,_doomflow_pixels,_doomflow_width,_doomflow_height,_doomflow_fb_copy,_dg_push_key \
       -sFORCE_FILESYSTEM=1 \
       --preload-file "$wad@/doom1.wad" \
       -DNORMALUNIX -DSNDSERV -D_DEFAULT_SOURCE \

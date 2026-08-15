@@ -10,7 +10,7 @@ FLOW_DIR="${FLOW_DIR:-$HOME/flow}"
 TMP_C="$ROOT/build/test_c_gameplay"
 TMP_MLIR="$ROOT/build/test_mlir_gameplay"
 TIMEOUT="${SMOKE_TIMEOUT:-600000}"
-MAX_FRAMES="${MAX_FRAMES:-12000}"
+MAX_FRAMES="${MAX_FRAMES:-24000}"
 
 export WASM_ENVIRONMENT="${WASM_ENVIRONMENT:-web,node}"
 export PATH="$ROOT/.venv/bin:$PATH"
