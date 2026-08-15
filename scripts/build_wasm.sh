@@ -128,7 +128,8 @@ flow_lower() {
     # --no-inline: mlir-opt inline pass takes 20+ min on 5991 functions.
     #   LLVM -O2 handles inlining at the backend stage.
     #   affine-loop-fusion is disabled by default in Flow (flow#466).
-    if ! python3 -m "$FLOWC" "$src" --mlir --llvm --wasm32 --lenient --optimize --opt-level O2 --no-inline -o "$ll" >&2; then
+    if ! python3 -m "$FLOWC" "$src" --mlir --llvm --wasm32 --lenient --optimize --opt-level O2 --no-inline -o "$ll" >&2
+    then
       echo "Flow→MLIR→LLVM failed for $src" >&2
       exit 1
     fi
