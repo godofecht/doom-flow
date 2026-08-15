@@ -871,6 +871,72 @@ function PipelineSection() {
 }
 
 // ---------------------------------------------------------------------------
+// Backend comparison section
+// ---------------------------------------------------------------------------
+
+function BackendComparisonSection() {
+  const rows = [
+    { label: "WASM binary", c: "546 KB", m: "419 KB" },
+    { label: "Functions", c: "615", m: "562" },
+    { label: "Data segments", c: "597", m: "872" },
+    { label: "Data segment bytes", c: "552,174", m: "421,076" },
+    { label: "ASYNCIFY symbols", c: "15", m: "0" },
+    { label: "Object file (pre-link)", c: "890 KB", m: "906 KB" },
+    { label: "Generated IR lines", c: "44,612 (C)", m: "105,216 (LLVM IR)" },
+    { label: "Optimization", c: "emcc -O2", m: "emcc -O2" },
+  ]
+  return (
+    <section className="mx-auto max-w-[920px] px-6 pb-10">
+      <h2 className="mb-4 text-base font-semibold">C vs MLIR backend comparison</h2>
+      <div className="overflow-hidden rounded-lg border border-border">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="border-b border-border bg-card">
+              <th className="px-4 py-2.5 text-left font-medium text-muted-foreground">Metric</th>
+              <th className="px-4 py-2.5 text-right font-medium text-muted-foreground">C backend</th>
+              <th className="px-4 py-2.5 text-right font-medium text-muted-foreground">MLIR backend</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.label} className="border-b border-border/50 last:border-0">
+                <td className="px-4 py-2.5 text-foreground">{r.label}</td>
+                <td className="px-4 py-2.5 text-right font-mono text-muted-foreground">{r.c}</td>
+                <td className="px-4 py-2.5 text-right font-mono text-accent">{r.m}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="mt-4 space-y-2 max-w-[68ch] text-xs leading-relaxed text-muted-foreground">
+        <p>
+          The C backend compiles Flow-generated C through emcc with
+          ASYNCIFY enabled. ASYNCIFY requires unwind and rewind trampolines,
+          a separate stack region, and dynamic call thunks. These add 53
+          functions and approximately 131 KB of data segment overhead to
+          the final WASM binary.
+        </p>
+        <p>
+          The MLIR backend emits LLVM IR directly from the Flow transpiler,
+          skipping the C intermediate. It uses a frame-driven architecture:
+          main() returns after initialization, and JavaScript drives
+          doomflow_frame() and doomflow_present() through requestAnimationFrame.
+          This eliminates the ASYNCIFY requirement and its associated runtime
+          overhead.
+        </p>
+        <p>
+          Both paths apply LLVM -O2 at the emcc link stage. The MLIR path
+          skips mlir-opt passes (canonicalize, cse, sccp, mem2reg, licm)
+          because the 10 MB Doom MLIR module triggers a parser crash in
+          Linux mlir-opt builds (LLVM 20 through 22). LLVM -O2 handles all
+          optimization at the backend stage.
+        </p>
+      </div>
+    </section>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Link cards
 // ---------------------------------------------------------------------------
 
@@ -1019,6 +1085,7 @@ export default function App() {
 
       <StatsSection />
       <PipelineSection />
+      <BackendComparisonSection />
       <LinkCards />
       <Footer />
     </div>
