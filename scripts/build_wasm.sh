@@ -125,10 +125,11 @@ flow_lower() {
     local ll="$TMP/${stem}.ll"
     # Flow logs on stdout; keep command substitution returning only the path.
     # --wasm32: libc size_t/long are i32 (Flow sources annotate them as i64).
-    # --no-inline: mlir-opt inline pass takes 20+ min on 5991 functions.
-    #   LLVM -O2 handles inlining at the backend stage.
-    #   affine-loop-fusion is disabled by default in Flow (flow#466).
-    if ! python3 -m "$FLOWC" "$src" --mlir --llvm --wasm32 --lenient --optimize --opt-level O2 --no-inline -o "$ll" >&2
+    # No mlir-opt passes: the 10MB Doom MLIR module triggers a parser crash
+    # in Linux mlir-opt (LLVM 20-22). LLVM -O2 handles all optimization at
+    # the backend stage. The mlir-opt passes (canonicalize, cse, sccp,
+    # mem2reg, licm) are nice-to-have but not required for correctness.
+    if ! python3 -m "$FLOWC" "$src" --mlir --llvm --wasm32 --lenient -o "$ll" >&2
     then
       echo "Flow→MLIR→LLVM failed for $src" >&2
       exit 1
