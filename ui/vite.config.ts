@@ -7,14 +7,14 @@ export default defineConfig({
   base: "./",
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "./src"),
+      "@": path.resolve(import.meta.dirname, "./src"),
     },
   },
   build: {
     outDir: "../site",
     emptyOutDir: false,
     rollupOptions: {
-      input: path.resolve(__dirname, "index.html"),
+      input: path.resolve(import.meta.dirname, "index.html"),
       output: {
         entryFileNames: "assets/[name].js",
         chunkFileNames: "assets/[name].js",
