@@ -144,6 +144,9 @@ flow_lower() {
       echo "  need fix/mlir-static-string-arrays in $FLOW_DIR" >&2
       exit 1
     fi
+    # Annotate LLVM IR with noalias/readonly/readnone attributes to help
+    # LLVM -O3 vectorize the hot rendering loops (R_DrawColumn etc.).
+    python3 "$ROOT/scripts/annotate_llvm_ir.py" "$ll" "$ll" >&2
     echo "$ll"
   else
     local c="$TMP/${stem}.c"
@@ -176,8 +179,6 @@ build_doom() {
     # corruption that previously blocked ASYNCIFY is fixed in Flow (flow#467),
     # but ASYNCIFY still requires a while(1) loop inside D_DoomLoop to work.
     # The Flow source uses a return-after-init architecture instead.
-    emcc -c "$ir" ${EMCC_OPT[@]} -o "$TMP/doom.o"
-    emcc -c "$FLOW_DIR/runtime/gfx_wasm.c" -O2 -o "$TMP/gfx_wasm.o"
     emcc -c "$FLOW_DIR/runtime/flow_rt_support.c" -O2 $TEST_CLOCK_DEFINE -o "$TMP/flow_rt.o"
     emcc -c "$ROOT/scripts/doom_shim.c" -O2 -o "$TMP/doom_shim.o"
     emcc "$TMP/doom.o" "$TMP/gfx_wasm.o" "$TMP/flow_rt.o" "$TMP/doom_shim.o" \

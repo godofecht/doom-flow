@@ -5,13 +5,13 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Slider } from "@/components/ui/slider"
 import { Separator } from "@/components/ui/separator"
 import { Progress } from "@/components/ui/progress"
-import { Play, Bot, Brain, ExternalLink, BookOpen, Code2 } from "lucide-react"
+import { Play, Brain, ExternalLink, BookOpen, Code2 } from "lucide-react"
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-type Mode = "play" | "ai" | "arena"
+type Mode = "play"
 
 interface WorkerInfo {
   worker: Worker
@@ -277,9 +277,10 @@ function DoomPanel({ mode }: { mode: "play" | "ai" }) {
 }
 
 // ---------------------------------------------------------------------------
-// RL Arena panel
+// RL Arena panel (disabled, pending rework)
 // ---------------------------------------------------------------------------
 
+// @ts-ignore - kept for future use
 function ArenaPanel() {
   const netCanvasRef = useRef<HTMLCanvasElement>(null)
   const [status, setStatus] = useState("idle")
@@ -1060,25 +1061,11 @@ export default function App() {
                 <Play className="mr-1.5 h-3.5 w-3.5" />
                 Play
               </TabsTrigger>
-              <TabsTrigger value="ai">
-                <Bot className="mr-1.5 h-3.5 w-3.5" />
-                Watch AI
-              </TabsTrigger>
-              <TabsTrigger value="arena">
-                <Brain className="mr-1.5 h-3.5 w-3.5" />
-                RL Arena
-              </TabsTrigger>
             </TabsList>
           </div>
 
           <TabsContent value="play" className="mt-6 flex justify-center w-full">
             <DoomPanel mode="play" />
-          </TabsContent>
-          <TabsContent value="ai" className="mt-6 flex justify-center w-full">
-            <DoomPanel mode="ai" />
-          </TabsContent>
-          <TabsContent value="arena" className="mt-6 flex justify-center w-full">
-            <ArenaPanel />
           </TabsContent>
         </Tabs>
       </div>
