@@ -181,7 +181,7 @@ build_doom() {
     # The Flow source uses a return-after-init architecture instead.
     emcc -c "$FLOW_DIR/runtime/flow_rt_support.c" -O2 $TEST_CLOCK_DEFINE -o "$TMP/flow_rt.o"
     emcc -c "$ROOT/scripts/doom_shim.c" -O2 -o "$TMP/doom_shim.o"
-    emcc "$TMP/doom.o" "$TMP/gfx_wasm.o" "$TMP/flow_rt.o" "$TMP/doom_shim.o" \
+    emcc "$ir" "$FLOW_DIR/runtime/gfx_wasm.c" "$TMP/flow_rt.o" "$TMP/doom_shim.o" \
       -O2 \
       $JS_LIBRARY \
       -sSTACK_SIZE=$STACK_SIZE \

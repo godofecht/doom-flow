@@ -18,7 +18,9 @@ AI gameplay including the E1M1 to E1M2 level transition.
 | Flow language | [github.com/flooooooooooow/flow](https://github.com/flooooooooooow/flow) |
 | Flow wiki | [flooooooooooow.github.io/flow](https://flooooooooooow.github.io/flow/) |
 | WASM gallery | [wiki /wasm/](https://flooooooooooow.github.io/flow/wasm/) |
+| Flow playground | [flooooooooooow.github.io/flow/playground/](https://flooooooooooow.github.io/flow/playground/) |
 | RL sister repo | [doom-flow-rl](https://github.com/godofecht/doom-flow-rl) |
+| Discord | [https://discord.gg/YK7VaHy24T](https://discord.gg/YK7VaHy24T) |
 
 ## Compile path
 
@@ -28,7 +30,7 @@ AI gameplay including the E1M1 to E1M2 level transition.
          └── --mlir --llvm ►  emcc + gfx_wasm.c ──►  .wasm (Pages)
 ```
 
-The MLIR object compiles at -O1 and links with emcc at -O1. The C
+The MLIR object compiles at -O2 and links with emcc at -O2. The C
 backend is used for native macOS builds. Both backends produce
 byte-identical framebuffer output.
 
@@ -60,7 +62,7 @@ The game loop is rAF-driven: `main()` returns after init, JS calls
 No ASYNCIFY.
 
 Pages modes: **Play**, **Watch AI** (`DOOMFLOW_AI` pilot, auto-advances
-through levels every 3600 frames), **RL Arena**.
+through levels every 3600 frames).
 
 ## Byte-identical verification
 
