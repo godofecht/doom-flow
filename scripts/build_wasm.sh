@@ -68,12 +68,6 @@ export PYTHONPATH="$FLOW_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 FLOWC=flow.transpiler
 mkdir -p "$TMP"
 
-# MLIR→LLVM IR is now opt-stable at -O1. Earlier string-scan miscompiles
-# (IdentifyIWADByName null-byte check) were caused by missing wasm32
-# datalayout, incorrect unsigned cast propagation, and zero-initialized
-# binary const expressions in the MLIR generator. Those are fixed in the
-# current Flow compiler, so we compile the Flow object at -O1 and link
-# with -O1 for binaryen optimization.
 EMCC_OPT=(-O2)
 EMCC_LINK_OPT=()
 JS_LIBRARY=""
@@ -85,9 +79,6 @@ fi
 if [ "$BACKEND" = "mlir" ]; then
   EMCC_OPT=(-O2)
   EMCC_LINK_OPT=(-O2)
-  # Config string-table globals must be initialized (Flow branch
-  # fix/mlir-static-string-arrays). Without this, M_LoadDefaults dies on
-  # 'use_mouse' from an undef @config_*_names array.
   if ! python3 -c "from flow.mlir_generator import MLIRGenerator; import sys; sys.exit(0 if hasattr(MLIRGenerator, '_emit_static_llvm_array_global') else 1)"; then
     echo "BACKEND=mlir needs Flow with static string-array global init" >&2
     echo "  (checkout fix/mlir-static-string-arrays in $FLOW_DIR)" >&2
@@ -117,18 +108,11 @@ emcc_common=(
   -lm
 )
 
-# Lower .flow → intermediate for emcc. Echoes the path on stdout.
 flow_lower() {
   local src="$1"
   local stem="$2"
   if [ "$BACKEND" = "mlir" ]; then
     local ll="$TMP/${stem}.ll"
-    # Flow logs on stdout; keep command substitution returning only the path.
-    # --wasm32: libc size_t/long are i32 (Flow sources annotate them as i64).
-    # No mlir-opt passes: the 10MB Doom MLIR module triggers a parser crash
-    # in Linux mlir-opt (LLVM 20-22). LLVM -O2 handles all optimization at
-    # the backend stage. The mlir-opt passes (canonicalize, cse, sccp,
-    # mem2reg, licm) are nice-to-have but not required for correctness.
     if ! python3 -m "$FLOWC" "$src" --mlir --llvm --wasm32 --lenient -o "$ll" >&2
     then
       echo "Flow→MLIR→LLVM failed for $src" >&2
@@ -138,15 +122,11 @@ flow_lower() {
       echo "empty LLVM IR written to $ll" >&2
       exit 1
     fi
-    # Catch Flow checkouts that still emit undef string-array globals.
     if grep -q '^@config_doom_names = .* undef' "$ll" 2>/dev/null; then
       echo "LLVM IR has undef @config_doom_names — wrong Flow checkout for MLIR" >&2
       echo "  need fix/mlir-static-string-arrays in $FLOW_DIR" >&2
       exit 1
     fi
-    # Annotate LLVM IR with noalias/readonly/readnone attributes to help
-    # LLVM -O3 vectorize the hot rendering loops (R_DrawColumn etc.).
-    python3 "$ROOT/scripts/annotate_llvm_ir.py" "$ll" "$ll" >&2
     echo "$ll"
   else
     local c="$TMP/${stem}.c"
@@ -174,14 +154,9 @@ build_doom() {
   ir="$(flow_lower "$ROOT/doom.flow" doom)"
 
   if [ "$BACKEND" = "mlir" ]; then
-    # No ASYNCIFY for MLIR: main() returns after init, JS drives frames
-    # via rAF calling doomflow_frame() + doomflow_present(). The alloca
-    # corruption that previously blocked ASYNCIFY is fixed in Flow (flow#467),
-    # but ASYNCIFY still requires a while(1) loop inside D_DoomLoop to work.
-    # The Flow source uses a return-after-init architecture instead.
     emcc -c "$FLOW_DIR/runtime/flow_rt_support.c" -O2 $TEST_CLOCK_DEFINE -o "$TMP/flow_rt.o"
     emcc -c "$ROOT/scripts/doom_shim.c" -O2 -o "$TMP/doom_shim.o"
-    emcc "$TMP/doom.o" "$TMP/gfx_wasm.o" "$TMP/flow_rt.o" "$TMP/doom_shim.o" \
+    emcc "$ir" "$FLOW_DIR/runtime/gfx_wasm.c" "$TMP/flow_rt.o" "$TMP/doom_shim.o" \
       -O2 \
       $JS_LIBRARY \
       -sSTACK_SIZE=$STACK_SIZE \
@@ -214,7 +189,6 @@ build_doom() {
       '-DFLOW_SHIFT_UB_HANDLER=flow_noop_handler' '-DFLOW_DIV0_HANDLER=flow_noop_handler' \
       -o "$OUT_DOOM/doom.js"
   fi
-  # Keep MLIR IR for fast ASYNCIFY/emcc iteration (Flow transpile is the slow part).
   if [ "$BACKEND" != "mlir" ]; then
     rm -f "$ir"
   fi
