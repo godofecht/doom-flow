@@ -8,8 +8,7 @@
 Doom, rewritten in [Flow](https://github.com/flooooooooooow/flow).
 Native build uses Flow's C backend. The browser demo ships with the
 MLIR backend (MLIR to LLVM to emcc). Framebuffer output is byte-identical
-to the C backend, verified across 136 samples spanning title screen and
-AI gameplay including the E1M1 to E1M2 level transition.
+to the C backend, verified across the deterministic parity suites.
 
 ![Doom AI pilot gameplay (CI GIF)](site/doom.gif)
 
@@ -37,6 +36,11 @@ byte-identical framebuffer output.
 CI records the GIF by driving the MLIR WASM build in Node with the
 deterministic test clock, capturing RGBA frames, and encoding with
 `frames_to_gif.py`.
+
+GitHub Pages rebuilds the production WASM from the current Flow checkout
+before uploading `site/`, then runs the MLIR smoke test against that freshly
+built artifact. The checked-in `site/wasm/doom/doom.wasm` is therefore no
+longer allowed to silently become a stale production binary.
 
 ## Build and run (native)
 
@@ -67,13 +71,12 @@ through levels every 3600 frames).
 ## Byte-identical verification
 
 ```bash
-FLOW_DIR=~/flow bash scripts/run_byte_identical.sh    # title screen: 15 samples
-FLOW_DIR=~/flow bash scripts/run_gameplay_test.sh      # AI gameplay: 121 samples
+FLOW_DIR=~/flow bash scripts/run_byte_identical.sh
+FLOW_DIR=~/flow bash scripts/run_gameplay_test.sh
 ```
 
 Both suites build C and MLIR WASM variants, drive them through the
-deterministic test clock, and compare CRC32 values per frame. Zero
-mismatches across all 136 samples.
+deterministic test clock, and compare CRC32 values per sampled frame.
 
 ## Record a GIF
 
@@ -87,3 +90,34 @@ FLOW_DIR=~/flow node scripts/record_wasm_gif.js --frames 600 --skip 6 --fps 15 -
 Arrows / WASD move. X or F fire. Space or E use. 1-7 weapons. Tab automap. Esc menu.
 
 See [`PORTING.md`](PORTING.md) for how the C to Flow port works.
+
+## Postmortem: the barrel bug
+
+Issue #8 exposed a gap in the verification strategy rather than a missing Doom
+mechanic. The Flow source already contained the vanilla barrel path: barrels
+have 20 health, enter the expected BEXP death-state sequence, dispatch
+`A_Explode`, and call `P_RadiusAttack`. The hitscan, damage, death-state, and
+radius-attack paths also match the original Doom implementation.
+
+The browser nevertheless served a broken barrel implementation because a
+previous optimization experiment post-processed generated LLVM IR with
+aggressive pointer attributes, including blanket `noalias` annotations. That
+assumption is invalid for Doom's heavily aliased object/state model. The pass
+was later removed from `scripts/build_wasm.sh`, but the already-generated
+`site/wasm/doom/doom.wasm` remained checked in. The Pages workflow simply
+uploaded `site/`, so production continued serving the stale miscompiled binary
+while CI rebuilt correct binaries from source.
+
+This also explains why CRC parity did not catch the problem. The parity suites
+compare the C and MLIR backends of the same Flow port. They are excellent at
+finding backend divergences, but they do not prove semantic equivalence with
+vanilla Doom, and they say nothing about a separately checked-in production
+artifact. Two backends can agree perfectly on the same porting mistake, and a
+correct CI build can coexist with an obsolete deployed binary.
+
+The corrective rule is now simple: production is built from source during the
+Pages job and smoke-tested before deployment. Backend parity remains useful,
+but it is treated as one layer of verification rather than a complete gameplay
+oracle. Behavioural regressions should be tested at the level where users
+observe them, and deployment artifacts must be derived from the commit being
+deployed rather than trusted as independent source files.

@@ -23,10 +23,51 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Checkout Flow
+        uses: actions/checkout@v5
+        with:
+          repository: flooooooooooow/flow
+          path: flow
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Flow Python deps
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -r flow/requirements.txt
+          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Emscripten
+        uses: emscripten-core/setup-emsdk@v15
+        with:
+          version: 5.0.1
+          actions-cache-folder: 'emsdk-cache'
+
+      - name: Build production WASM from current sources
+        env:
+          FLOW_DIR: ${{ github.workspace }}/flow
+          WASM_ENVIRONMENT: web,node
+        run: |
+          chmod +x scripts/build_wasm.sh
+          ./scripts/build_wasm.sh --doom-only
+
+      - name: Production artifact smoke test
+        env:
+          SMOKE_TIMEOUT: 30000
+        run: node scripts/smoke_test_mlir.js
+
       - name: Setup Pages
         uses: actions/configure-pages@v6
 
-      - name: Upload site
+      - name: Upload freshly built site
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
